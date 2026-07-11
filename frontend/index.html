@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <link rel="icon" type="image/svg+xml" href="/wails.png"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+    <link rel="stylesheet" href="/style.css"/>
+    <title>Podder - Podman Control Center</title>
+</head>
+<body>
+
+    <!-- Header bar -->
+    <header class="app-header">
+        <div class="logo-section">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+                <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+                <line x1="6" y1="6" x2="6.01" y2="6"/>
+                <line x1="6" y1="18" x2="6.01" y2="18"/>
+            </svg>
+            <span class="app-title">Podder</span>
+        </div>
+        <nav class="nav-tabs">
+            <button class="tab-btn active" onclick="switchTab('dashboard')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+                Dashboard
+            </button>
+            <button class="tab-btn" onclick="switchTab('containers')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                Containers
+            </button>
+            <button class="tab-btn" onclick="switchTab('images')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                Images
+            </button>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main class="app-content">
+
+        <!-- DASHBOARD TAB -->
+        <section id="tab-dashboard" class="tab-content active">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Containers</span>
+                        <span id="stat-containers-total" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card-inner"></div>
+                    <div class="stat-icon emerald">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Running</span>
+                        <span id="stat-containers-running" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon rose">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Stopped</span>
+                        <span id="stat-containers-stopped" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon cyan">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Images</span>
+                        <span id="stat-images-total" class="stat-num">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dashboard-grid">
+                <div class="info-card">
+                    <h2>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                        Podman Host Information
+                    </h2>
+                    <table class="info-table">
+                        <tr>
+                            <td class="label">OS / Distribution</td>
+                            <td id="info-os" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Kernel Version</td>
+                            <td id="info-kernel" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Available CPUs</td>
+                            <td id="info-cpus" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">System Memory</td>
+                            <td id="info-memory" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">System Uptime</td>
+                            <td id="info-uptime" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Podman Version</td>
+                            <td id="info-version" class="value">-</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="info-card">
+                    <h2>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+                        Environment Info
+                    </h2>
+                    <table class="info-table">
+                        <tr>
+                            <td class="label">Mode</td>
+                            <td class="value">Rootless (User session)</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Log Driver</td>
+                            <td class="value">journald</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Storage Driver</td>
+                            <td class="value">overlay</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- CONTAINERS TAB -->
+        <section id="tab-containers" class="tab-content">
+            <div class="section-header">
+                <div class="section-title">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="2" width="20" height="20" rx="2" ry="2"/><line x1="12" y1="2" x2="12" y2="22"/></svg>
+                    Containers
+                </div>
+                <div style="display: flex; gap: 16px; align-items: center;">
+                    <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); cursor: pointer;">
+                        <input type="checkbox" id="filter-all-containers" checked onchange="loadContainers()" style="cursor: pointer;"/>
+                        Show Stopped Containers
+                    </label>
+                    <button class="btn btn-primary" onclick="openRunModal('')">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        Run Container
+                    </button>
+                </div>
+            </div>
+
+            <div id="containers-list" class="container-grid">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+        <!-- IMAGES TAB -->
+        <section id="tab-images" class="tab-content">
+            <div class="section-header">
+                <div class="section-title">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                    Local Images
+                </div>
+                <div style="display: flex; gap: 10px; width: 450px;">
+                    <input type="text" id="pull-image-name" class="form-input" placeholder="e.g. docker.io/library/nginx:alpine" style="padding: 6px 12px; font-size: 13px;"/>
+                    <button class="btn btn-primary" id="btn-pull-image" onclick="pullImage()" style="flex-shrink: 0;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 15v4c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2v-4M17 9l-5 5-5-5M12 12.8V2.5"/></svg>
+                        Pull Image
+                    </button>
+                </div>
+            </div>
+
+            <div id="images-list" class="image-grid">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Modals -->
+    <!-- Logs Modal -->
+    <div id="logs-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <h3 class="modal-title" id="logs-modal-title">Container Logs</h3>
+                <button class="modal-close" onclick="closeModal('logs-modal')">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 12px; height: 100%; overflow: hidden;">
+                <pre id="logs-text" class="logs-output"></pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="refreshLogs()">Refresh</button>
+                <button class="btn btn-secondary" onclick="closeModal('logs-modal')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Run Container Modal -->
+    <div id="run-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Run New Container</h3>
+                <button class="modal-close" onclick="closeModal('run-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Image Name *</label>
+                    <input type="text" id="run-image" class="form-input" placeholder="e.g. docker.io/library/alpine:latest" required/>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Container Name (Optional)</label>
+                    <input type="text" id="run-name" class="form-input" placeholder="e.g. my-app"/>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Port Mapping (Optional)</label>
+                    <input type="text" id="run-ports" class="form-input" placeholder="e.g. 8080:80"/>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Command (Optional)</label>
+                    <input type="text" id="run-command" class="form-input" placeholder="e.g. sleep 1000"/>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('run-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="submitRunContainer()">Run Container</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification Banner -->
+    <div id="notification" class="notification-banner">
+        <div id="notification-icon" class="notification-icon">
+            <!-- Icon is injected dynamically -->
+        </div>
+        <div id="notification-text" class="notification-msg"></div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>

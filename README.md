@@ -1,59 +1,81 @@
-# Welcome to Your New Wails3 Project!
+# Podder - Podman GUI Control Panel & CLI Compose Helper
 
-Congratulations on generating your Wails3 application! This README will guide you through the next steps to get your project up and running.
+Podder is a sleek, lightweight, and modern desktop application and CLI tool for managing local Podman containers, images, and compose setups. It is built on Go and Wails v3, featuring a premium dark glassmorphic interface and raw web technologies (HTML, CSS, Vanilla JS) for low resource footprint and native speeds.
 
-## Getting Started
+---
 
-1. Navigate to your project directory in the terminal.
+## Features
 
-2. To run your application in development mode, use the following command:
+- **Dashboard**: High-level host metrics (OS/Kernel details, CPUs, memory status, uptime) and container stats widgets.
+- **Container Control**: List all containers (running/stopped), start, stop, restart, and remove them directly from the UI.
+- **Real-Time Logs**: View streaming container stdout/stderr in a scrollable terminal-style modal.
+- **Image Management**: List local images, pull new ones from public registries, run containers from images via quick forms, and delete unneeded images.
+- **Global CLI Command**: Act as a compose provider. Running `pod up` or `pod down` in a folder containing a compose file triggers your compose provider.
 
-   ```
+---
+
+## Installation & Setup
+
+### 1. Prerequisites
+
+Ensure you have **Go (v1.22+)** and **Node.js** installed.
+
+On Debian/Ubuntu systems, install the GTK4 and WebKitGTK 6.0 development headers required by Wails:
+```bash
+sudo apt update
+sudo apt install -y libgtk-4-dev libwebkitgtk-6.0-dev build-essential pkg-config
+```
+
+### 2. Install Wails v3 CLI
+Install the Wails v3 toolchain command `wails3`:
+```bash
+go install github.com/wailsapp/wails/v3/cmd/wails3@latest
+```
+Ensure your `GOPATH/bin` (typically `~/go/bin` or `~/go-workspace/bin`) is added to your shell's `PATH`.
+
+### 3. Build Podder
+Clone the repository and compile the native executable:
+```bash
+git clone https://github.com/Eowerd24/podder.git
+cd podder
+npm install --prefix frontend
+wails3 build
+```
+This produces a compiled binary at `bin/podder`.
+
+### 4. Create Global Shell Shortcuts
+To launch the GUI using `podder` or run compose setups using `pod up`/`pod down` from any directory, link the binary to your local user bin path:
+```bash
+ln -sf $(pwd)/bin/podder ~/.local/bin/podder
+ln -sf $(pwd)/bin/podder ~/.local/bin/pod
+```
+
+---
+
+## Getting Started (Wails3 Commands)
+
+1. **Development Mode**:
+   To run the application with live hot-reloading for both Go backend and frontend files:
+   ```bash
    wails3 dev
    ```
 
-   This will start your application and enable hot-reloading for both frontend and backend changes.
-
-3. To build your application for production, use:
-
-   ```
+2. **Production Build**:
+   To rebuild the release binary:
+   ```bash
    wails3 build
    ```
 
-   This will create a production-ready executable in the `build` directory.
+3. **Explore Wails3 Documentation**:
+   Visit [v3.wails.io](https://v3.wails.io/) for Wails v3 guides, API references, and templates.
 
-## Exploring Wails3 Features
-
-Now that you have your project set up, it's time to explore the features that Wails3 offers:
-
-1. **Check out the examples**: The best way to learn is by example. Visit the `examples` directory in the `v3/examples` directory to see various sample applications.
-
-2. **Run an example**: To run any of the examples, navigate to the example's directory and use:
-
-   ```
-   go run .
-   ```
-
-   Note: Some examples may be under development during the alpha phase.
-
-3. **Explore the documentation**: Visit the [Wails3 documentation](https://v3.wails.io/) for in-depth guides and API references.
-
-4. **Join the community**: Have questions or want to share your progress? Join the [Wails Discord](https://discord.gg/JDdSxwjhGf) or visit the [Wails discussions on GitHub](https://github.com/wailsapp/wails/discussions).
+---
 
 ## Project Structure
 
-Take a moment to familiarize yourself with your project structure:
-
-- `frontend/`: Contains your frontend code (HTML, CSS, JavaScript/TypeScript)
-- `main.go`: The entry point of your Go backend
-- `app.go`: Define your application structure and methods here
-- `wails.json`: Configuration file for your Wails project
-
-## Next Steps
-
-1. Modify the frontend in the `frontend/` directory to create your desired UI.
-2. Add backend functionality in `main.go`.
-3. Use `wails3 dev` to see your changes in real-time.
-4. When ready, build your application with `wails3 build`.
-
-Happy coding with Wails3! If you encounter any issues or have questions, don't hesitate to consult the documentation or reach out to the Wails community.
+- `main.go`: The entrypoint of the Go backend which configures and loads the Wails application window.
+- `podman.go`: Exposes Go services to the web interface (system stats, image list, container actions).
+- `frontend/`:
+  - `index.html`: Dashboard layout structure.
+  - `src/main.js`: Listens to user interactions and communicates with the bound Go services.
+  - `public/style.css`: Custom-built visual styling rules.

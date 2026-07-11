@@ -69,6 +69,47 @@ ln -sf $(pwd)/bin/podder ~/.local/bin/pod
 3. **Explore Wails3 Documentation**:
    Visit [v3.wails.io](https://v3.wails.io/) for Wails v3 guides, API references, and templates.
 
+   ---
+
+**How to install Go language with a Bash script** 
+
+Another alternative to installing Go is to use a simple Bash script. It will download and install Go language under of your own user account.
+
+Note that a system-wide installation might be better for some things (for example, better protected from accidental modifications etc.), but this was a bit simpler to setup.
+
+For this example, we are using:
+
+    https://github.com/canha/golang-tools-install-script
+
+Create directory
+
+mkdir -p ~/git/GitHub/canha
+
+Clone Git repository
+
+cd ~/git/GitHub/canha
+git clone https://github.com/canha/golang-tools-install-script 
+cd golang-tools-install-script/
+
+Install a 64-bit version
+
+bash goinstall.sh --64
+
+Script downloads the version specified in the Bash script (at the moment 1.9.2) and installs it to ~/.go directory.
+Check that it was added to your shell config
+
+cat ~/.bashrc
+
+Reload your shell
+
+source ~/.bashrc
+
+Try if it works
+
+go help
+
+That should show a quick help for the go command.
+
 ---
 
 ## Project Structure

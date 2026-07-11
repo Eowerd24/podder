@@ -41,4 +41,7 @@
 - [x] Compile production-ready binary with `wails3 build` to `bin/podder`.
 - [x] Update documentation: `docs/project-context.md`, `CHANGELOG.md`, `AGY.md`.
 - [x] Create comprehensive `.gitignore` configuration.
+- [x] Implement command-line parser in `main.go` supporting compose commands (`up`/`down`).
+- [x] Globally link `podder` and `pod` command shortcuts to user's bin PATH.
+
 

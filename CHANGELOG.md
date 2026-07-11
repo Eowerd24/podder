@@ -16,4 +16,7 @@ All notable changes to this project will be documented in this file.
 - Toast notifications for reporting action progress and errors.
 - Unit test suite (`podman_test.go`) validating container, image, and system info JSON parsing.
 - Comprehensive `.gitignore` configuration for Go, Wails v3, Node.js, and IDE files.
+- Command-line argument parsing in `main.go` supporting `podder up` / `podder down` commands for executing `compose` commands.
+- Symlinks for `podder` and `pod` globally exposed in the user's path (`/home/sarge/.local/bin/`).
+
 

@@ -14,57 +14,52 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 
 ---
 
-## Installation & Setup
+## Installation
 
-### 1. Prerequisites
+The easiest way to install Podder is to download the pre-compiled executable. You do **not** need to install Go or Node.js to run it.
 
-Ensure you have **Go (v1.22+)** and **Node.js** installed.
+1. **Download the latest release:**
+   Download the `podder` AppImage or binary from the [GitHub Releases page](https://github.com/Eowerd24/podder/releases).
 
-On Debian/Ubuntu systems, install the GTK4 and WebKitGTK 6.0 development headers required by Wails:
+2. **Make it executable & move to your PATH:**
+   ```bash
+   chmod +x podder
+   sudo mv podder /usr/local/bin/pod
+   ```
+
+3. **Run it:**
+   - Type `pod` to open the GUI.
+   - Type `pod up` in a directory with a compose file to spin up containers.
+   - Type `pod pull ubuntu` to pass native commands directly to Podman.
+
+*(Ubuntu/Debian users: Ensure you have the standard WebKit library installed via `sudo apt install libwebkitgtk-6.0-4`)*
+
+---
+
+## Contributing & Building from Source
+
+If you want to modify the code or build Podder from scratch, you will need **Go (v1.22+)** and **Node.js** installed.
+
+### 1. Install Dependencies
+On Debian/Ubuntu systems, install the GTK and WebKitGTK development headers required by Wails:
 ```bash
 sudo apt update
 sudo apt install -y libgtk-4-dev libwebkitgtk-6.0-dev build-essential pkg-config
 ```
 
 ### 2. Install Wails v3 CLI
-Install the Wails v3 toolchain command `wails3`:
 ```bash
 go install github.com/wailsapp/wails/v3/cmd/wails3@latest
 ```
-Ensure your `GOPATH/bin` (typically `~/go/bin` or `~/go-workspace/bin`) is added to your shell's `PATH`.
 
-### 3. Build Podder
-Clone the repository and compile the native executable:
+### 3. Build & Run
+Clone the repository and run the development server:
 ```bash
 git clone https://github.com/Eowerd24/podder.git
 cd podder
-npm install --prefix frontend
-wails3 build
+wails3 dev
 ```
-This produces a compiled binary at `bin/podder`.
-
-### 4. Create Global Shell Shortcuts
-To launch the GUI using `podder` or run compose setups using `pod up`/`pod down` from any directory, link the binary to your local user bin path:
-```bash
-ln -sf $(pwd)/bin/podder ~/.local/bin/podder
-ln -sf $(pwd)/bin/podder ~/.local/bin/pod
-```
-
----
-
-## Getting Started (Wails3 Commands)
-
-1. **Development Mode**:
-   To run the application with live hot-reloading for both Go backend and frontend files:
-   ```bash
-   wails3 dev
-   ```
-
-2. **Production Build**:
-   To rebuild the release binary:
-   ```bash
-   wails3 build
-   ```
+To compile a native release binary, run `wails3 build`.
 
 3. **Explore Wails3 Documentation**:
    Visit [v3.wails.io](https://v3.wails.io/) for Wails v3 guides, API references, and templates.

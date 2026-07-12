@@ -22,6 +22,15 @@ var assets embed.FS
 // main function serves as the application's entry point. It initializes the application, creates a window,
 // and starts the application.
 func main() {
+	// Disable WebKitGTK sandbox to prevent bubblewrap (bwrap) crash on systems with restricted user namespaces
+	// This is a known issue on Ubuntu 24.04 and other Linux systems with AppArmor restricting user namespaces.
+	os.Setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1")
+	
+	// Disable WebKitGTK hardware acceleration/compositing features that fail in environments without DRI3
+	// This fixes the sluggishness and libEGL warnings.
+	os.Setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+	os.Setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+
 	// CLI Arguments Parsing
 	if len(os.Args) > 1 {
 		cmd := os.Args[1]
@@ -31,11 +40,13 @@ func main() {
 		}
 		if cmd == "help" || cmd == "--help" || cmd == "-h" {
 			printUsage()
+			// Also pass through to podman so they see the native help too
+			handlePodmanPassthrough(os.Args[1:])
 			return
 		}
-		fmt.Printf("Unknown command: %s\n", cmd)
-		printUsage()
-		os.Exit(1)
+		// Treat any other command as a native podman command passthrough
+		handlePodmanPassthrough(os.Args[1:])
+		return
 	}
 
 	// Create a new Wails application by providing the necessary options.
@@ -146,6 +157,23 @@ func handleComposeCommand(action string) {
 	}
 }
 
+// handlePodmanPassthrough routes all unrecognized commands directly to the native podman CLI.
+func handlePodmanPassthrough(args []string) {
+	cmd := exec.Command("podman", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	err := cmd.Run()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitError.ExitCode())
+		}
+		fmt.Printf("Error executing podman: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // printUsage displays CLI help details.
 func printUsage() {
 	fmt.Println("Podder - Podman GUI Wrapper & CLI Compose Helper")
@@ -154,4 +182,7 @@ func printUsage() {
 	fmt.Println("  podder up       Run 'compose up -d' in the current directory")
 	fmt.Println("  podder down     Run 'compose down' in the current directory")
 	fmt.Println("  podder help     Show this help message")
+	fmt.Println("\nNative Podman Passthrough:")
+	fmt.Println("  podder <cmd>    Any other command (e.g. 'pull', 'ps', 'build') is passed")
+	fmt.Println("                  directly to the native podman CLI.")
 }

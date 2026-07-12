@@ -66,44 +66,29 @@ To compile a native release binary, run `wails3 build`.
 
    ---
 
-**How to install Go language with a Bash script** 
+### Alternative: Install Go via Bash Script
 
-Another alternative to installing Go is to use a simple Bash script. It will download and install Go language under of your own user account.
+If you prefer an isolated user-space installation rather than a system-wide package, you can use the [Golang Tools Install Script](https://github.com/canha/golang-tools-install-script).
 
-Note that a system-wide installation might be better for some things (for example, better protected from accidental modifications etc.), but this was a bit simpler to setup.
-
-For this example, we are using:
-
-    https://github.com/canha/golang-tools-install-script
-
-Create directory
-
+**1. Clone the repository:**
+```bash
 mkdir -p ~/git/GitHub/canha
-
-Clone Git repository
-
 cd ~/git/GitHub/canha
 git clone https://github.com/canha/golang-tools-install-script 
 cd golang-tools-install-script/
+```
 
-Install a 64-bit version
-
+**2. Run the installer (64-bit):**
+```bash
 bash goinstall.sh --64
+```
+*(This automatically downloads Go into your `~/.go` directory and appends the necessary paths to your `.bashrc`).*
 
-Script downloads the version specified in the Bash script (at the moment 1.9.2) and installs it to ~/.go directory.
-Check that it was added to your shell config
-
-cat ~/.bashrc
-
-Reload your shell
-
+**3. Reload your shell and verify:**
+```bash
 source ~/.bashrc
-
-Try if it works
-
-go help
-
-That should show a quick help for the go command.
+go version
+```
 
 ---
 

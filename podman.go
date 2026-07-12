@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 // PodmanService handles execution of Podman CLI commands and parsing of JSON outputs.
@@ -301,4 +305,63 @@ func (p *PodmanService) RunContainer(image string, name string, ports string, cm
 		return fmt.Errorf("%s", strings.TrimSpace(stderr))
 	}
 	return nil
+}
+
+// SelectAndRunCompose triggers a native OS file dialog to select a folder or compose file,
+// and then executes docker/podman compose in that directory.
+func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
+	dialog := application.Get().Dialog.OpenFile().
+		SetTitle("Select Compose File or Directory").
+		CanChooseDirectories(true).
+		CanChooseFiles(true)
+
+	path, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("failed to open dialog: %v", err)
+	}
+	if path == "" {
+		return "Cancelled by user.", nil
+	}
+
+	// Determine if path is a file or directory
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat path: %v", err)
+	}
+
+	dir := path
+	if !info.IsDir() {
+		dir = filepath.Dir(path)
+	}
+
+	var composeCmd *exec.Cmd
+	if _, err := exec.LookPath("podman-compose"); err == nil {
+		if action == "up" {
+			composeCmd = exec.Command("podman-compose", "up", "-d")
+		} else {
+			composeCmd = exec.Command("podman-compose", "down")
+		}
+	} else if _, err := exec.LookPath("docker-compose"); err == nil {
+		if action == "up" {
+			composeCmd = exec.Command("docker-compose", "up", "-d")
+		} else {
+			composeCmd = exec.Command("docker-compose", "down")
+		}
+	} else {
+		// Fallback to "podman compose"
+		if action == "up" {
+			composeCmd = exec.Command("podman", "compose", "up", "-d")
+		} else {
+			composeCmd = exec.Command("podman", "compose", "down")
+		}
+	}
+
+	composeCmd.Dir = dir
+
+	output, err := composeCmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("compose error: %v\noutput: %s", err, string(output))
+	}
+
+	return string(output), nil
 }

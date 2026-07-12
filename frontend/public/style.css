@@ -1,6 +1,6 @@
 :root {
     --bg-dark: #070913;
-    --card-bg: rgba(17, 22, 40, 0.65);
+    --card-bg: rgba(17, 22, 40, 0.95);
     --border-color: rgba(99, 102, 241, 0.15);
     --border-hover: rgba(99, 102, 241, 0.35);
     
@@ -49,14 +49,12 @@ body {
 /* App Header & Titlebar */
 .app-header {
     height: 56px;
-    background: rgba(13, 17, 33, 0.8);
+    background: rgba(13, 17, 33, 0.98);
     border-bottom: 1px solid var(--border-color);
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 0 24px;
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     flex-shrink: 0;
     --wails-draggable: drag;
 }
@@ -152,8 +150,6 @@ body {
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
     padding: 20px;
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
     transition: all 0.2s ease;
     display: flex;
     align-items: center;
@@ -228,7 +224,6 @@ body {
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
     padding: 24px;
-    backdrop-filter: blur(8px);
 }
 
 .info-card h2 {
@@ -297,7 +292,6 @@ body {
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
     padding: 20px;
-    backdrop-filter: blur(8px);
     transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     display: flex;
     flex-direction: column;
@@ -446,9 +440,7 @@ body {
     position: fixed;
     inset: 0;
     z-index: 100;
-    background: rgba(4, 5, 12, 0.75);
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
+    background: rgba(4, 5, 12, 0.90);
     display: none;
     align-items: center;
     justify-content: center;

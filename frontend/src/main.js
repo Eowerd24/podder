@@ -470,6 +470,31 @@ function showNotification(message, isError = false, isSuccess = false) {
     }
 }
 
+// --- Compose Actions ---
+
+window.runComposeDialog = async (action) => {
+    try {
+        showNotification(`Opening file browser to select compose ${action === 'up' ? 'startup' : 'teardown'} directory...`, false);
+        const result = await Podman.SelectAndRunCompose(action);
+        
+        if (result === "Cancelled by user.") {
+            showNotification("Compose action cancelled.", false, true);
+            return;
+        }
+        
+        showNotification(`Compose ${action} executed successfully!\n${result}`, false, true);
+        
+        // Refresh containers list automatically
+        if (currentTab === 'containers') {
+            loadContainers();
+        } else if (currentTab === 'dashboard') {
+            loadSystemInfo();
+        }
+    } catch (err) {
+        showNotification(`Compose Error: ${err}`, true);
+    }
+};
+
 // --- Utilities ---
 
 function formatBytes(bytes) {

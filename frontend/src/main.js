@@ -96,9 +96,19 @@ window.loadContainers = async () => {
     if (!listContainer) return;
     
     try {
-        const showStopped = document.getElementById('filter-all-containers').checked;
-        const containers = await Podman.ListContainers(showStopped);
+        const filterDropdown = document.getElementById('container-filter');
+        const filterType = filterDropdown ? filterDropdown.value : 'all';
+        const showAll = (filterType === 'all' || filterType === 'stopped');
         
+        const allContainers = await Podman.ListContainers(showAll);
+        
+        let containers = allContainers || [];
+        if (filterType === 'running') {
+            containers = containers.filter(c => c.State && c.State.toLowerCase() === 'running');
+        } else if (filterType === 'stopped') {
+            containers = containers.filter(c => !c.State || c.State.toLowerCase() !== 'running');
+        }
+
         if (!containers || containers.length === 0) {
             listContainer.innerHTML = `
                 <div class="empty-state" style="grid-column: 1 / -1;">
@@ -407,6 +417,11 @@ window.openModal = (modalId) => {
     document.getElementById(modalId).classList.add('active');
 };
 
+window.openBuildModal = () => {
+    document.getElementById('build-tag').value = '';
+    openModal('build-modal');
+};
+
 window.openRunModal = (imageName = '') => {
     document.getElementById('run-image').value = imageName;
     openModal('run-modal');
@@ -470,6 +485,16 @@ function showNotification(message, isError = false, isSuccess = false) {
     }
 }
 
+// --- Navigation Helpers ---
+
+window.navigateAndFilterContainers = (filterType) => {
+    const filterDropdown = document.getElementById('container-filter');
+    if (filterDropdown) {
+        filterDropdown.value = filterType;
+    }
+    switchTab('containers');
+};
+
 // --- Compose Actions ---
 
 window.runComposeDialog = async (action) => {
@@ -492,6 +517,33 @@ window.runComposeDialog = async (action) => {
         }
     } catch (err) {
         showNotification(`Compose Error: ${err}`, true);
+    }
+};
+
+window.submitBuildImage = async () => {
+    const tag = document.getElementById('build-tag').value.trim();
+    if (!tag) {
+        showNotification("Image tag is required.", true);
+        return;
+    }
+    
+    closeModal('build-modal');
+    
+    try {
+        showNotification("Opening file browser to select Dockerfile directory...", false);
+        const result = await Podman.BuildImageFromDirectory(tag);
+        
+        if (result === "Cancelled by user.") {
+            showNotification("Build cancelled.", false, true);
+            return;
+        }
+        
+        showNotification(`Build completed successfully!\n${result}`, false, true);
+        if (currentTab === 'images') {
+            loadImages();
+        }
+    } catch (err) {
+        showNotification(`Build Error: ${err}`, true);
     }
 };
 

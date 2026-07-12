@@ -42,7 +42,7 @@
         <!-- DASHBOARD TAB -->
         <section id="tab-dashboard" class="tab-content active">
             <div class="stats-grid">
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="navigateAndFilterContainers('all')" title="View All Containers">
                     <div class="stat-icon">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
                     </div>
@@ -51,7 +51,7 @@
                         <span id="stat-containers-total" class="stat-num">0</span>
                     </div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="navigateAndFilterContainers('running')" title="View Running Containers">
                     <div class="stat-card-inner"></div>
                     <div class="stat-icon emerald">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -61,7 +61,7 @@
                         <span id="stat-containers-running" class="stat-num">0</span>
                     </div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="navigateAndFilterContainers('stopped')" title="View Stopped Containers">
                     <div class="stat-icon rose">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/></svg>
                     </div>
@@ -70,7 +70,7 @@
                         <span id="stat-containers-stopped" class="stat-num">0</span>
                     </div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="switchTab('images')" title="View Images">
                     <div class="stat-icon cyan">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                     </div>
@@ -159,10 +159,11 @@
                     Containers
                 </div>
                 <div style="display: flex; gap: 16px; align-items: center;">
-                    <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); cursor: pointer;">
-                        <input type="checkbox" id="filter-all-containers" checked onchange="loadContainers()" style="cursor: pointer;"/>
-                        Show Stopped Containers
-                    </label>
+                    <select id="container-filter" class="form-input" style="width: 160px; padding: 6px 10px; font-size: 13px; cursor: pointer;" onchange="loadContainers()">
+                        <option value="all">All Containers</option>
+                        <option value="running">Running Only</option>
+                        <option value="stopped">Stopped Only</option>
+                    </select>
                     <button class="btn btn-primary" onclick="openRunModal('')">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                         Run Container
@@ -182,11 +183,15 @@
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                     Local Images
                 </div>
-                <div style="display: flex; gap: 10px; width: 450px;">
+                <div style="display: flex; gap: 8px; width: 480px;">
                     <input type="text" id="pull-image-name" class="form-input" placeholder="e.g. docker.io/library/nginx:alpine" style="padding: 6px 12px; font-size: 13px;"/>
                     <button class="btn btn-primary" id="btn-pull-image" onclick="pullImage()" style="flex-shrink: 0;">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 15v4c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2v-4M17 9l-5 5-5-5M12 12.8V2.5"/></svg>
-                        Pull Image
+                        Pull
+                    </button>
+                    <button class="btn btn-secondary" onclick="openBuildModal()" style="flex-shrink: 0;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+                        Build
                     </button>
                 </div>
             </div>
@@ -244,6 +249,27 @@
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal('run-modal')">Cancel</button>
                 <button class="btn btn-primary" onclick="submitRunContainer()">Run Container</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Build Image Modal -->
+    <div id="build-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Build Image from Folder</h3>
+                <button class="modal-close" onclick="closeModal('build-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Image Tag *</label>
+                    <input type="text" id="build-tag" class="form-input" placeholder="e.g. my-app:latest" required/>
+                </div>
+                <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 15px;">After clicking Build, you will be prompted to select the directory containing your Dockerfile.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('build-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="submitBuildImage()">Select Folder & Build</button>
             </div>
         </div>
     </div>

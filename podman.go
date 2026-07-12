@@ -365,3 +365,31 @@ func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
 
 	return string(output), nil
 }
+
+// BuildImageFromDirectory prompts the user for a directory, and runs podman build inside it.
+func (p *PodmanService) BuildImageFromDirectory(tag string) (string, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return "", fmt.Errorf("image tag cannot be empty")
+	}
+
+	dialog := application.Get().Dialog.OpenFile().
+		SetTitle("Select Directory containing Dockerfile").
+		CanChooseDirectories(true).
+		CanChooseFiles(false)
+
+	path, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("failed to open dialog: %v", err)
+	}
+	if path == "" {
+		return "Cancelled by user.", nil
+	}
+
+	cmd := exec.Command("podman", "build", "-t", tag, path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("build error: %v\noutput: %s", err, string(output))
+	}
+	return string(output), nil
+}

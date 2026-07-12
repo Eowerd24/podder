@@ -16,21 +16,18 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 
 ## Installation
 
-The easiest way to install Podder is to download the pre-compiled executable. You do **not** need to install Go or Node.js to run it.
+The easiest way to install Podder is to download the pre-compiled executable directly from the GitHub Releases. You do **not** need to install Go or Node.js.
 
-1. **Download the latest release:**
-   Download the `podder` AppImage or binary from the [GitHub Releases page](https://github.com/Eowerd24/podder/releases).
+### 1-Line Installation
+You can download the latest binary directly into your path and make it executable with a single command:
+```bash
+sudo curl -L -o /usr/local/bin/pod https://github.com/Eowerd24/podder/releases/latest/download/podder && sudo chmod +x /usr/local/bin/pod
+```
 
-2. **Make it executable & move to your PATH:**
-   ```bash
-   chmod +x podder
-   sudo mv podder /usr/local/bin/pod
-   ```
-
-3. **Run it:**
-   - Type `pod` to open the GUI.
-   - Type `pod up` in a directory with a compose file to spin up containers.
-   - Type `pod pull ubuntu` to pass native commands directly to Podman.
+### Usage:
+- Type `pod` anywhere in your terminal to open the GUI.
+- Type `pod up` in a directory with a `docker-compose.yml` to spin up containers.
+- Type `pod pull ubuntu` (or any podman command) to pass native commands directly to Podman.
 
 *(Ubuntu/Debian users: Ensure you have the standard WebKit library installed via `sudo apt install libwebkitgtk-6.0-4`)*
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -176,5 +178,63 @@ func TestSystemInfoJSONParsing(t *testing.T) {
 	}
 	if info.PodmanVersion != "4.9.3" {
 		t.Errorf("Expected PodmanVersion '4.9.3', got %s", info.PodmanVersion)
+	}
+}
+
+func TestBuildRunContainerArgsWithBindMount(t *testing.T) {
+	tempDir := t.TempDir()
+	hostPath := filepath.Join(tempDir, "content")
+	if err := os.Mkdir(hostPath, 0o755); err != nil {
+		t.Fatalf("failed to create host directory: %v", err)
+	}
+
+	args, err := buildRunContainerArgs(
+		"docker.io/library/nginx:latest",
+		"demo",
+		"8080:80",
+		"",
+		hostPath,
+		"/usr/share/nginx/html",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("buildRunContainerArgs returned error: %v", err)
+	}
+
+	expectedMount := "type=bind,src=" + hostPath + ",target=/usr/share/nginx/html,readonly"
+	foundMount := false
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--mount" && args[i+1] == expectedMount {
+			foundMount = true
+			break
+		}
+	}
+
+	if !foundMount {
+		t.Fatalf("expected mount spec %q in args %v", expectedMount, args)
+	}
+}
+
+func TestBuildRunContainerArgsRejectsIncompleteMount(t *testing.T) {
+	if _, err := buildRunContainerArgs(
+		"docker.io/library/alpine:latest",
+		"",
+		"",
+		"",
+		"/tmp/example",
+		"",
+		false,
+	); err == nil {
+		t.Fatal("expected missing container path to fail")
+	}
+}
+
+func TestIsSupportedImageFile(t *testing.T) {
+	if !isSupportedImageFile("/tmp/example.JPG") {
+		t.Fatal("expected JPG file to be accepted")
+	}
+
+	if isSupportedImageFile("/tmp/example.txt") {
+		t.Fatal("expected non-image file to be rejected")
 	}
 }

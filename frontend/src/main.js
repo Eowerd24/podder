@@ -1,12 +1,31 @@
 import * as Podman from "../bindings/changeme/podmanservice.js";
+import { Call as WailsCall } from "@wailsio/runtime";
 
 // Active Tab state
 let currentTab = 'dashboard';
 let activeLogContainerId = null;
 let logRefreshInterval = null;
 
+const containerViewMeta = {
+    all: {
+        title: 'Containers',
+        subtitle: 'Browse every local container or narrow the list to running or stopped instances.'
+    },
+    running: {
+        title: 'Running Containers',
+        subtitle: 'Focused view showing only actively running containers from the host.'
+    },
+    stopped: {
+        title: 'Stopped Containers',
+        subtitle: 'Focused view showing containers that are currently exited or otherwise not running.'
+    }
+};
+
 // Initialize on DOM load
 window.addEventListener('DOMContentLoaded', () => {
+    updateContainerViewMeta(getSelectedContainerFilter());
+    resetRunModal();
+
     // Initial data load
     refreshAll();
     
@@ -96,8 +115,8 @@ window.loadContainers = async () => {
     if (!listContainer) return;
     
     try {
-        const filterDropdown = document.getElementById('container-filter');
-        const filterType = filterDropdown ? filterDropdown.value : 'all';
+        const filterType = getSelectedContainerFilter();
+        updateContainerViewMeta(filterType);
         const showAll = (filterType === 'all' || filterType === 'stopped');
         
         const allContainers = await Podman.ListContainers(showAll);
@@ -387,24 +406,36 @@ window.submitRunContainer = async () => {
     const name = document.getElementById('run-name').value.trim();
     const ports = document.getElementById('run-ports').value.trim();
     const command = document.getElementById('run-command').value.trim();
+    const hostPath = document.getElementById('run-host-path').value.trim();
+    const containerPath = document.getElementById('run-container-path').value.trim();
+    const mountReadOnly = document.getElementById('run-mount-readonly').checked;
     
     if (!image) {
         showNotification("Image name is required.", true);
+        return;
+    }
+
+    if ((hostPath && !containerPath) || (!hostPath && containerPath)) {
+        showNotification("Both host content and container mount path are required when using a bind mount.", true);
         return;
     }
     
     try {
         showNotification("Creating container...", false);
         closeModal('run-modal');
-        await Podman.RunContainer(image, name, ports, command);
+        await WailsCall.ByName(
+            "main.PodmanService.RunContainer",
+            image,
+            name,
+            ports,
+            command,
+            hostPath,
+            containerPath,
+            mountReadOnly
+        );
         showNotification("Container created and running successfully", false, true);
-        
-        // Clean fields
-        document.getElementById('run-image').value = "";
-        document.getElementById('run-name').value = "";
-        document.getElementById('run-ports').value = "";
-        document.getElementById('run-command').value = "";
-        
+
+        resetRunModal();
         switchTab('containers');
     } catch (err) {
         showNotification(`Failed to run container: ${err}`, true);
@@ -423,8 +454,34 @@ window.openBuildModal = () => {
 };
 
 window.openRunModal = (imageName = '') => {
+    resetRunModal();
     document.getElementById('run-image').value = imageName;
     openModal('run-modal');
+};
+
+window.pickRunHostPath = async (kind) => {
+    try {
+        const selectedPath = await WailsCall.ByName("main.PodmanService.SelectHostPath", kind);
+        if (!selectedPath) {
+            return;
+        }
+
+        document.getElementById('run-host-path').value = selectedPath;
+
+        const containerPathInput = document.getElementById('run-container-path');
+        if (containerPathInput && !containerPathInput.value.trim()) {
+            containerPathInput.value = defaultContainerMountPath(kind, selectedPath);
+        }
+
+        const readOnlyCheckbox = document.getElementById('run-mount-readonly');
+        if (readOnlyCheckbox && kind === 'image') {
+            readOnlyCheckbox.checked = true;
+        }
+
+        showNotification(`Selected ${kind === 'folder' ? 'folder' : 'image file'} for bind mount.`, false, true);
+    } catch (err) {
+        showNotification(`Failed to select host path: ${err}`, true);
+    }
 };
 
 window.closeModal = (modalId) => {
@@ -492,7 +549,12 @@ window.navigateAndFilterContainers = (filterType) => {
     if (filterDropdown) {
         filterDropdown.value = filterType;
     }
+    updateContainerViewMeta(filterType);
     switchTab('containers');
+};
+
+window.handleContainerFilterChange = () => {
+    loadContainers();
 };
 
 // --- Compose Actions ---
@@ -556,4 +618,60 @@ function formatBytes(bytes) {
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+function getSelectedContainerFilter() {
+    const filterDropdown = document.getElementById('container-filter');
+    return filterDropdown ? filterDropdown.value : 'all';
+}
+
+function updateContainerViewMeta(filterType) {
+    const view = containerViewMeta[filterType] || containerViewMeta.all;
+    const titleElement = document.getElementById('container-view-title');
+    const subtitleElement = document.getElementById('container-view-subtitle');
+
+    if (titleElement) {
+        titleElement.innerHTML = `
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="2" width="20" height="20" rx="2" ry="2"/><line x1="12" y1="2" x2="12" y2="22"/></svg>
+            ${view.title}
+        `;
+    }
+
+    if (subtitleElement) {
+        subtitleElement.textContent = view.subtitle;
+    }
+}
+
+function resetRunModal() {
+    const defaults = {
+        'run-image': '',
+        'run-name': '',
+        'run-ports': '',
+        'run-host-path': '',
+        'run-container-path': '',
+        'run-command': ''
+    };
+
+    Object.entries(defaults).forEach(([id, value]) => {
+        const element = document.getElementById(id);
+        if (element) {
+            element.value = value;
+        }
+    });
+
+    const readOnlyCheckbox = document.getElementById('run-mount-readonly');
+    if (readOnlyCheckbox) {
+        readOnlyCheckbox.checked = true;
+    }
+}
+
+function defaultContainerMountPath(kind, selectedPath) {
+    if (kind === 'image') {
+        return `/app/input/${basename(selectedPath)}`;
+    }
+    return '/app/host';
+}
+
+function basename(path) {
+    return path.split(/[\\/]/).pop() || 'selected-file';
 }

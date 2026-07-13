@@ -49,3 +49,14 @@ graph TD
   - Common first-run compose failures are fixed at launch time without requiring users to understand Podman socket internals.
   - The package install remains conservative and does not guess which desktop user should own persistent user services.
   - Systems without a valid user systemd session still fail clearly, with an actionable manual command.
+
+### ADR 5: Filesystem-Backed Container Workflows Use Native Pickers
+* **Context**: Host bind mounts are error-prone when users must type absolute filesystem paths manually, especially for long folder paths or single asset files such as images.
+* **Decision**:
+  - Podder uses Wails native file dialogs to select host folders and host image files for bind mounts.
+  - The Run Container workflow keeps the image name field text-based, but treats host content selection as an explicit native-picker action.
+  - The Containers view exposes the active filter state clearly so dashboard navigation into running/stopped subsets is obvious.
+* **Consequences & Benefits**:
+  - Users can mount host content without copying filesystem paths manually.
+  - The bind-mount flow remains local and secure because Podder validates and passes paths directly to `podman` without shell interpolation.
+  - Filtered dashboard navigation behaves more like a focused drill-down than a blind tab switch.

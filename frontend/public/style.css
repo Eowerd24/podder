@@ -156,6 +156,19 @@ body {
     gap: 16px;
 }
 
+.stat-card-button {
+    width: 100%;
+    text-align: left;
+    appearance: none;
+    cursor: pointer;
+    color: inherit;
+}
+
+.stat-card-button:focus-visible {
+    outline: 2px solid rgba(99, 102, 241, 0.8);
+    outline-offset: 3px;
+}
+
 .stat-card:hover {
     border-color: var(--border-hover);
     transform: translateY(-2px);
@@ -279,6 +292,12 @@ body {
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.section-subtitle {
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--text-muted);
 }
 
 .container-grid, .image-grid {
@@ -557,6 +576,43 @@ body {
     color: rgba(255, 255, 255, 0.25);
 }
 
+.picker-group {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+}
+
+.picker-group .form-input {
+    flex: 1;
+}
+
+.picker-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.form-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 18px;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.checkbox-row input {
+    accent-color: var(--color-primary);
+}
+
 /* Code Logs Output */
 .logs-output {
     background: #04050a;
@@ -642,6 +698,21 @@ body {
 
 .empty-state p {
     font-size: 14px;
+}
+
+@media (max-width: 900px) {
+    .picker-group {
+        flex-direction: column;
+    }
+
+    .picker-actions {
+        width: 100%;
+    }
+
+    .picker-actions .btn {
+        flex: 1;
+        justify-content: center;
+    }
 }
 
 /* Scrollbar Customization */

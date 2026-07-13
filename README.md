@@ -11,6 +11,7 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 - **Real-Time Logs**: View streaming container stdout/stderr in a scrollable terminal-style modal.
 - **Image Management**: List local images, pull new ones from public registries, run containers from images via quick forms, and delete unneeded images.
 - **Global CLI Command**: Act as a compose provider. Running `pod up` or `pod down` in a folder containing a compose file triggers your compose provider.
+- **Podman Socket Preflight**: Before Podder runs `podman compose`, it checks for the rootless Podman API socket and tries to start `podman.socket` automatically when the socket is missing.
 
 ---
 
@@ -37,6 +38,13 @@ sudo curl -L -o /usr/local/bin/pod https://github.com/Eowerd24/podder/releases/l
 - Type `pod` anywhere in your terminal to open the GUI.
 - Type `pod up` in a directory with a `docker-compose.yml` to spin up containers.
 - Type `pod pull ubuntu` (or any podman command) to pass native commands directly to Podman.
+
+When `pod up` needs the Podman Docker-compatible API socket, Podder will try `systemctl --user start podman.socket` automatically. If you want that socket to be reliably available after login or reboot, enable it once yourself:
+
+```bash
+systemctl --user enable --now podman.socket
+sudo loginctl enable-linger "$USER"
+```
 
 *(Ubuntu/Debian users: Ensure you have the standard WebKit library installed via `sudo apt install libwebkitgtk-6.0-4`)*
 

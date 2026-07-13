@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Podder now prefers Podman-native compose execution before falling back to plain `docker-compose`.
+- `pod up` / `podder up` now preflight the rootless Podman API socket and attempt `systemctl --user start podman.socket` automatically when `podman compose` needs it.
+
 ## [1.0.0] - 2026-07-11
 
 ### Added
@@ -18,5 +24,4 @@ All notable changes to this project will be documented in this file.
 - Comprehensive `.gitignore` configuration for Go, Wails v3, Node.js, and IDE files.
 - Command-line argument parsing in `main.go` supporting `podder up` / `podder down` commands for executing `compose` commands.
 - Symlinks for `podder` and `pod` globally exposed in the user's path (`/home/sarge/.local/bin/`).
-
 

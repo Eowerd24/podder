@@ -1,45 +1,40 @@
-# PLAN: Native Host Path Pickers And Dashboard Filter Navigation
+# PLAN: Patch Version Bump To 0.1.1
 
 ## Objective
-Improve Podder's container workflow by letting users choose host folders or image files from a native file explorer when preparing a bind mount, and make the dashboard stat cards route cleanly into the Images or Containers views with the appropriate filters already selected.
+Bump Podder's application version by `0.0.1`, normalize inconsistent version metadata across packaging files, update the README and changelog to match, and create a fresh local commit on the current feature branch.
 
 ## Scope & Impact Analysis
 - **Files to modify**:
-  - `podman.go`: add native picker support for host folders and image files; extend container run support with optional bind-mount arguments.
-  - `podman_test.go`: add regression coverage for run-argument assembly and image-file validation helpers.
-  - `frontend/index.html`: expand the run modal with host-path controls and make the dashboard stat cards explicit interactive controls.
-  - `frontend/src/main.js`: wire picker actions, bind-mount submission, and filtered dashboard navigation state.
-  - `frontend/public/style.css`: style the new picker controls, filter subtitles, and clickable stat-card buttons.
-  - `docs/project-context.md`: record the native file-picker decision for filesystem-backed container workflows.
-  - `CHANGELOG.md`: capture the user-facing workflow changes.
+  - `build/config.yml`: align the app version source with the new release version.
+  - Platform packaging/version manifests that currently reference `0.1.0` or `0.0.1`:
+    - `build/linux/nfpm/nfpm.yaml`
+    - `build/darwin/Info.plist`
+    - `build/darwin/Info.dev.plist`
+    - `build/ios/Info.plist`
+    - `build/ios/Info.dev.plist`
+    - `build/windows/info.json`
+    - `build/windows/nsis/wails_tools.nsh`
+    - `build/windows/wails.exe.manifest`
+    - `build/windows/msix/app_manifest.xml`
+    - `build/windows/msix/template.xml`
+  - `README.md`: mention the current release version explicitly so install/build docs reflect the bump.
+  - `CHANGELOG.md`: convert the current unreleased entries into a `0.1.1` release entry.
 - **Runtime impact**:
-  - Users can pick a host folder or a host image file without typing absolute paths manually.
-  - Running or stopped container cards on the dashboard open the Containers tab with a visible filtered state.
-  - Existing image pull/build/compose workflows remain unchanged.
+  - No behavioral change to Podder itself.
+  - Build outputs and packaged binaries will report `0.1.1` consistently across supported platforms.
 
 ## Implementation Approach
-1. Add backend helpers for:
-   - validating supported image-file selections
-   - building `podman run` arguments with an optional bind mount
-   - opening native dialogs for either a host folder or a host image file
-2. Expand the Run Container modal with:
-   - a read-only selected host path field
-   - separate picker buttons for folders and image files
-   - a container mount target path field
-   - a read-only toggle for the mount
-3. Route run submissions through Wails runtime `Call.ByName(...)` for the new picker flow so the frontend does not depend on regenerated numeric binding IDs inside this workspace.
-4. Make dashboard stat cards explicit button-like controls and add a visible subtitle on the Containers view so the selected filter is obvious after navigation.
+1. Treat the existing effective release baseline as `0.1.0` and bump it to `0.1.1`.
+2. Correct the outlier in `build/config.yml` from `0.0.1` to `0.1.1` so the central build metadata matches the platform manifests.
+3. Update README release wording so the current version is visible in the install/build guidance.
+4. Roll the current unreleased changes into a dated `0.1.1` changelog section.
+5. Commit the version/documentation changes locally on the active branch.
 
 ## Testing Strategy
-- Run Go unit tests for the new pure helper logic if a Go toolchain is available.
-- Manually verify:
-  - selecting a folder populates the run modal and mounts it into a new container
-  - selecting an image file populates the run modal and mounts it into a new container
-  - invalid non-image file selections are rejected with a clear error
-  - clicking dashboard cards opens All Containers, Running, Stopped, or Images as appropriate
-- Confirm no regressions in image listing, container listing, compose actions, and image build selection.
+- Verify all targeted manifest files now reference `0.1.1` consistently.
+- Re-scan the repo for stale `0.1.0` / `0.0.1` version strings in Podder-owned release metadata.
+- Confirm the branch is clean after the new commit.
 
 ## Rollback Plan
-- Revert the run-modal picker additions in the frontend.
-- Revert the optional bind-mount and picker logic in `podman.go`.
-- Remove the docs and changelog entries describing the feature.
+- Revert the manifest and documentation edits.
+- Remove the local version-bump commit if needed.

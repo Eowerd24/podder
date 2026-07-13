@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-13
+
 ### Changed
 - Podder now prefers Podman-native compose execution before falling back to plain `docker-compose`.
 - `pod up` / `podder up` now preflight the rootless Podman API socket and attempt `systemctl --user start podman.socket` automatically when `podman compose` needs it.

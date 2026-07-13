@@ -1,56 +1,40 @@
-# PLAN: Implementing CLI Commands for Podman GUI & Compose Control
+# PLAN: Patch Version Bump To 0.1.1
 
 ## Objective
-Enhance the built binary to function both as a GUI application (when run with no arguments) and as a CLI wrapper for compose commands (when run as `podder up` / `podder down` or `pod up` / `pod down` in a directory with a compose file). Expose `podder` and `pod` globally in the user's path.
+Bump Podder's application version by `0.0.1`, normalize inconsistent version metadata across packaging files, update the README and changelog to match, and create a fresh local commit on the current feature branch.
 
-## Scope
+## Scope & Impact Analysis
 - **Files to modify**:
-  - `main.go`: Parse command-line arguments to intercept `up`/`down` commands and route them to compose executors.
-- **Symlinks to create**:
-  - `/home/sarge/.local/bin/podder` -> `/home/sarge/Downloads/podder/bin/podder`
-  - `/home/sarge/.local/bin/pod` -> `/home/sarge/Downloads/podder/bin/podder`
+  - `build/config.yml`: align the app version source with the new release version.
+  - Platform packaging/version manifests that currently reference `0.1.0` or `0.0.1`:
+    - `build/linux/nfpm/nfpm.yaml`
+    - `build/darwin/Info.plist`
+    - `build/darwin/Info.dev.plist`
+    - `build/ios/Info.plist`
+    - `build/ios/Info.dev.plist`
+    - `build/windows/info.json`
+    - `build/windows/nsis/wails_tools.nsh`
+    - `build/windows/wails.exe.manifest`
+    - `build/windows/msix/app_manifest.xml`
+    - `build/windows/msix/template.xml`
+  - `README.md`: mention the current release version explicitly so install/build docs reflect the bump.
+  - `CHANGELOG.md`: convert the current unreleased entries into a `0.1.1` release entry.
+- **Runtime impact**:
+  - No behavioral change to Podder itself.
+  - Build outputs and packaged binaries will report `0.1.1` consistently across supported platforms.
 
 ## Implementation Approach
-
-### 1. Argument Parsing in `main.go`
-- Add imports: `"fmt"`, `"os"`, `"os/exec"`, `"path/filepath"`.
-- At the start of `main()`, check `os.Args`.
-- If `len(os.Args) > 1`:
-  - Read `os.Args[1]`.
-  - If `os.Args[1] == "up"` or `os.Args[1] == "down"`:
-    - Call a helper function `handleComposeCommand(os.Args[1])` to run the compose tool and exit.
-  - If `os.Args[1] == "help"` or `--help` or `-h`:
-    - Print a clean help manual and exit.
-  - Otherwise, print an unknown command error and exit.
-- If `len(os.Args) == 1`, proceed with launching the Wails GUI window.
-
-### 2. Compose Execution Helper (`main.go`)
-- Check for existence of compose configuration files in the current working directory:
-  - `compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`.
-  - If none are found, report: `"No compose file (compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml) found in the current directory."` and exit with 1.
-- Resolve the compose provider executable:
-  - Look up `podman-compose` in the system path.
-  - If not found, look up `docker-compose` in the system path.
-  - If not found, look up `podman compose` (by checking if `podman` works with `compose`).
-  - If no compose provider is available, print:
-    `"Error: No compose provider found in path. Please install 'podman-compose' or 'docker-compose'."` and exit with 1.
-- Run the compose provider with the command (`up -d` for "up", or `down` for "down").
-- Bind the provider process's stdout/stderr and stdin directly to `os.Stdout`, `os.Stderr`, and `os.Stdin` to allow interactive output and real-time streaming.
-
-### 3. Path Linking
-- Create symlinks `/home/sarge/.local/bin/podder` and `/home/sarge/.local/bin/pod` pointing to the built binary, ensuring the commands can be run from any directory.
+1. Treat the existing effective release baseline as `0.1.0` and bump it to `0.1.1`.
+2. Correct the outlier in `build/config.yml` from `0.0.1` to `0.1.1` so the central build metadata matches the platform manifests.
+3. Update README release wording so the current version is visible in the install/build guidance.
+4. Roll the current unreleased changes into a dated `0.1.1` changelog section.
+5. Commit the version/documentation changes locally on the active branch.
 
 ## Testing Strategy
-- Compile the code: `wails3 build`.
-- Create a test directory with a simple `compose.yaml` (running a small service like Alpine).
-- Test executing `podder up` and `podder down` from that directory.
-- Test running `pod up` and `pod down` (verifying symlink).
-- Test running `podder` and `pod` with no arguments (verifying GUI launch behavior).
-
-## Risks & Mitigations
-- **Risk**: GUI launch tries to compile or run, but is missing X11/display connection.
-  - *Mitigation*: CLI compose commands exit immediately without initializing the Wails GUI application. They execute in head/terminal mode.
+- Verify all targeted manifest files now reference `0.1.1` consistently.
+- Re-scan the repo for stale `0.1.0` / `0.0.1` version strings in Podder-owned release metadata.
+- Confirm the branch is clean after the new commit.
 
 ## Rollback Plan
-- Delete the symlinks.
-- Revert changes to `main.go`.
+- Revert the manifest and documentation edits.
+- Remove the local version-bump commit if needed.

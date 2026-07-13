@@ -18,4 +18,9 @@ else
   echo "Warning: update-mime-database command not found. Custom URL schemes may not be immediately recognized." >&2
 fi
 
+echo "Note: Podder will try to start your user podman.socket automatically when compose launches need it."
+echo "Note: To keep the rootless Podman API socket available across sessions, run:"
+echo "  systemctl --user enable --now podman.socket"
+echo "  sudo loginctl enable-linger \$USER"
+
 exit 0

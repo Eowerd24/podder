@@ -15,6 +15,19 @@ import (
 // PodmanService handles execution of Podman CLI commands and parsing of JSON outputs.
 type PodmanService struct{}
 
+var supportedImageExtensions = map[string]struct{}{
+	".avif":  {},
+	".bmp":   {},
+	".gif":   {},
+	".jpeg":  {},
+	".jpg":   {},
+	".png":   {},
+	".svg":   {},
+	".tif":   {},
+	".tiff":  {},
+	".webp":  {},
+}
+
 // Container represents a Podman container.
 type Container struct {
 	Id         string   `json:"Id"`
@@ -273,10 +286,23 @@ func (p *PodmanService) PullImage(name string) error {
 }
 
 // RunContainer runs a container from an image with optional configuration.
-func (p *PodmanService) RunContainer(image string, name string, ports string, cmd string) error {
+func (p *PodmanService) RunContainer(image string, name string, ports string, cmd string, hostPath string, containerPath string, readOnly bool) error {
+	args, err := buildRunContainerArgs(image, name, ports, cmd, hostPath, containerPath, readOnly)
+	if err != nil {
+		return err
+	}
+
+	_, stderr, err := p.runCommand(args...)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+func buildRunContainerArgs(image string, name string, ports string, cmd string, hostPath string, containerPath string, readOnly bool) ([]string, error) {
 	image = strings.TrimSpace(image)
 	if image == "" {
-		return fmt.Errorf("image name cannot be empty")
+		return nil, fmt.Errorf("image name cannot be empty")
 	}
 
 	args := []string{"run", "-d"}
@@ -291,20 +317,69 @@ func (p *PodmanService) RunContainer(image string, name string, ports string, cm
 		args = append(args, "-p", ports)
 	}
 
+	hostPath = strings.TrimSpace(hostPath)
+	containerPath = strings.TrimSpace(containerPath)
+	if hostPath == "" && containerPath != "" {
+		return nil, fmt.Errorf("host path is required when a container mount path is provided")
+	}
+	if hostPath != "" && containerPath == "" {
+		return nil, fmt.Errorf("container mount path is required when a host path is provided")
+	}
+	if hostPath != "" {
+		if _, err := os.Stat(hostPath); err != nil {
+			return nil, fmt.Errorf("host path is not accessible: %w", err)
+		}
+
+		mountSpec := fmt.Sprintf("type=bind,src=%s,target=%s", hostPath, containerPath)
+		if readOnly {
+			mountSpec += ",readonly"
+		}
+		args = append(args, "--mount", mountSpec)
+	}
+
 	args = append(args, image)
 
 	cmd = strings.TrimSpace(cmd)
 	if cmd != "" {
-		// Split cmd by space to pass arguments properly (simple split, directly as slice elements)
-		cmdParts := strings.Fields(cmd)
-		args = append(args, cmdParts...)
+		args = append(args, strings.Fields(cmd)...)
 	}
 
-	_, stderr, err := p.runCommand(args...)
-	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	return args, nil
+}
+
+func isSupportedImageFile(path string) bool {
+	extension := strings.ToLower(filepath.Ext(strings.TrimSpace(path)))
+	_, ok := supportedImageExtensions[extension]
+	return ok
+}
+
+// SelectHostPath prompts the user to select a host folder or image file for a bind mount.
+func (p *PodmanService) SelectHostPath(kind string) (string, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+
+	dialog := application.Get().Dialog.OpenFile()
+	switch kind {
+	case "folder":
+		dialog = dialog.SetTitle("Select Host Folder").CanChooseDirectories(true).CanChooseFiles(false)
+	case "image":
+		dialog = dialog.SetTitle("Select Host Image File").CanChooseDirectories(false).CanChooseFiles(true)
+	default:
+		return "", fmt.Errorf("unsupported selection kind: %s", kind)
 	}
-	return nil
+
+	path, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("failed to open dialog: %v", err)
+	}
+	if path == "" {
+		return "", nil
+	}
+
+	if kind == "image" && !isSupportedImageFile(path) {
+		return "", fmt.Errorf("selected file must be an image (png, jpg, jpeg, gif, webp, bmp, svg, tif, tiff, avif)")
+	}
+
+	return path, nil
 }
 
 // SelectAndRunCompose triggers a native OS file dialog to select a folder or compose file,

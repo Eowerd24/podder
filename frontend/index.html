@@ -42,7 +42,7 @@
         <!-- DASHBOARD TAB -->
         <section id="tab-dashboard" class="tab-content active">
             <div class="stats-grid">
-                <div class="stat-card" style="cursor: pointer;" onclick="navigateAndFilterContainers('all')" title="View All Containers">
+                <button type="button" class="stat-card stat-card-button" onclick="navigateAndFilterContainers('all')" title="View All Containers">
                     <div class="stat-icon">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
                     </div>
@@ -50,9 +50,8 @@
                         <span class="stat-label">Total Containers</span>
                         <span id="stat-containers-total" class="stat-num">0</span>
                     </div>
-                </div>
-                <div class="stat-card" style="cursor: pointer;" onclick="navigateAndFilterContainers('running')" title="View Running Containers">
-                    <div class="stat-card-inner"></div>
+                </button>
+                <button type="button" class="stat-card stat-card-button" onclick="navigateAndFilterContainers('running')" title="View Running Containers">
                     <div class="stat-icon emerald">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                     </div>
@@ -60,8 +59,8 @@
                         <span class="stat-label">Running</span>
                         <span id="stat-containers-running" class="stat-num">0</span>
                     </div>
-                </div>
-                <div class="stat-card" style="cursor: pointer;" onclick="navigateAndFilterContainers('stopped')" title="View Stopped Containers">
+                </button>
+                <button type="button" class="stat-card stat-card-button" onclick="navigateAndFilterContainers('stopped')" title="View Stopped Containers">
                     <div class="stat-icon rose">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/></svg>
                     </div>
@@ -69,8 +68,8 @@
                         <span class="stat-label">Stopped</span>
                         <span id="stat-containers-stopped" class="stat-num">0</span>
                     </div>
-                </div>
-                <div class="stat-card" style="cursor: pointer;" onclick="switchTab('images')" title="View Images">
+                </button>
+                <button type="button" class="stat-card stat-card-button" onclick="switchTab('images')" title="View Images">
                     <div class="stat-icon cyan">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                     </div>
@@ -78,7 +77,7 @@
                         <span class="stat-label">Total Images</span>
                         <span id="stat-images-total" class="stat-num">0</span>
                     </div>
-                </div>
+                </button>
             </div>
 
             <div class="dashboard-grid">
@@ -154,12 +153,15 @@
         <!-- CONTAINERS TAB -->
         <section id="tab-containers" class="tab-content">
             <div class="section-header">
-                <div class="section-title">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="2" width="20" height="20" rx="2" ry="2"/><line x1="12" y1="2" x2="12" y2="22"/></svg>
-                    Containers
+                <div>
+                    <div id="container-view-title" class="section-title">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="2" width="20" height="20" rx="2" ry="2"/><line x1="12" y1="2" x2="12" y2="22"/></svg>
+                        Containers
+                    </div>
+                    <p id="container-view-subtitle" class="section-subtitle">Browse every local container or narrow the list to running or stopped instances.</p>
                 </div>
                 <div style="display: flex; gap: 16px; align-items: center;">
-                    <select id="container-filter" class="form-input" style="width: 160px; padding: 6px 10px; font-size: 13px; cursor: pointer;" onchange="loadContainers()">
+                    <select id="container-filter" class="form-input" style="width: 160px; padding: 6px 10px; font-size: 13px; cursor: pointer;" onchange="handleContainerFilterChange()">
                         <option value="all">All Containers</option>
                         <option value="running">Running Only</option>
                         <option value="stopped">Stopped Only</option>
@@ -241,6 +243,25 @@
                     <label class="form-label">Port Mapping (Optional)</label>
                     <input type="text" id="run-ports" class="form-input" placeholder="e.g. 8080:80"/>
                 </div>
+                <div class="form-group">
+                    <label class="form-label">Host Content (Optional)</label>
+                    <div class="picker-group">
+                        <input type="text" id="run-host-path" class="form-input" placeholder="Choose a host folder or image file" readonly/>
+                        <div class="picker-actions">
+                            <button type="button" class="btn btn-secondary" onclick="pickRunHostPath('folder')">Pick Folder</button>
+                            <button type="button" class="btn btn-secondary" onclick="pickRunHostPath('image')">Pick Image</button>
+                        </div>
+                    </div>
+                    <p class="form-hint">Use a native file explorer to mount a folder or single image file into the container.</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Container Mount Path (Optional)</label>
+                    <input type="text" id="run-container-path" class="form-input" placeholder="e.g. /app/host or /usr/share/nginx/html/image.png"/>
+                </div>
+                <label class="checkbox-row">
+                    <input type="checkbox" id="run-mount-readonly" checked/>
+                    <span>Mount selected host content as read-only</span>
+                </label>
                 <div class="form-group">
                     <label class="form-label">Command (Optional)</label>
                     <input type="text" id="run-command" class="form-input" placeholder="e.g. sleep 1000"/>

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"embed"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"strings"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -19,13 +22,23 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+type composeProvider struct {
+	path              string
+	args              []string
+	needsPodmanSocket bool
+}
+
+type lookPathFunc func(file string) (string, error)
+type pathExistsFunc func(path string) bool
+type commandRunner func(name string, args ...string) error
+
 // main function serves as the application's entry point. It initializes the application, creates a window,
 // and starts the application.
 func main() {
 	// Disable WebKitGTK sandbox to prevent bubblewrap (bwrap) crash on systems with restricted user namespaces
 	// This is a known issue on Ubuntu 24.04 and other Linux systems with AppArmor restricting user namespaces.
 	os.Setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1")
-	
+
 	// Disable WebKitGTK hardware acceleration/compositing features that fail in environments without DRI3
 	// This fixes the sluggishness and libEGL warnings.
 	os.Setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
@@ -89,60 +102,23 @@ func main() {
 
 // handleComposeCommand routes compose up/down requests to podman-compose, docker-compose, or podman compose.
 func handleComposeCommand(action string) {
-	// 1. Detect compose file in current directory
-	composeFiles := []string{
-		"compose.yaml",
-		"compose.yml",
-		"docker-compose.yaml",
-		"docker-compose.yml",
-	}
-
-	found := false
-	for _, file := range composeFiles {
-		if _, err := os.Stat(file); err == nil {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		fmt.Printf("Error: No compose file (compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml) found in the current directory.\n")
+	if err := ensureComposeFilePresent(); err != nil {
+		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	// 2. Resolve compose tool
-	var composeCmd *exec.Cmd
-
-	// Check if podman-compose exists
-	if _, err := exec.LookPath("podman-compose"); err == nil {
-		if action == "up" {
-			composeCmd = exec.Command("podman-compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("podman-compose", "down")
-		}
-	} else if _, err := exec.LookPath("docker-compose"); err == nil {
-		// Check if docker-compose exists
-		if action == "up" {
-			composeCmd = exec.Command("docker-compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("docker-compose", "down")
-		}
-	} else {
-		// Fallback to "podman compose"
-		if _, err := exec.LookPath("podman"); err == nil {
-			if action == "up" {
-				composeCmd = exec.Command("podman", "compose", "up", "-d")
-			} else {
-				composeCmd = exec.Command("podman", "compose", "down")
-			}
-		}
-	}
-
-	if composeCmd == nil {
-		fmt.Println("Error: No compose provider found in PATH.")
-		fmt.Println("Please install 'podman-compose' or configure 'podman compose' (with a docker-compose provider).")
+	provider, err := resolveComposeProvider(action)
+	if err != nil {
+		fmt.Println(err)
 		os.Exit(1)
 	}
+
+	if err := ensureComposeProviderReady(provider); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	composeCmd := exec.Command(provider.path, provider.args...)
 
 	// Stream stdout, stderr and stdin directly
 	composeCmd.Stdout = os.Stdout
@@ -155,6 +131,137 @@ func handleComposeCommand(action string) {
 		fmt.Printf("Error running compose command: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func ensureComposeFilePresent() error {
+	composeFiles := []string{
+		"compose.yaml",
+		"compose.yml",
+		"docker-compose.yaml",
+		"docker-compose.yml",
+	}
+
+	for _, file := range composeFiles {
+		if _, err := os.Stat(file); err == nil {
+			return nil
+		}
+	}
+
+	return errors.New("Error: No compose file (compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml) found in the current directory.")
+}
+
+func resolveComposeProvider(action string) (*composeProvider, error) {
+	return resolveComposeProviderWithLookPath(action, exec.LookPath)
+}
+
+func resolveComposeProviderWithLookPath(action string, lookPath lookPathFunc) (*composeProvider, error) {
+	args, err := composeArgs(action)
+	if err != nil {
+		return nil, err
+	}
+
+	if path, err := lookPath("podman-compose"); err == nil {
+		return &composeProvider{
+			path: path,
+			args: args,
+		}, nil
+	}
+
+	if path, err := lookPath("podman"); err == nil {
+		return &composeProvider{
+			path:              path,
+			args:              append([]string{"compose"}, args...),
+			needsPodmanSocket: true,
+		}, nil
+	}
+
+	if path, err := lookPath("docker-compose"); err == nil {
+		return &composeProvider{
+			path: path,
+			args: args,
+		}, nil
+	}
+
+	return nil, errors.New("Error: No compose provider found in PATH.\nPlease install 'podman-compose' or configure 'podman compose' (with a docker-compose provider).")
+}
+
+func composeArgs(action string) ([]string, error) {
+	switch action {
+	case "up":
+		return []string{"up", "-d"}, nil
+	case "down":
+		return []string{"down"}, nil
+	default:
+		return nil, fmt.Errorf("Error: Unsupported compose action %q.", action)
+	}
+}
+
+func ensureComposeProviderReady(provider *composeProvider) error {
+	if !provider.needsPodmanSocket {
+		return nil
+	}
+
+	socketPath := podmanSocketPath(os.Getenv, currentUserUID())
+	return ensurePodmanSocket(socketPath, fileExists, exec.LookPath, runStreamingCommand)
+}
+
+func podmanSocketPath(getenv func(string) string, uid string) string {
+	if runtimeDir := getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+		return filepath.Join(runtimeDir, "podman", "podman.sock")
+	}
+
+	if uid == "" {
+		return ""
+	}
+
+	return filepath.Join("/run/user", uid, "podman", "podman.sock")
+}
+
+func currentUserUID() string {
+	currentUser, err := user.Current()
+	if err != nil {
+		return ""
+	}
+
+	return currentUser.Uid
+}
+
+func ensurePodmanSocket(socketPath string, exists pathExistsFunc, lookPath lookPathFunc, run commandRunner) error {
+	if socketPath == "" {
+		return errors.New("Error: Could not determine the Podman API socket path for this user session.")
+	}
+
+	if exists(socketPath) {
+		return nil
+	}
+
+	if _, err := lookPath("systemctl"); err != nil {
+		return fmt.Errorf("Error: Podman compose needs the user socket at %s, but it is not present and 'systemctl' is unavailable.\nRun 'systemctl --user enable --now podman.socket' manually.", socketPath)
+	}
+
+	fmt.Printf("Podman API socket not detected at %s. Starting podman.socket...\n", socketPath)
+	if err := run("systemctl", "--user", "start", "podman.socket"); err != nil {
+		return fmt.Errorf("Error: Failed to start podman.socket for compose support: %w\nRun 'systemctl --user enable --now podman.socket' manually and try again.", err)
+	}
+
+	if !exists(socketPath) {
+		return fmt.Errorf("Error: Podman socket is still unavailable at %s after starting podman.socket.\nCheck 'systemctl --user status podman.socket --no-pager' for details.", socketPath)
+	}
+
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func runStreamingCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
 }
 
 // handlePodmanPassthrough routes all unrecognized commands directly to the native podman CLI.

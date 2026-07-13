@@ -38,3 +38,25 @@ graph TD
   - We use standard Go synchronous calls, but the Wails frontend calls them asynchronously (via JS promises).
   - We use a spinner animation on the active buttons to signal loading states.
   - We auto-refresh stats and container lists every 5 seconds, and container logs every 3 seconds when the logs modal is open.
+
+### ADR 4: Compose Launches Perform A Podman Socket Preflight
+* **Context**: `podman compose` can depend on the user-scoped Docker-compatible Podman API socket (`podman.sock`). On many rootless systems that socket is not started by default, which causes first-run compose failures even though Podman itself is installed correctly.
+* **Decision**:
+  - Podder prefers Podman-native compose execution over plain `docker-compose` when both are available.
+  - Before running a compose provider that needs the Podman API socket, Podder checks whether the socket exists and attempts `systemctl --user start podman.socket` if it does not.
+  - Podder does not auto-enable lingering or mutate user systemd state from package install scripts.
+* **Consequences & Benefits**:
+  - Common first-run compose failures are fixed at launch time without requiring users to understand Podman socket internals.
+  - The package install remains conservative and does not guess which desktop user should own persistent user services.
+  - Systems without a valid user systemd session still fail clearly, with an actionable manual command.
+
+### ADR 5: Filesystem-Backed Container Workflows Use Native Pickers
+* **Context**: Host bind mounts are error-prone when users must type absolute filesystem paths manually, especially for long folder paths or single asset files such as images.
+* **Decision**:
+  - Podder uses Wails native file dialogs to select host folders and host image files for bind mounts.
+  - The Run Container workflow keeps the image name field text-based, but treats host content selection as an explicit native-picker action.
+  - The Containers view exposes the active filter state clearly so dashboard navigation into running/stopped subsets is obvious.
+* **Consequences & Benefits**:
+  - Users can mount host content without copying filesystem paths manually.
+  - The bind-mount flow remains local and secure because Podder validates and passes paths directly to `podman` without shell interpolation.
+  - Filtered dashboard navigation behaves more like a focused drill-down than a blind tab switch.

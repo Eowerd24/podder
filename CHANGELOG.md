@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-07-15
+
+### Changed
+- Updated release metadata and packaging manifests to version `1.1.2`.
+- GitHub Actions now publishes the Linux binary for the `v1.1.2` release tag.
+
 ## [0.1.1] - 2026-07-13
 
 ### Changed

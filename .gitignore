@@ -32,3 +32,9 @@ test.out
 *.sw?
 .DS_Store
 Thumbs.db
+
+# Local agent notes
+AGENTS.md
+AGY.md
+PLAN.md
+PROGRESS.md

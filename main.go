@@ -1,8 +1,8 @@
 package main
 
 import (
-	"errors"
 	"embed"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -126,7 +126,7 @@ func handleComposeCommand(action string) {
 	composeCmd.Stdin = os.Stdin
 
 	fmt.Printf("Executing: %s %s...\n", composeCmd.Path, strings.Join(composeCmd.Args[1:], " "))
-	err := composeCmd.Run()
+	err = composeCmd.Run()
 	if err != nil {
 		fmt.Printf("Error running compose command: %v\n", err)
 		os.Exit(1)

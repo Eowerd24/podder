@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -334,7 +335,9 @@ func TestValidatePortMapping(t *testing.T) {
 		t.Errorf("expected container port 0 to be invalid")
 	}
 
-	// 3. Wildcard exposure warning
+	// 3. Wildcard exposure classification: a brand-new mapping has nothing
+	// to have "changed" from, so ExposureChange must stay false absent an
+	// OldHostIP to compare against — only the classification is reported.
 	res3, err := service.ValidatePortMapping(PortMappingRequest{
 		HostIP:        "0.0.0.0",
 		HostPort:      59999,
@@ -344,8 +347,32 @@ func TestValidatePortMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !res3.ExposureChange || res3.Exposure != "wildcard" {
-		t.Errorf("expected wildcard exposure detection: %+v", res3)
+	if res3.ExposureChange {
+		t.Errorf("expected no ExposureChange for a brand-new mapping with no prior state: %+v", res3)
+	}
+	if res3.Exposure != "wildcard" {
+		t.Errorf("expected wildcard exposure classification: %+v", res3)
+	}
+	for _, c := range res3.Checks {
+		if strings.Contains(c.Message, "Public Exposure") {
+			t.Errorf("expected wildcard wording to avoid asserting Internet-'public' reachability, got: %q", c.Message)
+		}
+	}
+
+	// 4. A genuine exposure transition (loopback -> wildcard) IS reported
+	// when the caller supplies the previous bind address.
+	res4, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP:        "0.0.0.0",
+		HostPort:      59998,
+		ContainerPort: 80,
+		Protocol:      "tcp",
+		OldHostIP:     "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res4.ExposureChange {
+		t.Errorf("expected ExposureChange=true for a loopback->wildcard transition: %+v", res4)
 	}
 }
 

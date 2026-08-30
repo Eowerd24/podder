@@ -196,6 +196,70 @@ func EndpointsConflict(addrA, addrB string) bool {
 	return AddressesConflict(addrA, addrB)
 }
 
+// ClassifyExposure buckets a candidate bind address into a coarse exposure
+// category ("loopback", "specific-ip", "wildcard"), independent of any
+// prior state. This is candidate classification, not a "change" — a
+// brand-new wildcard mapping has nothing to have "changed" from. See
+// AnalyzeExposureTransition for genuine before/after comparisons.
+func ClassifyExposure(address string) string {
+	return CategorizeExposure(address)
+}
+
+// ExposureTransition describes what changed (if anything) about a
+// mapping's network exposure between an old and a new bind address.
+type ExposureTransition struct {
+	From    string `json:"from"`
+	To      string `json:"to"`
+	Widened bool   `json:"widened"`
+	Notice  string `json:"notice,omitempty"`
+}
+
+// exposureRank orders exposure categories from least to most reachable, so
+// a transition can be judged as widening, narrowing, or unchanged.
+func exposureRank(category string) int {
+	switch category {
+	case "loopback":
+		return 0
+	case "specific-ip":
+		return 1
+	case "wildcard":
+		return 2
+	default:
+		return 1
+	}
+}
+
+// AnalyzeExposureTransition compares the exposure of an old and a new bind
+// address and reports whether the change widens network reachability.
+// Unlike a bare "is this wildcard" flag, this distinguishes an actual
+// transition (loopback -> LAN, LAN -> wildcard, ...) from a brand-new
+// mapping with no prior state, and it never claims Internet-"public"
+// reachability merely because a service binds 0.0.0.0 — wildcard means all
+// local interfaces, not necessarily Internet-public routability, which
+// depends on firewall/NAT rules this function cannot see.
+func AnalyzeExposureTransition(oldAddress, newAddress string) ExposureTransition {
+	from := ClassifyExposure(oldAddress)
+	to := ClassifyExposure(newAddress)
+
+	t := ExposureTransition{From: from, To: to}
+	if exposureRank(to) <= exposureRank(from) {
+		return t
+	}
+
+	t.Widened = true
+	switch {
+	case from == "loopback" && to == "wildcard":
+		t.Notice = "Exposure is widening from local-only (loopback) to all interfaces. Any network-reachable host may connect, subject to firewall rules."
+	case from == "loopback" && to == "specific-ip":
+		t.Notice = "Exposure is widening from local-only (loopback) to a specific network interface. Hosts able to reach that interface may connect."
+	case from == "specific-ip" && to == "wildcard":
+		t.Notice = "Exposure is widening from a specific network interface to all interfaces."
+	default:
+		t.Notice = "Network exposure is widening."
+	}
+	return t
+}
+
 // EndpointsEquivalentForReconciliation reports whether two bind addresses
 // represent the same declared endpoint for reconciliation purposes. Unlike
 // EndpointsConflict, wildcard does not equal everything here: a registry

@@ -277,6 +277,9 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		assessment.Blockers = append(assessment.Blockers, fmt.Sprintf("Container is a member of Pod '%s'. Adopt the Pod rather than an individual member.", prov.PodName))
 	} else if prov.Type == "podder" {
 		assessment.Warnings = append(assessment.Warnings, "Container is already managed by Podder.")
+	} else if prov.Type == "ambiguous" {
+		assessment.CanAdopt = false
+		assessment.Blockers = append(assessment.Blockers, "Container has conflicting ownership evidence ("+prov.AmbiguityReason+"). Resolve the conflicting labels before adopting.")
 	}
 
 	// Default-deny representability gate: any inspected field Podder cannot

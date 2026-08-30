@@ -92,3 +92,71 @@ func TestClassifyProvenance_AdHoc(t *testing.T) {
 		t.Errorf("expected CanMutateDirectly to be false for unmanaged ad-hoc containers")
 	}
 }
+
+func TestClassifyProvenance_ComposeWithPodderLabelsIsAmbiguous(t *testing.T) {
+	// The dangerous case: an externally-owned Compose workload also carries
+	// a self-declared io.podder.managed=true label. This must never be
+	// classified as directly Podder-managed.
+	labels := map[string]string{
+		"com.docker.compose.project": "homelab-stack",
+		"com.docker.compose.service": "n8n",
+		"io.podder.managed":          "true",
+		"io.podder.service":          "n8n",
+	}
+
+	p := ClassifyProvenance(labels, "", "")
+	if p.Type != "ambiguous" {
+		t.Fatalf("expected type 'ambiguous' for conflicting Compose+Podder evidence, got %q", p.Type)
+	}
+	if p.CanMutateDirectly {
+		t.Errorf("expected ambiguous provenance to never permit direct mutation")
+	}
+	if !p.Ambiguous || p.AmbiguityReason == "" {
+		t.Errorf("expected Ambiguous=true with a populated AmbiguityReason, got %+v", p)
+	}
+}
+
+func TestClassifyProvenance_QuadletWithPodderLabelsIsAmbiguous(t *testing.T) {
+	labels := map[string]string{
+		"PODMAN_SYSTEMD_UNIT": "vaultwarden.service",
+		"io.podder.managed":   "true",
+	}
+	p := ClassifyProvenance(labels, "", "")
+	if p.Type != "ambiguous" {
+		t.Fatalf("expected type 'ambiguous' for conflicting Quadlet+Podder evidence, got %q", p.Type)
+	}
+}
+
+func TestClassifyProvenance_ComposeAndQuadletBothPresentIsAmbiguous(t *testing.T) {
+	labels := map[string]string{
+		"com.docker.compose.project": "stack",
+		"PODMAN_SYSTEMD_UNIT":        "unit.service",
+	}
+	p := ClassifyProvenance(labels, "", "")
+	if p.Type != "ambiguous" {
+		t.Fatalf("expected type 'ambiguous' when Compose and Quadlet markers coexist, got %q", p.Type)
+	}
+}
+
+func TestClassifyProvenance_PodTakesPrecedenceOverLabels(t *testing.T) {
+	// Pod membership is a runtime-structural fact; it must win even if
+	// Podder labels are also present, since port bindings genuinely belong
+	// to the Pod regardless of any label.
+	labels := map[string]string{"io.podder.managed": "true"}
+	p := ClassifyProvenance(labels, "pod-id-1", "my-pod")
+	if p.Type != "pod" {
+		t.Fatalf("expected Pod membership to take precedence, got %q", p.Type)
+	}
+}
+
+func TestClassifyProvenance_ConfidenceAndEvidencePopulated(t *testing.T) {
+	p := ClassifyProvenance(map[string]string{"io.podder.managed": "true"}, "", "")
+	if p.Confidence != "high" || len(p.Evidence) == 0 {
+		t.Errorf("expected high confidence with evidence for a clean Podder label, got %+v", p)
+	}
+
+	adhoc := ClassifyProvenance(nil, "", "")
+	if adhoc.Confidence == "" || len(adhoc.Evidence) == 0 {
+		t.Errorf("expected the ad-hoc fallback to still report confidence/evidence, got %+v", adhoc)
+	}
+}

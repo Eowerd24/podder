@@ -531,6 +531,22 @@ func TestClassifyLifecycle(t *testing.T) {
 	}
 }
 
+func TestMutateContainerPorts_UnchangedPortDoesNotConflictWithItself(t *testing.T) {
+	sim := newMutationSim()
+	samePorts := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	svc := setupManagedContainer(t, sim, "steady", "alpine", "running", samePorts)
+
+	// Requesting the exact same mapping the container already holds must
+	// not be rejected as a self-conflict.
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "steady", NewPorts: samePorts})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected an unchanged port mapping to be treated as its own claim, not a conflict: %+v", result.Steps)
+	}
+}
+
 func TestNewBackupNameIsUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 50; i++ {

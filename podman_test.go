@@ -416,6 +416,26 @@ func TestValidateSpecCatchesDuplicatePortsAndBadBinds(t *testing.T) {
 	}
 }
 
+func TestCreateContainerRejectsIntraRequestPortConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	svc := &PodmanService{runner: newFakeCommandRunner()}
+	req := ContainerCreateRequest{
+		Image: "alpine",
+		Name:  "clashing",
+		PortMappings: []PortMapping{
+			{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 81, Protocol: "tcp"},
+		},
+	}
+	if _, err := svc.CreateContainer(req); err == nil {
+		t.Fatalf("expected two mappings claiming the same host port within one request to be rejected")
+	}
+}
+
 func TestValidateSpecRejectsFutureSchemaVersion(t *testing.T) {
 	spec := ContainerSpec{Image: "alpine", SchemaVersion: CurrentSpecSchemaVersion + 1}
 	errs := ValidateSpec(spec)

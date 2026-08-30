@@ -94,6 +94,11 @@ type PortOverviewSummary struct {
 	RegistryUndeclared     int    `json:"registryUndeclared"`
 	RegistryMissing        int    `json:"registryMissing"`
 	RegistryReserved       int    `json:"registryReserved"`
+	// RegistryRemote counts registry records that are scoped to a
+	// different node than this Podder instance's local node — these are
+	// never counted toward RegistryMissing/RegistryReserved.
+	RegistryRemote int    `json:"registryRemote"`
+	LocalNode      string `json:"localNode,omitempty"`
 }
 
 // PortOverview is the aggregate model returned to the frontend.
@@ -109,6 +114,11 @@ type PortMappingRequest struct {
 	ContainerPort uint16 `json:"containerPort"`
 	Protocol      string `json:"protocol"`
 	ContainerID   string `json:"containerId,omitempty"`
+	// OldHostIP, when set, is the bind address this mapping is replacing
+	// (e.g. during a port mutation), letting ValidatePortMapping analyze
+	// the exposure TRANSITION instead of merely classifying the candidate
+	// in isolation.
+	OldHostIP string `json:"oldHostIP,omitempty"`
 }
 
 // ValidationCheck represents a single validation check result.
@@ -463,12 +473,21 @@ func (p *PodmanService) CollectPortClaims() ([]PortClaim, error) {
 		}
 	}
 
-	// 3. Collect from external port registry if configured & enabled
+	// 3. Collect from external port registry if configured & enabled. The
+	// registry is homelab-wide; only records that apply to THIS Podder
+	// instance's local node are collected as local claims at all — a
+	// record scoped to a different node is not a local claim, remote or
+	// otherwise (see GetPortOverview for how it's surfaced instead).
 	settings, err := p.GetSettings()
 	if err == nil && settings.PortRegistry.Enabled && settings.PortRegistry.Path != "" {
 		regResult, err := p.LoadPortRegistry(settings.PortRegistry.Path)
 		if err == nil && regResult.Loaded {
+			localNode := resolveLocalNode(settings)
 			for _, rp := range regResult.Ports {
+				if !nodeApplies(rp.Node, localNode) {
+					continue
+				}
+
 				claimSource := "registry-active"
 				if rp.State == "reserved" {
 					claimSource = "registry-reserved"
@@ -496,6 +515,32 @@ func (p *PodmanService) CollectPortClaims() ([]PortClaim, error) {
 	return claims, nil
 }
 
+// CollectBlockingClaims returns only the claims that represent a genuinely
+// occupied or intentionally reserved endpoint — i.e. ones that should block
+// a new deployment attempt. A registry "active" record is a declaration of
+// intended state, not confirmation that a socket is open, and must not
+// block deploying the very service that owns that declaration; a "planned"
+// record is even less concrete. Only live runtime evidence (Podman
+// containers, host listeners) and explicit registry reservations are
+// treated as blocking. Use this (not CollectPortClaims) for
+// ValidatePortMapping/FindFreePort; use CollectPortClaims for
+// reconciliation/display, where "active" claims are meaningful ownership
+// evidence even though they don't block allocation.
+func (p *PodmanService) CollectBlockingClaims() ([]PortClaim, error) {
+	all, err := p.CollectPortClaims()
+	if err != nil {
+		return nil, err
+	}
+	blocking := make([]PortClaim, 0, len(all))
+	for _, c := range all {
+		if c.Source == "registry-active" || c.Source == "registry-planned" {
+			continue
+		}
+		blocking = append(blocking, c)
+	}
+	return blocking, nil
+}
+
 // GetPortOverview aggregates all port mapping data, host listeners, and external registry reconciliation.
 func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	var items []PortOverviewItem
@@ -518,22 +563,34 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		registryResult, _ = p.LoadPortRegistry(settings.PortRegistry.Path)
 	}
 
+	localNode := resolveLocalNode(settings)
+
 	matchedRegistryIDs := make(map[string]bool)
 	registryMatchCount := 0
 	registryUndeclaredCount := 0
 	registryMissingCount := 0
 	registryReservedCount := 0
+	registryRemoteCount := 0
 
-	// Helper to find matching registry port
+	// Helper to find matching registry port. Uses
+	// EndpointsEquivalentForReconciliation (not EndpointsConflict/
+	// AddressesConflict): a registry entry declaring 0.0.0.0:3000 is not
+	// considered fulfilled by a runtime endpoint that only bound
+	// 127.0.0.1:3000 — the two would conflict at the socket layer if both
+	// tried to bind, but they are not the same declaration. Records scoped
+	// to a different node are never matched against local runtime state.
 	findRegistryMatch := func(bind string, port uint16, protocol string, serviceName string) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded {
 			return nil
 		}
 		for i := range registryResult.Ports {
 			rp := &registryResult.Ports[i]
+			if !nodeApplies(rp.Node, localNode) {
+				continue
+			}
 			if rp.Listener.Port == port &&
 				NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) &&
-				AddressesConflict(bind, rp.Listener.Address) {
+				EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
 				return rp
 			}
 		}
@@ -541,6 +598,9 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		if serviceName != "" {
 			for i := range registryResult.Ports {
 				rp := &registryResult.Ports[i]
+				if !nodeApplies(rp.Node, localNode) {
+					continue
+				}
 				if rp.Listener.Port == port &&
 					NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) &&
 					strings.EqualFold(rp.Service, serviceName) {
@@ -719,6 +779,44 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			status := "DECLARED"
 			reconcileStatus := "DECLARED_MISSING"
 
+			if !nodeApplies(rp.Node, localNode) {
+				// A registry-wide (homelab, not single-instance) record
+				// scoped to a different node describes a service this
+				// Podder instance does not, and should not, observe
+				// locally. It must never be reported as locally missing.
+				registryRemoteCount++
+				status = "REMOTE"
+				reconcileStatus = "REMOTE"
+
+				exposure := CategorizeExposure(rp.Listener.Address)
+				if rp.Scope != "" {
+					exposure = rp.Scope
+				}
+				owner := rp.Service
+				if owner == "" {
+					owner = rp.ID
+				}
+				items = append(items, PortOverviewItem{
+					ID:                   fmt.Sprintf("registry-%s-%d", rp.ID, idx),
+					Source:               "registry-declared",
+					Owner:                owner,
+					BindAddress:          rp.Listener.Address,
+					HostPort:             rp.Listener.Port,
+					ContainerPort:        rp.Container.Port,
+					Protocol:             strings.ToUpper(rp.Protocol),
+					Exposure:             exposure,
+					Status:               status,
+					IsContainer:          false,
+					RegistryID:           rp.ID,
+					RegistryState:        rp.State,
+					Scope:                rp.Node,
+					ApplicationProtocol:  rp.ApplicationProtocol,
+					ReconciliationStatus: reconcileStatus,
+					Purpose:              rp.Purpose,
+				})
+				continue
+			}
+
 			// Check if host port is currently occupied by another socket
 			isHostOccupied := false
 			for _, l := range listeners {
@@ -793,6 +891,8 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			RegistryUndeclared:     registryUndeclaredCount,
 			RegistryMissing:        registryMissingCount,
 			RegistryReserved:       registryReservedCount,
+			RegistryRemote:         registryRemoteCount,
+			LocalNode:              localNode,
 		},
 	}
 
@@ -860,36 +960,61 @@ func (p *PodmanService) ValidatePortMapping(req PortMappingRequest) (*PortValida
 		})
 	}
 
-	// 3. Exposure categorization
-	exposure := CategorizeExposure(req.HostIP)
+	// 3. Exposure classification. ClassifyExposure buckets this candidate
+	// in isolation — it is not, by itself, a "change" (a brand-new mapping
+	// has no prior state to have changed from). When the caller supplies
+	// OldHostIP (e.g. a mutation editing an existing mapping),
+	// AnalyzeExposureTransition reports whether reachability is actually
+	// widening. "wildcard" only ever means "all local interfaces", never
+	// "public" — public Internet routability depends on firewall/NAT rules
+	// this validation cannot see.
+	exposure := ClassifyExposure(req.HostIP)
 	result.Exposure = exposure
-	if exposure == "wildcard" {
-		result.ExposureChange = true
-		result.ExposureNotice = "Binding to wildcard (0.0.0.0 or all interfaces) exposes this port to external network traffic subject to host firewall rules."
+
+	if strings.TrimSpace(req.OldHostIP) != "" {
+		transition := AnalyzeExposureTransition(req.OldHostIP, req.HostIP)
+		if transition.Widened {
+			result.ExposureChange = true
+			result.ExposureNotice = transition.Notice
+			result.Checks = append(result.Checks, ValidationCheck{
+				Name:    "Exposure Transition",
+				Passed:  true,
+				Message: fmt.Sprintf("Exposure is widening: %s -> %s.", transition.From, transition.To),
+				Level:   "warning",
+			})
+		}
+	}
+
+	switch exposure {
+	case "wildcard":
 		result.Checks = append(result.Checks, ValidationCheck{
 			Name:    "Exposure Level",
 			Passed:  true,
-			Message: "Wildcard / Public Exposure (0.0.0.0 / all interfaces)",
+			Message: "All interfaces / network exposed (0.0.0.0): reachable from other hosts on networks that can route to this host, subject to firewall rules. This does not by itself mean Internet-public.",
 			Level:   "warning",
 		})
-	} else if exposure == "loopback" {
+	case "loopback":
 		result.Checks = append(result.Checks, ValidationCheck{
 			Name:    "Exposure Level",
 			Passed:  true,
-			Message: "Local-only / Loopback (127.0.0.1)",
+			Message: "Local-only / loopback (127.0.0.1)",
 			Level:   "ok",
 		})
-	} else {
+	default:
 		result.Checks = append(result.Checks, ValidationCheck{
 			Name:    "Exposure Level",
 			Passed:  true,
-			Message: fmt.Sprintf("Specific Host IP (%s)", req.HostIP),
+			Message: fmt.Sprintf("Specific host interface (%s): network-reachable according to routing/firewall rules.", req.HostIP),
 			Level:   "ok",
 		})
 	}
 
-	// 4. Collision check against active claims (containers, host listeners, registry reservations)
-	claims, err := p.CollectPortClaims()
+	// 4. Collision check against blocking claims only (live containers,
+	// host listeners, explicit registry reservations). A registry "active"
+	// or "planned" declaration is intended state, not a confirmed open
+	// socket, and must not block deploying the very service that owns that
+	// declaration — see CollectBlockingClaims.
+	claims, err := p.CollectBlockingClaims()
 	if err == nil && req.HostPort > 0 {
 		candidate := PortClaim{
 			Address:  req.HostIP,
@@ -937,7 +1062,7 @@ func (p *PodmanService) FindFreePort(startPort uint16, protocol string, bindAddr
 		startPort = 3000
 	}
 
-	claims, err := p.CollectPortClaims()
+	claims, err := p.CollectBlockingClaims()
 	if err != nil {
 		claims = []PortClaim{}
 	}

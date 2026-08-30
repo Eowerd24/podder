@@ -8,15 +8,15 @@
   IgnorableNamespaces="uap3">
   
   <Identity 
-    Name="com.example.podder"
-    Publisher="CN=My Company"
-    Version="1.1.2.0"
+    Name="io.github.eowerd24.podder"
+    Publisher="CN=Podder Contributors"
+    Version="1.2.0.0"
     ProcessorArchitecture="x64" />
-  
+
   <Properties>
-    <DisplayName>My Product</DisplayName>
-    <PublisherDisplayName>My Company</PublisherDisplayName>
-    <Description>A podder application</Description>
+    <DisplayName>Podder</DisplayName>
+    <PublisherDisplayName>Podder Contributors</PublisherDisplayName>
+    <Description>A lightweight desktop GUI and CLI for managing local Podman containers, images, and Compose/Quadlet workloads</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   
@@ -29,10 +29,10 @@
   </Resources>
   
   <Applications>
-    <Application Id="com.example.podder" Executable="podder" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="io.github.eowerd24.podder" Executable="podder" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="My Product"
-        Description="A podder application"
+        DisplayName="Podder"
+        Description="A lightweight desktop GUI and CLI for managing local Podman containers, images, and Compose/Quadlet workloads"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">

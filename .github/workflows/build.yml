@@ -8,13 +8,22 @@ on:
   pull_request:
     branches: [ "main" ]
 
-jobs:
-  build:
-    runs-on: ubuntu-24.04
+# Build/test jobs only need to read the repository. contents: write is
+# granted only to the release-publishing job, and only for a tag push.
+permissions:
+  contents: read
 
-    # The softprops/action-gh-release action requires permissions to create releases
-    permissions:
-      contents: write
+env:
+  # Keep the Wails v3 CLI pinned to the exact same version as the library
+  # dependency in go.mod, instead of `wails3@latest` — installing a
+  # different CLI version than the library it drives is how generated
+  # bindings/build config can silently drift out of sync with the code.
+  WAILS_VERSION: v3.0.0-alpha2.117
+
+jobs:
+  test:
+    name: Test & Build
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout Repository
@@ -24,26 +33,47 @@ jobs:
       uses: actions/setup-go@v5
       with:
           go-version: '1.25'
+          cache: true
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '18'
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
 
     - name: Install System Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev build-essential pkg-config
 
-    - name: Install Wails v3 CLI
-      run: go install github.com/wailsapp/wails/v3/cmd/wails3@latest
+    - name: go vet
+      run: go vet ./...
+
+    - name: go test
+      run: go test ./...
+
+    - name: go test -race
+      # Race detector on the pure Go application/test code (the build/ios
+      # and build/android helper packages are platform-scaffolding, not
+      # part of the tested application).
+      run: go test -race .
 
     - name: Install Frontend NPM Dependencies
       working-directory: ./frontend
-      run: npm install
+      run: npm ci
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: npm run build
+
+    - name: Install Wails v3 CLI
+      run: go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}
 
     - name: Build Application Binary
-      run: wails3 build
+      run: |
+        export PATH="$PATH:$(go env GOPATH)/bin"
+        wails3 build
 
     - name: Upload Linux Binary Artifact
       uses: actions/upload-artifact@v4
@@ -51,8 +81,25 @@ jobs:
         name: podder-linux-amd64
         path: bin/podder
 
+  release:
+    name: Publish Release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download Linux Binary Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: podder-linux-amd64
+        path: bin
+
+    - name: Make Binary Executable
+      run: chmod +x bin/podder
+
     - name: Publish GitHub Release
-      if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
       with:
         files: bin/podder

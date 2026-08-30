@@ -11,9 +11,17 @@ We believe container management shouldn't be complicated. Podder strips away the
 ## Key Capabilities
 
 - **Dashboard**: Real-time host metrics (OS, Kernel, CPU, memory, uptime) and container statistics
-- **Container Management**: Start, stop, restart, and remove containers with a single click
+- **Container Management & Provenance**: Start, stop, restart, and remove containers with a single click, with automatic orchestrator origin classification (`Compose`, `Quadlet`, `Pod`, `Podder`, `Ad-Hoc`)
+- **Port Administration & Sockets**: Dedicated Ports tab observing published container mappings and active host listening sockets with conflict detection and endpoint helpers
+- **Pure-Go Conflict Matrix & Exposure Safeguards**: Multi-port validation, protocol boundary checks, and automatic free-port discovery with wildcard exposure alerts
+- **External Port Registry Reconciliation**: Optional `ports.yaml` Git inventory reconciliation (`MATCH`, `UNDECLARED`, `DECLARED_MISSING`, `RESERVED`)
+- **Podder Declarative Workloads**: Durable JSON specifications under `$XDG_CONFIG_HOME/podder/services/` with built-in deployer
+- **Transactional Port Mutations**: Atomic container mutation with preflight checks, snapshotting, health verification, and automated rollback
+- **Quadlet & Compose Direct Integration**: In-place transactional `.container` and `compose.yml` port editing with service reloads
+- **Workload Adoption**: Automated inspect-to-spec conversion turning unmanaged containers into declarative Podder workloads
+- **Podman Networks & IPAM**: Network inspector exploring bridge/macvlan/ipvlan subnets, gateways, isolation, and live container IP assignments
 - **Real-Time Logs**: Stream container logs in a terminal-style interface
-- **Image Management**: Pull images from registries, run containers, and manage local images
+- **Image Management**: Pull images from registries, run containers with structured port and volume options, and manage local images
 - **Compose Integration**: Act as a compose provider—run `pod up` or `pod down` in any directory with a compose file
 - **Native Podman Support**: Pass any podman command directly through the CLI
 

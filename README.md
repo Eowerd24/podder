@@ -7,9 +7,17 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 ## Features
 
 - **Dashboard**: High-level host metrics (OS/Kernel details, CPUs, memory status, uptime) and container stats widgets.
-- **Container Control**: List all containers (running/stopped), start, stop, restart, and remove them directly from the UI.
+- **Container Control & Provenance Badges**: List all containers (running/stopped), start, stop, restart, and remove them directly from the UI, with orchestrator-aware provenance classification (`Compose`, `Quadlet`, `Pod`, `Podder`, `Ad-Hoc`).
+- **Port Administration & Socket Discovery**: Dedicated Ports tab showing published container mappings and active host listening sockets (`ss`), with conflict indicators, reconciliation status, and endpoint copying helpers.
+- **Pure-Go Conflict Matrix & Exposure Safeguards**: Real-time port availability validation, protocol boundary checks (independent TCP/UDP), wildcard exposure warnings, and automated next-free-port suggestions.
+- **External Port Registry & Reconciliation**: Optional, read-only Git-managed inventory (`ports.yaml`) support with live status reconciliation (`MATCH`, `UNDECLARED`, `DECLARED_MISSING`, `RESERVED_FREE`, `RESERVED_IN_USE`, `PLANNED`).
+- **Podder Declarative Workload Specifications**: Atomic persistence to `$XDG_CONFIG_HOME/podder/services/<name>.json`, automatic label injection (`io.podder.managed=true`), and built-in declarative deployer.
+- **Safe Port Mutation Transactions**: Atomic port editing engine with 5-step transaction lifecycle (`Preflight -> Snapshot -> Rename & Launch -> Socket Health Verification -> Commit / Auto-Rollback`).
+- **In-Place Quadlet & Compose Integration**: Directly edit published ports in systemd `.container` unit files (`PublishPort=`) or Docker/Podman Compose project files (`ports:` YAML) with automatic reload and rollback on failure.
+- **Workload Adoption**: One-click conversion of ad-hoc running containers into persistent Podder-managed declarative workloads with inspect-to-spec capture and safety analysis.
+- **Podman Network Browser & IPAM Inspector**: Dedicated Networks view discovering local bridge/macvlan/ipvlan networks, subnets, gateways, internal isolation flags, DNS resolution status, and active container IP address allocations.
 - **Real-Time Logs**: View streaming container stdout/stderr in a scrollable terminal-style modal.
-- **Image Management**: List local images, pull new ones from public registries, run containers from images via quick forms, and delete unneeded images.
+- **Image Management & Multi-Port Run Modal**: List local images, pull new ones from public registries, run containers with structured multi-port and bind-mount configurations, and delete unneeded images.
 - **Global CLI Command**: Act as a compose provider. Running `pod up` or `pod down` in a folder containing a compose file triggers your compose provider.
 - **Podman Socket Preflight**: Before Podder runs `podman compose`, it checks for the rootless Podman API socket and tries to start `podman.socket` automatically when the socket is missing.
 
@@ -19,7 +27,7 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 
 The easiest way to install Podder is to download the pre-compiled executable directly from the GitHub Releases. You do **not** need to install Go or Node.js.
 
-Current release target: `1.1.2`
+Current release target: `1.2.0`
 
 ### Option A: 1-Line Installation (Recommended)
 You can download the latest binary directly into your path and make it executable with a single command:
@@ -75,7 +83,7 @@ git clone https://github.com/Eowerd24/podder.git
 cd podder
 wails3 dev
 ```
-To compile a native release binary, run `wails3 build`. The packaging metadata in this branch is aligned to release `1.1.2`.
+To compile a native release binary, run `wails3 build`. The packaging metadata in this branch is aligned to release `1.2.0`.
 
 3. **Explore Wails3 Documentation**:
    Visit [v3.wails.io](https://v3.wails.io/) for Wails v3 guides, API references, and templates.

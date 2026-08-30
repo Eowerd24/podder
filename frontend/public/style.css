@@ -733,3 +733,576 @@ body {
 ::-webkit-scrollbar-thumb:hover {
     background: rgba(255, 255, 255, 0.2);
 }
+
+/* Card published port mappings */
+.card-ports-container {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 2px;
+}
+
+.port-badge-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+}
+
+.port-proto-tag {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.port-proto-tag.tcp, .proto-tag.tcp {
+    background: rgba(99, 102, 241, 0.15);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.port-proto-tag.udp, .proto-tag.udp {
+    background: rgba(6, 182, 212, 0.15);
+    color: #67e8f9;
+    border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.port-mapping-text {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.port-mapping-text.exp-loopback {
+    color: var(--color-emerald);
+}
+
+.port-mapping-text.exp-wildcard {
+    color: var(--color-amber);
+}
+
+.port-mapping-text.exp-specific {
+    color: var(--color-cyan);
+}
+
+/* Ports Tab styling */
+.filter-btn-group {
+    display: flex;
+    background: rgba(17, 22, 40, 0.95);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    padding: 2px;
+    gap: 2px;
+}
+
+.filter-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 4px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.filter-btn:hover {
+    color: var(--text-primary);
+}
+
+.filter-btn.active {
+    background: rgba(99, 102, 241, 0.2);
+    color: #fff;
+}
+
+.ports-table-wrapper {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    overflow-x: auto;
+}
+
+.ports-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+    font-size: 13px;
+}
+
+.ports-table th {
+    background: rgba(13, 17, 33, 0.9);
+    padding: 12px 16px;
+    font-weight: 600;
+    color: var(--text-muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.ports-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    vertical-align: middle;
+}
+
+.ports-table tr:last-child td {
+    border-bottom: none;
+}
+
+.ports-table tr:hover td {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.source-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+
+.source-badge.podman {
+    background: rgba(99, 102, 241, 0.15);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.source-badge.host {
+    background: rgba(16, 185, 129, 0.15);
+    color: #6ee7b7;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.exp-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.exp-badge.loopback {
+    background: rgba(16, 185, 129, 0.12);
+    color: var(--color-emerald);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+}
+
+.exp-badge.wildcard {
+    background: rgba(245, 158, 11, 0.12);
+    color: var(--color-amber);
+    border: 1px solid rgba(245, 158, 11, 0.25);
+}
+
+.exp-badge.specific {
+    background: rgba(6, 182, 212, 0.12);
+    color: var(--color-cyan);
+    border: 1px solid rgba(6, 182, 212, 0.25);
+}
+
+.status-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.status-pill.active {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--color-emerald);
+}
+
+.status-pill.stopped {
+    background: rgba(156, 163, 175, 0.15);
+    color: var(--text-muted);
+}
+
+.status-pill.conflict {
+    background: rgba(244, 63, 94, 0.15);
+    color: var(--color-rose);
+    border: 1px solid rgba(244, 63, 94, 0.3);
+}
+
+.endpoint-code {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-primary);
+}
+
+.proto-tag {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+
+.btn-xs {
+    padding: 3px 8px;
+    font-size: 12px;
+    border-radius: 5px;
+}
+
+/* Run container modal multi-port editor */
+.port-rows-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.port-input-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 8px;
+    border-radius: var(--radius-sm);
+}
+
+.port-field-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.field-mini-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.port-field-group .form-input {
+    padding: 6px 8px;
+    font-size: 12px;
+}
+
+.empty-port-hint {
+    padding: 12px;
+    font-size: 13px;
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px dashed rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-sm);
+    text-align: center;
+}
+
+.row-validation-msg {
+    font-size: 11px;
+    margin-top: 2px;
+    padding-left: 4px;
+}
+
+.row-validation-msg.ok {
+    color: var(--color-emerald);
+}
+
+.row-validation-msg.error {
+    color: var(--color-rose);
+}
+
+.exposure-warning-banner {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: #fde68a;
+    line-height: 1.4;
+}
+
+.exposure-warning-banner .warning-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: var(--color-amber);
+}
+
+.exposure-warning-banner code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+}
+
+/* Registry Summary Bar */
+.registry-summary-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px solid rgba(99, 102, 241, 0.25);
+    border-radius: var(--radius-sm);
+    padding: 8px 14px;
+    margin-bottom: 12px;
+    font-size: 12px;
+}
+
+.reg-summary-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-primary);
+}
+
+.reg-summary-item code {
+    background: rgba(0, 0, 0, 0.4);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: #c7d2fe;
+}
+
+.reg-dot.active {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-emerald);
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+
+.reg-summary-metrics {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.reg-metric {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.reg-metric.match {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--color-emerald);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.reg-metric.undeclared {
+    background: rgba(156, 163, 175, 0.15);
+    color: var(--text-muted);
+    border: 1px solid rgba(156, 163, 175, 0.25);
+}
+
+.reg-metric.missing {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--color-amber);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.reg-metric.reserved {
+    background: rgba(6, 182, 212, 0.15);
+    color: var(--color-cyan);
+    border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+/* Registry & Scope Badges */
+.source-badge.registry {
+    background: rgba(168, 85, 247, 0.15);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.exp-badge.lan {
+    background: rgba(59, 130, 246, 0.12);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.25);
+}
+
+.exp-badge.management {
+    background: rgba(236, 72, 153, 0.12);
+    color: #f472b6;
+    border: 1px solid rgba(236, 72, 153, 0.25);
+}
+
+.status-pill.missing {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--color-amber);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.status-pill.reserved {
+    background: rgba(6, 182, 212, 0.15);
+    color: var(--color-cyan);
+    border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.status-pill.planned {
+    background: rgba(168, 85, 247, 0.15);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+/* Reconciliation Badges */
+.reconcile-pill {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.reconcile-pill.match {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--color-emerald);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.reconcile-pill.undeclared {
+    background: rgba(156, 163, 175, 0.12);
+    color: var(--text-muted);
+    border: 1px solid rgba(156, 163, 175, 0.2);
+}
+
+.reconcile-pill.missing {
+    background: rgba(245, 158, 11, 0.15);
+    color: var(--color-amber);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.reconcile-pill.reserved {
+    background: rgba(6, 182, 212, 0.15);
+    color: var(--color-cyan);
+    border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.reconcile-pill.conflict {
+    background: rgba(244, 63, 94, 0.15);
+    color: var(--color-rose);
+    border: 1px solid rgba(244, 63, 94, 0.3);
+}
+
+.reconcile-pill.planned {
+    background: rgba(168, 85, 247, 0.15);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.reconcile-pill.host {
+    background: rgba(99, 102, 241, 0.1);
+    color: #a5b4fc;
+}
+
+/* Settings Modal Banners */
+.registry-status-banner {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.registry-status-banner.loading {
+    background: rgba(99, 102, 241, 0.1);
+    color: #c7d2fe;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.registry-status-banner.success {
+    background: rgba(16, 185, 129, 0.1);
+    color: #a7f3d0;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.registry-status-banner.error {
+    background: rgba(244, 63, 94, 0.1);
+    color: #fecdd3;
+    border: 1px solid rgba(244, 63, 94, 0.3);
+}
+
+/* Workload Provenance Badges */
+.prov-badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-top: 4px;
+    letter-spacing: 0.02em;
+}
+
+.prov-badge.compose {
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.prov-badge.quadlet {
+    background: rgba(236, 72, 153, 0.15);
+    color: #f472b6;
+    border: 1px solid rgba(236, 72, 153, 0.3);
+}
+
+.prov-badge.podder {
+    background: rgba(16, 185, 129, 0.15);
+    color: #6ee7b7;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.prov-badge.pod {
+    background: rgba(168, 85, 247, 0.15);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.prov-badge.adhoc {
+    background: rgba(156, 163, 175, 0.12);
+    color: var(--text-muted);
+    border: 1px solid rgba(156, 163, 175, 0.2);
+}
+
+.prov-mini-badge {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.prov-mini-badge.compose {
+    background: rgba(59, 130, 246, 0.2);
+    color: #93c5fd;
+}
+
+.prov-mini-badge.quadlet {
+    background: rgba(236, 72, 153, 0.2);
+    color: #f472b6;
+}
+
+.prov-mini-badge.podder {
+    background: rgba(16, 185, 129, 0.2);
+    color: #6ee7b7;
+}
+
+.prov-mini-badge.pod {
+    background: rgba(168, 85, 247, 0.2);
+    color: #d8b4fe;
+}
+
+.prov-mini-badge.adhoc {
+    background: rgba(156, 163, 175, 0.15);
+    color: var(--text-muted);
+}
+
+

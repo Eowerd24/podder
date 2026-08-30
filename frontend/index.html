@@ -33,6 +33,18 @@
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                 Images
             </button>
+            <button class="tab-btn" onclick="switchTab('ports')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                Ports
+            </button>
+            <button class="tab-btn" onclick="switchTab('networks')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="6" height="6" rx="1"/><rect x="16" y="2" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="12" y1="13" x2="12" y2="16"/></svg>
+                Networks
+            </button>
+            <button class="tab-btn" onclick="openSettingsModal()" title="Settings & External Registry">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                Settings
+            </button>
         </nav>
     </header>
 
@@ -161,10 +173,15 @@
                     <p id="container-view-subtitle" class="section-subtitle">Browse every local container or narrow the list to running or stopped instances.</p>
                 </div>
                 <div style="display: flex; gap: 16px; align-items: center;">
-                    <select id="container-filter" class="form-input" style="width: 160px; padding: 6px 10px; font-size: 13px; cursor: pointer;" onchange="handleContainerFilterChange()">
+                    <select id="container-filter" class="form-input" style="width: 175px; padding: 6px 10px; font-size: 13px; cursor: pointer;" onchange="handleContainerFilterChange()">
                         <option value="all">All Containers</option>
                         <option value="running">Running Only</option>
                         <option value="stopped">Stopped Only</option>
+                        <option value="prov-compose">Compose Only</option>
+                        <option value="prov-quadlet">Quadlet Only</option>
+                        <option value="prov-podder">Podder Only</option>
+                        <option value="prov-pod">Pod Members Only</option>
+                        <option value="prov-adhoc">Ad-Hoc Only</option>
                     </select>
                     <button class="btn btn-primary" onclick="openRunModal('')">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -203,9 +220,180 @@
             </div>
         </section>
 
+        <!-- PORTS TAB -->
+        <section id="tab-ports" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon cyan">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Published Mappings</span>
+                        <span id="stat-ports-published" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon emerald">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Host Listeners</span>
+                        <span id="stat-ports-listeners" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Unique Ports</span>
+                        <span id="stat-ports-unique" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon rose">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Conflicts</span>
+                        <span id="stat-ports-conflicts" class="stat-num">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-header">
+                <div>
+                    <div class="section-title">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                        Port Administration & Host Reality
+                    </div>
+                    <p class="section-subtitle">Live inspection of container published ports and host listening sockets.</p>
+                </div>
+                <div style="display: flex; gap: 12px; align-items: center;">
+                    <div class="filter-btn-group">
+                        <button class="filter-btn active" id="port-filter-all" onclick="setPortFilter('all')">All</button>
+                        <button class="filter-btn" id="port-filter-podman" onclick="setPortFilter('podman')">Podman</button>
+                        <button class="filter-btn" id="port-filter-host" onclick="setPortFilter('host')">Host Listeners</button>
+                        <button class="filter-btn" id="port-filter-registry" onclick="setPortFilter('registry')">Registry</button>
+                        <button class="filter-btn" id="port-filter-conflicts" onclick="setPortFilter('conflicts')">Conflicts</button>
+                    </div>
+                    <input type="text" id="port-search-input" class="form-input" placeholder="Filter ports, IP, owner, service..." style="width: 210px; padding: 6px 12px; font-size: 13px;" oninput="handlePortSearch()"/>
+                    <button class="btn btn-secondary" onclick="loadPorts()" title="Refresh Ports">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                        Refresh
+                    </button>
+                </div>
+            </div>
+
+            <div id="registry-status-bar" class="registry-summary-bar" style="display: none;">
+                <!-- Dynamically rendered registry info -->
+            </div>
+
+            <div id="ports-list" class="ports-container">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+        <!-- NETWORKS TAB -->
+        <section id="tab-networks" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon cyan">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="6" height="6" rx="1"/><rect x="16" y="2" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="12" y1="13" x2="12" y2="16"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Networks</span>
+                        <span id="stat-networks-total" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon emerald">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Bridge Driver</span>
+                        <span id="stat-networks-bridge" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon violet">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Isolated (Internal)</span>
+                        <span id="stat-networks-internal" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon amber">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Connected Endpoints</span>
+                        <span id="stat-networks-endpoints" class="stat-num">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-header">
+                <h2 class="section-title">Podman Networks & IPAM</h2>
+                <div class="section-actions">
+                    <input type="text" id="network-search-input" class="form-input" placeholder="Filter networks, subnet, driver..." style="width: 210px; padding: 6px 12px; font-size: 13px;" oninput="handleNetworkSearch()"/>
+                    <button class="btn btn-primary" onclick="openCreateNetworkModal()">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        Create Network
+                    </button>
+                    <button class="btn btn-secondary" onclick="loadNetworks()" title="Refresh Networks">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                        Refresh
+                    </button>
+                </div>
+            </div>
+
+            <div id="networks-list" class="cards-grid">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
     </main>
 
     <!-- Modals -->
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Settings & Port Registry</h3>
+                <button class="modal-close" onclick="closeModal('settings-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="checkbox-row" style="margin-bottom: 8px;">
+                        <input type="checkbox" id="setting-registry-enabled" onchange="toggleRegistrySettings(this.checked)"/>
+                        <span style="font-weight: 600;">Enable External Port Registry (ports.yaml)</span>
+                    </label>
+                    <p class="form-hint">Reconcile observed local container and host ports against an intended Git-managed homelab inventory.</p>
+                </div>
+                <div id="registry-config-fields" style="display: none;">
+                    <div class="form-group">
+                        <label class="form-label">Registry File Path (.yaml / .yml)</label>
+                        <div class="picker-group">
+                            <input type="text" id="setting-registry-path" class="form-input" placeholder="/path/to/inventory/network/ports.yaml"/>
+                            <div class="picker-actions">
+                                <button type="button" class="btn btn-secondary" onclick="pickRegistryFile()">Browse...</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="registry-test-result" class="registry-status-banner" style="display: none;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="testRegistryFile()">Test / Reload</button>
+                <button class="btn btn-secondary" onclick="closeModal('settings-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="saveAppSettings()">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Logs Modal -->
     <div id="logs-modal" class="modal">
         <div class="modal-content large">
@@ -240,8 +428,14 @@
                     <input type="text" id="run-name" class="form-input" placeholder="e.g. my-app"/>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Port Mapping (Optional)</label>
-                    <input type="text" id="run-ports" class="form-input" placeholder="e.g. 8080:80"/>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <label class="form-label" style="margin-bottom: 0;">Port Mappings (Optional)</label>
+                        <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="addRunPortRow()">+ Add Port</button>
+                    </div>
+                    <div id="run-ports-container" class="port-rows-container">
+                        <!-- Dynamically managed port rows -->
+                    </div>
+                    <div id="run-exposure-warning" class="exposure-warning-banner" style="display: none;"></div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Host Content (Optional)</label>
@@ -266,10 +460,186 @@
                     <label class="form-label">Command (Optional)</label>
                     <input type="text" id="run-command" class="form-input" placeholder="e.g. sleep 1000"/>
                 </div>
+                <label class="checkbox-row" style="margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+                    <input type="checkbox" id="run-save-spec" checked/>
+                    <span style="font-weight: 550;">Save as Podder-Managed Workload (Persistent Declarative Spec)</span>
+                </label>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal('run-modal')">Cancel</button>
                 <button class="btn btn-primary" onclick="submitRunContainer()">Run Container</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Spec Viewer Modal -->
+    <div id="spec-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <h3 class="modal-title" id="spec-modal-title">Container Specification</h3>
+                <button class="modal-close" onclick="closeModal('spec-modal')">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 12px; height: 100%; overflow: hidden;">
+                <pre id="spec-text" class="logs-output" style="color: #a5b4fc; font-family: var(--font-mono);"></pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('spec-modal')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Ports / Mutation Modal -->
+    <div id="edit-ports-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <h3 class="modal-title" id="edit-ports-title">Edit Container Ports</h3>
+                    <div id="edit-ports-provenance" style="margin-top: 4px;"></div>
+                </div>
+                <button class="modal-close" onclick="closeModal('edit-ports-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="edit-ports-container-id" />
+                <input type="hidden" id="edit-ports-service-name" />
+                <input type="hidden" id="edit-ports-unit-name" />
+
+                <!-- Orchestrator Mode Switcher (if Compose or Quadlet) -->
+                <div id="edit-ports-mode-bar" style="display: none; margin-bottom: 15px;">
+                    <div class="filter-btn-group" style="width: 100%;">
+                        <button type="button" class="filter-btn active" id="btn-mode-inplace" style="flex: 1; text-align: center;" onclick="setEditPortsMode('inplace')">In-Place File Edit & Reload</button>
+                        <button type="button" class="filter-btn" id="btn-mode-manual" style="flex: 1; text-align: center;" onclick="setEditPortsMode('manual')">Manual Snippet</button>
+                    </div>
+                </div>
+
+                <!-- External Orchestrator Guidance (Compose / Quadlet / Pod) -->
+                <div id="edit-ports-guidance-box" style="display: none; margin-bottom: 15px;">
+                    <div class="exposure-warning-banner" id="edit-ports-guidance-text"></div>
+                    <div id="edit-ports-snippet-wrapper" style="margin-top: 10px; display: none;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <span class="field-mini-label">Suggested Configuration Snippet:</span>
+                            <button type="button" class="btn btn-secondary btn-xs" onclick="copyEditPortsSnippet()">Copy Snippet</button>
+                        </div>
+                        <pre id="edit-ports-snippet-text" class="logs-output" style="max-height: 140px; font-family: var(--font-mono); color: #93c5fd;"></pre>
+                    </div>
+                </div>
+
+                <!-- Direct Port Editing Area -->
+                <div id="edit-ports-interactive-area">
+                    <div id="edit-ports-file-info" style="display: none; font-size: 11px; color: var(--text-muted); margin-bottom: 10px; font-family: var(--font-mono);"></div>
+
+                    <div class="form-group">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <label class="form-label" style="margin-bottom: 0;">Published Ports</label>
+                            <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="addEditPortRow()">+ Add Port</button>
+                        </div>
+                        <div id="edit-ports-rows-container" class="port-rows-container">
+                            <!-- Dynamically managed port rows -->
+                        </div>
+                        <div id="edit-ports-exposure-warning" class="exposure-warning-banner" style="display: none;"></div>
+                    </div>
+
+                    <!-- Ad-Hoc Confirmation Checkbox -->
+                    <div id="edit-ports-adhoc-confirm-box" style="display: none; margin-top: 12px; padding: 10px; border-radius: var(--radius-sm); background: rgba(244, 63, 94, 0.08); border: 1px solid rgba(244, 63, 94, 0.2);">
+                        <label class="checkbox-row" style="margin-bottom: 0;">
+                            <input type="checkbox" id="edit-ports-adhoc-confirm"/>
+                            <span style="font-size: 12px; color: #fecdd3;">I understand this unmanaged container will be recreated and unmounted ephemeral data will be lost.</span>
+                        </label>
+                    </div>
+
+                    <!-- Mutation Transaction Steps Log -->
+                    <div id="edit-ports-steps-box" style="display: none; margin-top: 15px;">
+                        <span class="field-mini-label">Transaction Log:</span>
+                        <div id="edit-ports-steps-list" style="margin-top: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 4px;"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('edit-ports-modal')">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-port-mutation" onclick="submitPortMutation()">Mutate Ports (Atomic Transaction)</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Workload Adoption Modal -->
+    <div id="adopt-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <div>
+                    <h3 class="modal-title" id="adopt-modal-title">Adopt Workload into Podder</h3>
+                    <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Convert this ad-hoc container into a declarative Podder-managed service</div>
+                </div>
+                <button class="modal-close" onclick="closeModal('adopt-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="adopt-container-id" />
+                <div id="adopt-assessment-loading" style="text-align: center; padding: 20px; color: var(--text-muted);">
+                    Analyzing container configuration...
+                </div>
+                <div id="adopt-assessment-content" style="display: none;">
+                    <div class="form-group">
+                        <label class="form-label">Service Name *</label>
+                        <input type="text" id="adopt-service-name" class="form-input" placeholder="e.g. web-app"/>
+                        <p class="form-hint">Declarative spec will be stored under <code>~/.config/podder/services/&lt;name&gt;.json</code></p>
+                    </div>
+                    
+                    <div id="adopt-warnings-box" style="display: none; margin-bottom: 12px;"></div>
+
+                    <div class="form-group">
+                        <label class="form-label">Extracted Declarative Spec Preview</label>
+                        <pre id="adopt-spec-preview" class="logs-output" style="max-height: 220px; font-family: var(--font-mono); color: #6ee7b7;"></pre>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('adopt-modal')">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-adopt" onclick="submitAdoption()">Adopt Workload</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Network Modal -->
+    <div id="create-network-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Create Podman Network</h3>
+                <button class="modal-close" onclick="closeModal('create-network-modal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Network Name *</label>
+                    <input type="text" id="net-create-name" class="form-input" placeholder="e.g. custom-bridge" required/>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Driver</label>
+                    <select id="net-create-driver" class="form-input">
+                        <option value="bridge" selected>bridge (Default container bridge)</option>
+                        <option value="macvlan">macvlan (Direct MAC address on host interface)</option>
+                        <option value="ipvlan">ipvlan (L2/L3 host interface)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Subnet CIDR (Optional)</label>
+                    <input type="text" id="net-create-subnet" class="form-input" placeholder="e.g. 10.89.5.0/24"/>
+                    <p class="form-hint">Leave blank to auto-allocate an available subnet.</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Gateway IP (Optional)</label>
+                    <input type="text" id="net-create-gateway" class="form-input" placeholder="e.g. 10.89.5.1"/>
+                </div>
+                <div class="form-group" style="margin-top: 15px; display: flex; flex-direction: column; gap: 8px;">
+                    <label class="checkbox-row" style="margin-bottom: 0;">
+                        <input type="checkbox" id="net-create-dns" checked/>
+                        <span style="font-weight: 500;">Enable Container Name DNS Resolution</span>
+                    </label>
+                    <label class="checkbox-row" style="margin-bottom: 0;">
+                        <input type="checkbox" id="net-create-internal"/>
+                        <span style="font-weight: 500;">Internal / Isolated (Block external internet access)</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('create-network-modal')">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-create-network" onclick="submitCreateNetwork()">Create Network</button>
             </div>
         </div>
     </div>

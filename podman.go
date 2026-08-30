@@ -28,18 +28,51 @@ var supportedImageExtensions = map[string]struct{}{
 	".webp":  {},
 }
 
-// Container represents a Podman container.
+// rawPodmanPort represents port structure in raw Podman JSON.
+type rawPodmanPort struct {
+	HostIP        string `json:"host_ip"`
+	ContainerPort uint16 `json:"container_port"`
+	HostPort      uint16 `json:"host_port"`
+	Range         int    `json:"range"`
+	Protocol      string `json:"protocol"`
+}
+
+// rawContainer represents a raw container from Podman JSON.
+type rawContainer struct {
+	Id         string            `json:"Id"`
+	Names      []string          `json:"Names"`
+	Image      string            `json:"Image"`
+	ImageID    string            `json:"ImageID"`
+	State      string            `json:"State"`
+	Status     string            `json:"Status"`
+	Created    int64             `json:"Created"`
+	ExitCode   int               `json:"ExitCode"`
+	Command    []string          `json:"Command"`
+	AutoRemove bool              `json:"AutoRemove"`
+	Ports      []rawPodmanPort   `json:"Ports"`
+	Pod        string            `json:"Pod"`
+	PodName    string            `json:"PodName"`
+	Labels     map[string]string `json:"Labels"`
+}
+
+// Container represents a Podman container with structured port mappings and provenance.
 type Container struct {
-	Id         string   `json:"Id"`
-	Names      []string `json:"Names"`
-	Image      string   `json:"Image"`
-	ImageID    string   `json:"ImageID"`
-	State      string   `json:"State"`
-	Status     string   `json:"Status"`
-	Created    int64    `json:"Created"`
-	ExitCode   int      `json:"ExitCode"`
-	Command    []string `json:"Command"`
-	AutoRemove bool     `json:"AutoRemove"`
+	Id           string             `json:"Id"`
+	Names        []string           `json:"Names"`
+	Image        string             `json:"Image"`
+	ImageID      string             `json:"ImageID"`
+	State        string             `json:"State"`
+	Status       string             `json:"Status"`
+	Created      int64              `json:"Created"`
+	ExitCode     int                `json:"ExitCode"`
+	Command      []string           `json:"Command"`
+	AutoRemove   bool               `json:"AutoRemove"`
+	PortMappings []PortMapping      `json:"PortMappings"`
+	Ports        []PortMapping      `json:"Ports"`
+	Pod          string             `json:"Pod,omitempty"`
+	PodName      string             `json:"PodName,omitempty"`
+	Labels       map[string]string  `json:"Labels,omitempty"`
+	Provenance   WorkloadProvenance `json:"provenance"`
 }
 
 // Image represents a Podman image.
@@ -149,6 +182,77 @@ func (p *PodmanService) GetSystemInfo() (*SystemInfo, error) {
 	return info, nil
 }
 
+// parseContainersJSON parses JSON from `podman ps --format json`.
+func parseContainersJSON(data []byte) ([]Container, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "[]" {
+		return []Container{}, nil
+	}
+
+	var rawList []rawContainer
+	if err := json.Unmarshal(data, &rawList); err != nil {
+		// Fallback: try unmarshaling directly into []Container
+		var fallbackList []Container
+		if errFallback := json.Unmarshal(data, &fallbackList); errFallback == nil {
+			for i := range fallbackList {
+				if len(fallbackList[i].PortMappings) == 0 && len(fallbackList[i].Ports) > 0 {
+					fallbackList[i].PortMappings = fallbackList[i].Ports
+				} else if len(fallbackList[i].Ports) == 0 && len(fallbackList[i].PortMappings) > 0 {
+					fallbackList[i].Ports = fallbackList[i].PortMappings
+				}
+			}
+			return fallbackList, nil
+		}
+		return nil, fmt.Errorf("failed to parse containers json: %w", err)
+	}
+
+	containers := make([]Container, len(rawList))
+	for i, rc := range rawList {
+		var mappings []PortMapping
+		for _, rp := range rc.Ports {
+			proto := strings.ToLower(rp.Protocol)
+			if proto == "" {
+				proto = "tcp"
+			}
+			mappings = append(mappings, PortMapping{
+				HostIP:        rp.HostIP,
+				HostPort:      rp.HostPort,
+				ContainerPort: rp.ContainerPort,
+				Protocol:      proto,
+				RangeSize:     rp.Range,
+			})
+		}
+
+		podName := rc.PodName
+		if podName == "" {
+			podName = rc.Pod
+		}
+
+		provenance := ClassifyProvenance(rc.Labels, rc.Pod, rc.PodName)
+
+		containers[i] = Container{
+			Id:           rc.Id,
+			Names:        rc.Names,
+			Image:        rc.Image,
+			ImageID:      rc.ImageID,
+			State:        rc.State,
+			Status:       rc.Status,
+			Created:      rc.Created,
+			ExitCode:     rc.ExitCode,
+			Command:      rc.Command,
+			AutoRemove:   rc.AutoRemove,
+			PortMappings: mappings,
+			Ports:        mappings,
+			Pod:          rc.Pod,
+			PodName:      podName,
+			Labels:       rc.Labels,
+			Provenance:   provenance,
+		}
+	}
+
+	return containers, nil
+}
+
 // ListContainers lists all containers (running and stopped if all=true).
 func (p *PodmanService) ListContainers(all bool) ([]Container, error) {
 	args := []string{"ps", "--format", "json"}
@@ -161,16 +265,7 @@ func (p *PodmanService) ListContainers(all bool) ([]Container, error) {
 		return nil, fmt.Errorf("failed to list containers: %v, stderr: %s", err, stderr)
 	}
 
-	var containers []Container
-	if strings.TrimSpace(stdout) == "" || strings.TrimSpace(stdout) == "[]" {
-		return containers, nil
-	}
-
-	if err := json.Unmarshal([]byte(stdout), &containers); err != nil {
-		return nil, fmt.Errorf("failed to parse containers json: %v", err)
-	}
-
-	return containers, nil
+	return parseContainersJSON([]byte(stdout))
 }
 
 // ListImages lists local images.
@@ -299,6 +394,109 @@ func (p *PodmanService) RunContainer(image string, name string, ports string, cm
 	return nil
 }
 
+// RunContainerWithPortMappings runs a container from an image with structured port mappings.
+func (p *PodmanService) RunContainerWithPortMappings(image string, name string, portMappings []PortMapping, cmd string, hostPath string, containerPath string, readOnly bool) error {
+	args, err := buildRunContainerArgsWithMappings(image, name, portMappings, cmd, hostPath, containerPath, readOnly)
+	if err != nil {
+		return err
+	}
+
+	_, stderr, err := p.runCommand(args...)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+
+	// Auto-persist declarative spec if a workload name was provided
+	trimmedName := strings.TrimSpace(name)
+	if trimmedName != "" {
+		var binds []BindMountSpec
+		if hostPath != "" && containerPath != "" {
+			binds = append(binds, BindMountSpec{
+				HostPath:      hostPath,
+				ContainerPath: containerPath,
+				ReadOnly:      readOnly,
+			})
+		}
+		_ = p.SaveSpec(ContainerSpec{
+			Name:         trimmedName,
+			Image:        image,
+			PortMappings: portMappings,
+			Binds:        binds,
+			Command:      cmd,
+		})
+	}
+
+	return nil
+}
+
+func buildPortArg(m PortMapping) string {
+	proto := strings.ToLower(strings.TrimSpace(m.Protocol))
+	if proto == "" {
+		proto = "tcp"
+	}
+	hostIP := strings.TrimSpace(m.HostIP)
+	if hostIP != "" && hostIP != "0.0.0.0" && hostIP != "*" {
+		return fmt.Sprintf("%s:%d:%d/%s", hostIP, m.HostPort, m.ContainerPort, proto)
+	}
+	if m.HostPort != 0 {
+		return fmt.Sprintf("%d:%d/%s", m.HostPort, m.ContainerPort, proto)
+	}
+	return fmt.Sprintf("%d/%s", m.ContainerPort, proto)
+}
+
+func buildRunContainerArgsWithMappings(image string, name string, portMappings []PortMapping, cmd string, hostPath string, containerPath string, readOnly bool) ([]string, error) {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return nil, fmt.Errorf("image name cannot be empty")
+	}
+
+	args := []string{"run", "-d"}
+
+	name = strings.TrimSpace(name)
+	if name != "" {
+		args = append(args, "--name", name)
+		args = append(args, "--label", "io.podder.managed=true")
+		args = append(args, "--label", "io.podder.service="+name)
+	} else {
+		args = append(args, "--label", "io.podder.managed=true")
+	}
+
+	for _, m := range portMappings {
+		if m.ContainerPort > 0 {
+			args = append(args, "-p", buildPortArg(m))
+		}
+	}
+
+	hostPath = strings.TrimSpace(hostPath)
+	containerPath = strings.TrimSpace(containerPath)
+	if hostPath == "" && containerPath != "" {
+		return nil, fmt.Errorf("host path is required when a container mount path is provided")
+	}
+	if hostPath != "" && containerPath == "" {
+		return nil, fmt.Errorf("container mount path is required when a host path is provided")
+	}
+	if hostPath != "" {
+		if _, err := os.Stat(hostPath); err != nil {
+			return nil, fmt.Errorf("host path is not accessible: %w", err)
+		}
+
+		mountSpec := fmt.Sprintf("type=bind,src=%s,target=%s", hostPath, containerPath)
+		if readOnly {
+			mountSpec += ",readonly"
+		}
+		args = append(args, "--mount", mountSpec)
+	}
+
+	args = append(args, image)
+
+	cmd = strings.TrimSpace(cmd)
+	if cmd != "" {
+		args = append(args, strings.Fields(cmd)...)
+	}
+
+	return args, nil
+}
+
 func buildRunContainerArgs(image string, name string, ports string, cmd string, hostPath string, containerPath string, readOnly bool) ([]string, error) {
 	image = strings.TrimSpace(image)
 	if image == "" {
@@ -314,7 +512,19 @@ func buildRunContainerArgs(image string, name string, ports string, cmd string, 
 
 	ports = strings.TrimSpace(ports)
 	if ports != "" {
-		args = append(args, "-p", ports)
+		portItems := strings.FieldsFunc(ports, func(r rune) bool {
+			return r == ',' || r == ' ' || r == ';'
+		})
+		if len(portItems) > 0 {
+			for _, pItem := range portItems {
+				pTrimmed := strings.TrimSpace(pItem)
+				if pTrimmed != "" {
+					args = append(args, "-p", pTrimmed)
+				}
+			}
+		} else {
+			args = append(args, "-p", ports)
+		}
 	}
 
 	hostPath = strings.TrimSpace(hostPath)

@@ -1,4 +1,4 @@
-import * as Podman from "../bindings/changeme/podmanservice.js";
+import * as Podman from "../bindings/github.com/Eowerd24/podder/podmanservice.js";
 import { Call as WailsCall } from "@wailsio/runtime";
 
 // --- Trust boundary: escaping helpers for untrusted data ---

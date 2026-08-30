@@ -1,4 +1,4 @@
-module changeme
+module github.com/Eowerd24/podder
 
 go 1.25.0
 

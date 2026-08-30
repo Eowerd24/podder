@@ -128,6 +128,7 @@ func TestSettingsPersistence(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{}
 
@@ -171,6 +172,7 @@ func TestRegistryReservationConflict(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	// Strict port-availability validation is fail-closed: it must not rely
 	// on whatever real podman/ss happens (or doesn't happen) to be
@@ -223,6 +225,7 @@ func TestReconciliationStates(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	// Never depend on whatever real podman/ss happens to be installed (or
 	// not) on the machine running the tests — inject an empty fake runner.
@@ -314,6 +317,7 @@ func TestReconciliation_RemoteNodeNeverReportedAsLocallyMissing(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
@@ -380,6 +384,7 @@ ports:
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
@@ -413,6 +418,7 @@ func TestActiveRegistryDeclarationDoesNotBlockOwnService(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
@@ -559,6 +565,7 @@ func TestGetLocalNodeDefaultsToHostname(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{}
 	node, err := service.GetLocalNode()
@@ -602,6 +609,7 @@ ports:
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := newFakeCommandRunner()
 	runner.On("podman ps", func(string, []string) (string, string, error) {
@@ -649,6 +657,7 @@ ports:
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath}, LocalNode: "rig9"}); err != nil {
 		t.Fatal(err)

@@ -10,6 +10,7 @@ func TestSpecsCRUD(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{}
 
@@ -89,6 +90,7 @@ func TestLegacySpecWithoutSchemaVersionMigratesToManaged(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	// Simulate a spec file written by the pre-hardening prototype: no
 	// schemaVersion, no managed field at all (both post-date this pass).
@@ -153,6 +155,7 @@ func TestSpecFilePermissionsAreRestrictive(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	service := &PodmanService{}
 	spec := ContainerSpec{Name: "secret-app", Image: "alpine", Env: map[string]string{"TOKEN": "s3cr3t"}}
@@ -183,6 +186,7 @@ func TestCandidateSpecCommitAndDiscard(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	spec := ContainerSpec{Name: "candidate-app", Image: "alpine"}
 	candidatePath, err := writeCandidateSpec(spec)

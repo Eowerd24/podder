@@ -273,6 +273,7 @@ func TestCreateContainerManagedCommitsSpecOnSuccess(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := fakePsRunner("abc123def456", "svc1", true)
 	svc := &PodmanService{runner: runner}
@@ -308,6 +309,7 @@ func TestCreateContainerUnmanagedSavesNoSpec(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := fakePsRunner("abc123", "svc2", true)
 	svc := &PodmanService{runner: runner}
@@ -343,6 +345,7 @@ func TestCreateContainerFailedCreateLeavesNoCandidateSpec(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := newFakeCommandRunner()
 	runner.On("podman image", func(n string, args []string) (string, string, error) { return `[{"Id":"sha256:test-image"}]`, "", nil })
@@ -376,6 +379,7 @@ func TestCreateContainerVerifyFailureRemovesContainerAndSpec(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := newFakeCommandRunner()
 	runner.On("podman image", func(n string, args []string) (string, string, error) { return `[{"Id":"sha256:test-image"}]`, "", nil })
@@ -435,6 +439,7 @@ func TestCreateContainerRejectsIntraRequestPortConflict(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	svc := &PodmanService{runner: newFakeCommandRunner()}
 	req := ContainerCreateRequest{

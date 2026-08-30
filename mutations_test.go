@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -241,9 +240,8 @@ func (s *mutationSim) Run(name string, args ...string) (string, string, error) {
 func withTestHome(t *testing.T) {
 	t.Helper()
 	tempDir := t.TempDir()
-	origHome := os.Getenv("HOME")
-	t.Cleanup(func() { os.Setenv("HOME", origHome) })
-	os.Setenv("HOME", tempDir)
+	t.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 }
 
 func withFastPolling(t *testing.T) {

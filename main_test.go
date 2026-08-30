@@ -59,8 +59,54 @@ func TestResolveComposeProviderPrefersPodmanOverDockerCompose(t *testing.T) {
 	if !provider.needsPodmanSocket {
 		t.Fatal("podman compose should require Podman socket preflight")
 	}
-	if len(provider.args) != 2 || provider.args[0] != "compose" || provider.args[1] != "down" {
-		t.Fatalf("unexpected podman compose args: %v", provider.args)
+	if len(provider.subcommand) != 1 || provider.subcommand[0] != "compose" {
+		t.Fatalf("unexpected podman compose subcommand: %v", provider.subcommand)
+	}
+
+	args := provider.BuildArgs("/path/to/compose.yaml", "down", nil, "")
+	want := []string{"compose", "-f", "/path/to/compose.yaml", "down"}
+	if len(args) != len(want) {
+		t.Fatalf("BuildArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("BuildArgs() = %v, want %v", args, want)
+		}
+	}
+}
+
+func TestComposeProviderBuildArgsOrderingForNonNativeProvider(t *testing.T) {
+	t.Parallel()
+
+	// podman-compose/docker-compose ARE the compose command — -f must come
+	// immediately after the binary, never a bare "podman -f FILE compose"
+	// which is what the pre-hardening bug produced for the native provider.
+	provider := &composeProvider{path: "/usr/bin/podman-compose"}
+	args := provider.BuildArgs("/path/to/compose.yaml", "up", []string{"-d"}, "web")
+	want := []string{"-f", "/path/to/compose.yaml", "up", "-d", "web"}
+	if len(args) != len(want) {
+		t.Fatalf("BuildArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("BuildArgs() = %v, want %v", args, want)
+		}
+	}
+}
+
+func TestComposeProviderBuildArgsOrderingForNativeProvider(t *testing.T) {
+	t.Parallel()
+
+	provider := &composeProvider{path: "/usr/bin/podman", subcommand: []string{"compose"}, needsPodmanSocket: true}
+	args := provider.BuildArgs("/path/to/compose.yaml", "up", []string{"-d"}, "web")
+	want := []string{"compose", "-f", "/path/to/compose.yaml", "up", "-d", "web"}
+	if len(args) != len(want) {
+		t.Fatalf("BuildArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("BuildArgs() = %v, want %v", args, want)
+		}
 	}
 }
 

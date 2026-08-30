@@ -22,10 +22,40 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+// composeProvider identifies which compose CLI to drive and how to shape
+// its argv. This is the single place Compose command-line construction
+// happens — CLI passthrough, GUI Compose actions, port mutation, and
+// mutation rollback all build their argv via BuildArgs instead of each
+// hand-assembling provider-specific flags (which is how the "podman -f
+// FILE compose up -d" ordering bug happened: prepending -f before the
+// "compose" subcommand token is invalid for the native podman provider).
 type composeProvider struct {
-	path              string
-	args              []string
+	path string
+	// subcommand is the provider-specific prefix before compose-file flags:
+	// ["compose"] for the native `podman compose` fallback, empty for
+	// podman-compose/docker-compose (which already ARE the compose command).
+	subcommand        []string
 	needsPodmanSocket bool
+}
+
+// BuildArgs constructs a full compose invocation argv for this provider:
+//
+//	<subcommand...> [-f composeFile] <verb> <verbArgs...> [service]
+//
+// composeFile may be empty (CLI passthrough relies on the compose tool's
+// own directory auto-discovery); service may be empty to operate on the
+// whole project.
+func (c *composeProvider) BuildArgs(composeFile, verb string, verbArgs []string, service string) []string {
+	args := append([]string{}, c.subcommand...)
+	if composeFile != "" {
+		args = append(args, "-f", composeFile)
+	}
+	args = append(args, verb)
+	args = append(args, verbArgs...)
+	if service != "" {
+		args = append(args, service)
+	}
+	return args
 }
 
 type lookPathFunc func(file string) (string, error)
@@ -100,6 +130,21 @@ func main() {
 	}
 }
 
+// composeVerbAndArgs maps a Podder-level action ("up"/"down") to the
+// compose verb and its fixed flags. This is the ONLY place that mapping is
+// defined; BuildArgs then interleaves it correctly for whichever provider
+// was resolved.
+func composeVerbAndArgs(action string) (verb string, extra []string, err error) {
+	switch action {
+	case "up":
+		return "up", []string{"-d"}, nil
+	case "down":
+		return "down", nil, nil
+	default:
+		return "", nil, fmt.Errorf("Error: Unsupported compose action %q.", action)
+	}
+}
+
 // handleComposeCommand routes compose up/down requests to podman-compose, docker-compose, or podman compose.
 func handleComposeCommand(action string) {
 	if err := ensureComposeFilePresent(); err != nil {
@@ -118,7 +163,14 @@ func handleComposeCommand(action string) {
 		os.Exit(1)
 	}
 
-	composeCmd := exec.Command(provider.path, provider.args...)
+	verb, extra, err := composeVerbAndArgs(action)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	args := provider.BuildArgs("", verb, extra, "")
+	composeCmd := exec.Command(provider.path, args...)
 
 	// Stream stdout, stderr and stdin directly
 	composeCmd.Stdout = os.Stdout
@@ -154,46 +206,34 @@ func resolveComposeProvider(action string) (*composeProvider, error) {
 	return resolveComposeProviderWithLookPath(action, exec.LookPath)
 }
 
+// resolveComposeProviderWithLookPath picks the compose CLI to drive:
+// podman-compose, then native `podman compose`, then docker-compose. It
+// only validates that action is supported (BuildArgs does the actual
+// argv construction later, once a compose file and optional service are
+// known) so the same resolved provider can be reused for CLI passthrough,
+// GUI actions, mutation, and rollback.
 func resolveComposeProviderWithLookPath(action string, lookPath lookPathFunc) (*composeProvider, error) {
-	args, err := composeArgs(action)
-	if err != nil {
-		return nil, err
+	if action != "up" && action != "down" {
+		return nil, fmt.Errorf("Error: Unsupported compose action %q.", action)
 	}
 
 	if path, err := lookPath("podman-compose"); err == nil {
-		return &composeProvider{
-			path: path,
-			args: args,
-		}, nil
+		return &composeProvider{path: path}, nil
 	}
 
 	if path, err := lookPath("podman"); err == nil {
 		return &composeProvider{
 			path:              path,
-			args:              append([]string{"compose"}, args...),
+			subcommand:        []string{"compose"},
 			needsPodmanSocket: true,
 		}, nil
 	}
 
 	if path, err := lookPath("docker-compose"); err == nil {
-		return &composeProvider{
-			path: path,
-			args: args,
-		}, nil
+		return &composeProvider{path: path}, nil
 	}
 
 	return nil, errors.New("Error: No compose provider found in PATH.\nPlease install 'podman-compose' or configure 'podman compose' (with a docker-compose provider).")
-}
-
-func composeArgs(action string) ([]string, error) {
-	switch action {
-	case "up":
-		return []string{"up", "-d"}, nil
-	case "down":
-		return []string{"down"}, nil
-	default:
-		return nil, fmt.Errorf("Error: Unsupported compose action %q.", action)
-	}
 }
 
 func ensureComposeProviderReady(provider *composeProvider) error {

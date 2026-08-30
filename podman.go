@@ -18,6 +18,11 @@ type PodmanService struct {
 	// the real host executor in production; tests inject a scripted fake so
 	// every failure point of a transaction can be exercised deterministically.
 	runner CommandRunner
+	// lookPath resolves which compose provider binary is on PATH. The zero
+	// value (nil) falls back to exec.LookPath in production; tests inject a
+	// scripted fake so Compose mutation is exercisable without a real
+	// podman-compose/docker-compose install.
+	lookPath lookPathFunc
 }
 
 // cmdRunner returns the configured CommandRunner, falling back to the real
@@ -27,6 +32,15 @@ func (p *PodmanService) cmdRunner() CommandRunner {
 		return p.runner
 	}
 	return defaultCommandRunner
+}
+
+// lookPathFn returns the configured lookPathFunc, falling back to the real
+// exec.LookPath when none was injected.
+func (p *PodmanService) lookPathFn() lookPathFunc {
+	if p.lookPath != nil {
+		return p.lookPath
+	}
+	return exec.LookPath
 }
 
 var supportedImageExtensions = map[string]struct{}{
@@ -621,28 +635,23 @@ func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
 		dir = filepath.Dir(path)
 	}
 
-	var composeCmd *exec.Cmd
-	if _, err := exec.LookPath("podman-compose"); err == nil {
-		if action == "up" {
-			composeCmd = exec.Command("podman-compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("podman-compose", "down")
-		}
-	} else if _, err := exec.LookPath("docker-compose"); err == nil {
-		if action == "up" {
-			composeCmd = exec.Command("docker-compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("docker-compose", "down")
-		}
-	} else {
-		// Fallback to "podman compose"
-		if action == "up" {
-			composeCmd = exec.Command("podman", "compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("podman", "compose", "down")
-		}
+	// Reuse the exact same provider resolution and readiness preflight as
+	// CLI passthrough and Compose mutation, instead of a third hand-rolled
+	// implementation with its own (previously buggy) argv construction.
+	provider, err := resolveComposeProviderWithLookPath(action, p.lookPathFn())
+	if err != nil {
+		return "", err
+	}
+	if err := ensureComposeProviderReady(provider); err != nil {
+		return "", err
 	}
 
+	verb, extra, err := composeVerbAndArgs(action)
+	if err != nil {
+		return "", err
+	}
+
+	composeCmd := exec.Command(provider.path, provider.BuildArgs("", verb, extra, "")...)
 	composeCmd.Dir = dir
 
 	output, err := composeCmd.CombinedOutput()

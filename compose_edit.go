@@ -396,6 +396,11 @@ func (p *PodmanService) MutateComposePorts(containerID string, newPorts []PortMa
 		Success: false,
 		Steps:   []PortMutationStepResult{},
 	}
+	result.RequiresExternal = true
+	result.Guidance = "Automatic in-place Compose mutation is disabled in this hardening build. Podder cannot yet prove complete effective-project identity, preserve every YAML construct, and verify rollback across provider implementations. Use the generated snippet and the authoritative Compose workflow manually."
+	result.ComposeSnippet = GenerateComposeSnippet("service", newPorts)
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
+	return result, nil
 
 	details, err := p.InspectCompose(containerID)
 	if err != nil {

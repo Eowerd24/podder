@@ -260,10 +260,12 @@ func (p *PodmanService) CreateNetwork(name string, driver string, subnet string,
 	}
 
 	if subnetNet != nil {
-		if existing, err := p.ListNetworks(); err == nil {
-			if conflict := findSubnetOverlap(existing, subnetNet); conflict != "" {
-				return fmt.Errorf("subnet %s overlaps with existing network %q", subnet, conflict)
-			}
+		existing, err := p.ListNetworks()
+		if err != nil {
+			return fmt.Errorf("refusing to create network %q because existing subnets could not be inspected: %w", name, err)
+		}
+		if conflict := findSubnetOverlap(existing, subnetNet); conflict != "" {
+			return fmt.Errorf("subnet %s overlaps with existing network %q", subnet, conflict)
 		}
 	}
 
@@ -307,7 +309,10 @@ func (p *PodmanService) RemoveNetwork(name string) error {
 	}
 
 	networks, err := p.ListNetworks()
-	if err == nil {
+	if err != nil {
+		return fmt.Errorf("refusing to remove network %q because current attachments could not be inspected: %w", name, err)
+	}
+	{
 		for _, n := range networks {
 			if n.Name == name && len(n.ConnectedContainers) > 0 {
 				names := make([]string, 0, len(n.ConnectedContainers))

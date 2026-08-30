@@ -69,8 +69,8 @@ func TestParseInspectToAssessment_CleanAdHoc(t *testing.T) {
 	if assessment.ProposedSpec.Env["CUSTOM_VAR"] != "hello123" {
 		t.Errorf("expected CUSTOM_VAR in env, got: %+v", assessment.ProposedSpec.Env)
 	}
-	if _, exists := assessment.ProposedSpec.Env["PATH"]; exists {
-		t.Errorf("expected default PATH to be filtered out")
+	if assessment.ProposedSpec.Env["PATH"] == "" {
+		t.Errorf("expected PATH to be preserved exactly; adoption must not guess which environment values are disposable")
 	}
 }
 
@@ -325,7 +325,7 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 	sim.addContainer("legacy-web", "nginx:alpine", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}, false, "")
 	svc := &PodmanService{runner: &adoptionInspectRouter{sim: sim, image: "nginx:alpine", ports: []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}}}
 
-	result, err := svc.AdoptContainer("legacy-web", "web-svc")
+	result, err := svc.AdoptContainer("legacy-web", "legacy-web")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 		t.Fatalf("expected successful adoption, message: %s", result.Message)
 	}
 
-	spec, err := svc.GetSpec("web-svc")
+	spec, err := svc.GetSpec("legacy-web")
 	if err != nil {
 		t.Fatalf("expected committed spec after successful adoption: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 		t.Errorf("expected committed spec to be Managed")
 	}
 
-	c := sim.containers["web-svc"]
+	c := sim.containers["legacy-web"]
 	if c == nil || !c.managed {
 		t.Fatalf("expected replacement container to exist and carry managed labels, got: %+v", c)
 	}
@@ -402,7 +402,7 @@ func (r *adoptionInspectRouter) Run(name string, args ...string) (string, string
 			portsJSON = fmt.Sprintf(`{"%d/%s": [{"HostIp":"%s","HostPort":"%d"}]}`, p.ContainerPort, p.Protocol, p.HostIP, p.HostPort)
 		}
 		return fmt.Sprintf(`[{"Id":"%s","Name":"/%s","Image":"%s","Config":{"Image":"%s","Cmd":[],"Env":[],"Labels":{}},"HostConfig":{"PortBindings":%s,"Privileged":false,"NetworkMode":"bridge"},"Mounts":[],"Pod":""}]`,
-			c.id, id, r.image, r.image, portsJSON), "", nil
+			c.id, id, c.imageID, r.image, portsJSON), "", nil
 	}
 	if r.failCreate && name == "podman" && len(args) > 0 && (args[0] == "run" || args[0] == "create") {
 		return "", "simulated create failure", fmt.Errorf("simulated create failure")

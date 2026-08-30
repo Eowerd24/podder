@@ -262,16 +262,16 @@ func TestMutateComposePorts_SuccessfulServiceScopedApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !result.Success {
-		t.Fatalf("expected successful compose mutation, steps: %+v", result.Steps)
+	if result.Success || !result.RequiresExternal {
+		t.Fatalf("expected Compose mutation to be safely disabled with manual guidance, got: %+v", result)
 	}
 
 	updated, err := os.ReadFile(composeFile)
 	if err != nil {
 		t.Fatalf("failed to read updated compose file: %v", err)
 	}
-	if !strings.Contains(string(updated), "127.0.0.1:9090:80/tcp") {
-		t.Errorf("expected compose file to reflect new port, got: %s", updated)
+	if string(updated) != content {
+		t.Errorf("read-only Compose mutation must not alter the file, got: %s", updated)
 	}
 }
 
@@ -294,8 +294,8 @@ func TestMutateComposePorts_FailedApplyRollsBackFile(t *testing.T) {
 	if result.Success {
 		t.Fatalf("expected failed compose apply to fail the transaction")
 	}
-	if !result.RolledBack {
-		t.Fatalf("expected a verified rollback, got: %+v", result)
+	if !result.RequiresExternal || result.RolledBack {
+		t.Fatalf("expected preflight refusal without rollback attempt, got: %+v", result)
 	}
 
 	restored, err := os.ReadFile(composeFile)

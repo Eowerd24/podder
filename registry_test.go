@@ -178,8 +178,9 @@ func TestRegistryReservationConflict(t *testing.T) {
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
 		PortRegistry: PortRegistryConfig{
-			Enabled: true,
-			Path:    registryPath,
+			Enabled:              true,
+			Path:                 registryPath,
+			TreatUnscopedAsLocal: true,
 		},
 	}); err != nil {
 		t.Fatalf("failed to save registry settings: %v", err)
@@ -228,8 +229,9 @@ func TestReconciliationStates(t *testing.T) {
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
 		PortRegistry: PortRegistryConfig{
-			Enabled: true,
-			Path:    registryPath,
+			Enabled:              true,
+			Path:                 registryPath,
+			TreatUnscopedAsLocal: true,
 		},
 		// The fixture's node-scoped entries (rig9-*) are only evaluated as
 		// local once the local node identity matches.
@@ -315,7 +317,7 @@ func TestReconciliation_RemoteNodeNeverReportedAsLocallyMissing(t *testing.T) {
 
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
-		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath},
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
 		LocalNode:    "rig9",
 	}); err != nil {
 		t.Fatalf("failed to save settings: %v", err)
@@ -381,7 +383,7 @@ ports:
 
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
-		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath},
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
 		LocalNode:    "rig9",
 	}); err != nil {
 		t.Fatalf("failed to save settings: %v", err)
@@ -414,7 +416,7 @@ func TestActiveRegistryDeclarationDoesNotBlockOwnService(t *testing.T) {
 
 	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
-		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath},
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
 		LocalNode:    "rig9",
 	}); err != nil {
 		t.Fatalf("failed to save settings: %v", err)

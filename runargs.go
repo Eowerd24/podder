@@ -26,6 +26,9 @@ func BuildRunArgsFromSpec(spec ContainerSpec) ([]string, error) {
 	}
 
 	image := strings.TrimSpace(spec.Image)
+	if spec.Managed {
+		image = strings.TrimSpace(spec.ResolvedImage)
+	}
 	args := []string{"run", "-d"}
 
 	name := strings.TrimSpace(spec.Name)

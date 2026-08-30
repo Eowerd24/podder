@@ -482,7 +482,7 @@ func TestCollectBlockingClaimsStrict_MalformedEnabledRegistryBlocksValidation(t 
 	runner := newFakeCommandRunner()
 	service := &PodmanService{runner: runner}
 	if err := service.SaveSettings(AppSettings{
-		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath},
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
 	}); err != nil {
 		t.Fatalf("failed to save settings: %v", err)
 	}

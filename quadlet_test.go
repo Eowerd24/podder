@@ -150,16 +150,16 @@ func TestMutateQuadletPorts_UserScopeSuccessPreservesActiveState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !result.Success {
-		t.Fatalf("expected successful mutation, steps: %+v", result.Steps)
+	if result.Success || !result.RequiresExternal {
+		t.Fatalf("expected Quadlet mutation to be safely disabled with manual guidance, got: %+v", result)
 	}
 
 	data, err := os.ReadFile(unitPath)
 	if err != nil {
 		t.Fatalf("failed to read unit file: %v", err)
 	}
-	if !strings.Contains(string(data), "PublishPort=127.0.0.1:9090:80/tcp") {
-		t.Errorf("expected updated port in unit file, got: %s", data)
+	if strings.Contains(string(data), "9090") {
+		t.Errorf("read-only Quadlet mutation must not alter the unit file, got: %s", data)
 	}
 }
 
@@ -177,8 +177,8 @@ func TestMutateQuadletPorts_InactiveUnitNeverForceStarted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !result.Success {
-		t.Fatalf("expected successful mutation, steps: %+v", result.Steps)
+	if result.Success || !result.RequiresExternal {
+		t.Fatalf("expected Quadlet mutation to be safely disabled with manual guidance, got: %+v", result)
 	}
 	if sim.active {
 		t.Errorf("expected an originally-inactive unit to remain inactive (never auto-started)")
@@ -211,8 +211,8 @@ func TestMutateQuadletPorts_ReloadFailureRollsBack(t *testing.T) {
 	if result.RolledBack {
 		t.Fatalf("expected rollback to be reported as failed when its own daemon-reload also fails")
 	}
-	if !result.ManualRecoveryRequired {
-		t.Errorf("expected ManualRecoveryRequired=true")
+	if !result.RequiresExternal || result.ManualRecoveryRequired {
+		t.Errorf("expected preflight refusal without a rollback attempt, got: %+v", result)
 	}
 }
 

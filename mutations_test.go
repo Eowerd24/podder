@@ -66,6 +66,7 @@ func TestGenerateQuadletSnippet(t *testing.T) {
 type simContainer struct {
 	id      string
 	image   string
+	imageID string
 	state   string // "running" or "exited"
 	ports   []PortMapping
 	managed bool
@@ -87,8 +88,14 @@ func newMutationSim() *mutationSim {
 func (s *mutationSim) addContainer(name, image, state string, ports []PortMapping, managed bool, service string) {
 	s.nextID++
 	s.containers[name] = &simContainer{
-		id:      fmt.Sprintf("%040d", s.nextID),
-		image:   image,
+		id:    fmt.Sprintf("%040d", s.nextID),
+		image: image,
+		imageID: func() string {
+			if strings.HasPrefix(image, "sha256:") {
+				return image
+			}
+			return "sha256:sim-" + image
+		}(),
 		state:   state,
 		ports:   ports,
 		managed: managed,
@@ -107,7 +114,7 @@ func (s *mutationSim) psJSON() string {
 		first = false
 		labels := "{}"
 		if c.managed {
-			labels = fmt.Sprintf(`{"io.podder.managed":"true","io.podder.service":"%s"}`, c.service)
+			labels = fmt.Sprintf(`{"io.podder.managed":"true","io.podder.service":"%s","io.podder.schema-version":"%d"}`, c.service, CurrentSpecSchemaVersion)
 		}
 		var portsJSON strings.Builder
 		portsJSON.WriteString("[")
@@ -118,8 +125,8 @@ func (s *mutationSim) psJSON() string {
 			portsJSON.WriteString(fmt.Sprintf(`{"host_ip":"%s","container_port":%d,"host_port":%d,"protocol":"%s"}`, p.HostIP, p.ContainerPort, p.HostPort, p.Protocol))
 		}
 		portsJSON.WriteString("]")
-		sb.WriteString(fmt.Sprintf(`{"Id":"%s","Names":["%s"],"Image":"%s","State":"%s","Ports":%s,"Labels":%s}`,
-			c.id, name, c.image, c.state, portsJSON.String(), labels))
+		sb.WriteString(fmt.Sprintf(`{"Id":"%s","Names":["%s"],"Image":"%s","ImageID":"%s","State":"%s","Ports":%s,"Labels":%s}`,
+			c.id, name, c.image, c.imageID, c.state, portsJSON.String(), labels))
 	}
 	sb.WriteString("]")
 	return sb.String()
@@ -243,15 +250,18 @@ func setupManagedContainer(t *testing.T, sim *mutationSim, name, image, state st
 
 	svc := &PodmanService{runner: sim}
 	spec := ContainerSpec{
-		Name:         name,
-		Image:        image,
-		Managed:      true,
-		PortMappings: ports,
-		Binds:        []BindMountSpec{{HostPath: t.TempDir(), ContainerPath: "/data"}},
-		Env:          map[string]string{"FOO": "bar"},
-		Command:      []string{"sh", "-c", "echo hello world"},
+		Name:           name,
+		Image:          image,
+		Managed:        true,
+		SchemaVersion:  CurrentSpecSchemaVersion,
+		ResolvedImage:  "sha256:sim-" + image,
+		ReplayComplete: true,
+		PortMappings:   ports,
+		Binds:          []BindMountSpec{{HostPath: t.TempDir(), ContainerPath: "/data"}},
+		Env:            map[string]string{"FOO": "bar"},
+		Command:        []string{"sh", "-c", "echo hello world"},
 	}
-	if err := svc.SaveSpec(spec); err != nil {
+	if err := saveSpec(spec); err != nil {
 		t.Fatalf("failed to seed spec: %v", err)
 	}
 	sim.addContainer(name, image, state, ports, true, name)

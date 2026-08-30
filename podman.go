@@ -23,6 +23,8 @@ type PodmanService struct {
 	// scripted fake so Compose mutation is exercisable without a real
 	// podman-compose/docker-compose install.
 	lookPath lookPathFunc
+	// commitSpec is injectable so commit-failure cleanup is testable.
+	commitSpec func(candidatePath string, spec ContainerSpec) error
 }
 
 // cmdRunner returns the configured CommandRunner, falling back to the real
@@ -41,6 +43,13 @@ func (p *PodmanService) lookPathFn() lookPathFunc {
 		return p.lookPath
 	}
 	return exec.LookPath
+}
+
+func (p *PodmanService) commitCandidate(candidatePath string, spec ContainerSpec) error {
+	if p.commitSpec != nil {
+		return p.commitSpec(candidatePath, spec)
+	}
+	return commitCandidateSpec(candidatePath, spec)
 }
 
 var supportedImageExtensions = map[string]struct{}{
@@ -424,10 +433,12 @@ type ContainerCreateRequest struct {
 
 // ContainerCreateResult reports the outcome of a container creation request.
 type ContainerCreateResult struct {
-	Success     bool   `json:"success"`
-	ContainerID string `json:"containerId"`
-	Managed     bool   `json:"managed"`
-	Message     string `json:"message,omitempty"`
+	Success                bool   `json:"success"`
+	ContainerID            string `json:"containerId"`
+	Managed                bool   `json:"managed"`
+	Message                string `json:"message,omitempty"`
+	ManualRecoveryRequired bool   `json:"manualRecoveryRequired,omitempty"`
+	CandidateSpecPath      string `json:"candidateSpecPath,omitempty"`
 }
 
 // CreateContainer creates a new container from an explicit request. It is
@@ -461,6 +472,15 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 		Entrypoint:    req.Entrypoint,
 	}
 
+	if spec.Managed {
+		resolved, resolveErr := p.resolveImageID(spec.Image)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("managed creation requires an immutable image identity: %w", resolveErr)
+		}
+		spec.ResolvedImage = resolved
+		spec.ReplayComplete = true
+	}
+
 	if errs := ValidateSpec(spec); len(errs) > 0 {
 		return nil, fmt.Errorf("invalid container spec: %s", strings.Join(errs, "; "))
 	}
@@ -482,25 +502,39 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 		}
 	}
 
-	stdout, stderr, err := p.runCommand(args...)
-	if err != nil {
-		discardCandidateSpec(candidatePath)
-		return nil, fmt.Errorf("failed to create container: %v (stderr: %s)", err, strings.TrimSpace(stderr))
+	result := &ContainerCreateResult{Managed: spec.Managed}
+	cleanupFailedManagedCreate := func(reason string) (*ContainerCreateResult, error) {
+		removeErr := p.RemoveContainer(result.ContainerID)
+		removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			return p.containerAbsent(result.ContainerID, spec.Name)
+		})
+		if removed {
+			discardCandidateSpec(candidatePath)
+			result.Message = reason + " The uncommitted container was verified removed; no managed spec was promoted."
+			return result, nil
+		}
+		result.ManualRecoveryRequired = true
+		result.CandidateSpecPath = candidatePath
+		result.Message = fmt.Sprintf("%s ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: the managed-labeled container may still exist and the valid candidate spec was retained at %s (remove error: %v).", reason, candidatePath, removeErr)
+		return result, nil
 	}
 
-	containerID := strings.TrimSpace(stdout)
-	result := &ContainerCreateResult{ContainerID: containerID}
+	stdout, stderr, err := p.runCommand(args...)
+	result.ContainerID = strings.TrimSpace(stdout)
+	if err != nil {
+		if !spec.Managed || !p.containerExistsByIdentity(result.ContainerID, spec.Name) {
+			discardCandidateSpec(candidatePath)
+			return nil, fmt.Errorf("failed to create container: %v (stderr: %s)", err, strings.TrimSpace(stderr))
+		}
+		return cleanupFailedManagedCreate(fmt.Sprintf("Podman reported creation failure after a container became observable: %v (stderr: %s).", err, strings.TrimSpace(stderr)))
+	}
 
 	if spec.Managed {
-		if !p.containerExistsByIdentity(containerID, spec.Name) {
-			discardCandidateSpec(candidatePath)
-			_ = p.RemoveContainer(containerID)
-			return nil, fmt.Errorf("container failed to verify after creation; managed state was not committed and the container was removed")
+		if !p.verifyCreatedManagedContainer(result.ContainerID, spec) {
+			return cleanupFailedManagedCreate("Container failed post-create verification: exact ID, name, lifecycle, image identity, managed labels, or configured ports did not match the candidate spec.")
 		}
-		if err := commitCandidateSpec(candidatePath, spec); err != nil {
-			discardCandidateSpec(candidatePath)
-			_ = p.RemoveContainer(containerID)
-			return nil, fmt.Errorf("failed to commit managed spec, container removed to avoid an unmanaged-but-labeled state: %w", err)
+		if err := p.commitCandidate(candidatePath, spec); err != nil {
+			return cleanupFailedManagedCreate(fmt.Sprintf("Failed to commit managed spec: %v.", err))
 		}
 	}
 
@@ -508,6 +542,22 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 	result.Managed = spec.Managed
 	result.Message = "Container created successfully."
 	return result, nil
+}
+
+// resolveImageID pins a managed spec to the immutable local image object.
+// Replaying a mutable tag would not reproduce the bytes that were verified.
+func (p *PodmanService) resolveImageID(image string) (string, error) {
+	stdout, stderr, err := p.runCommand("image", "inspect", "--format", "json", image)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect image %q: %v (stderr: %s)", image, err, strings.TrimSpace(stderr))
+	}
+	var images []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &images); err != nil || len(images) == 0 || strings.TrimSpace(images[0].ID) == "" {
+		return "", fmt.Errorf("image %q did not return a usable immutable ID", image)
+	}
+	return strings.TrimSpace(images[0].ID), nil
 }
 
 // containerExistsByIdentity verifies a just-created container is visible to
@@ -531,6 +581,39 @@ func (p *PodmanService) containerExistsByIdentity(containerID, name string) bool
 		}
 	}
 	return false
+}
+
+func (p *PodmanService) verifyCreatedManagedContainer(containerID string, spec ContainerSpec) bool {
+	if strings.TrimSpace(containerID) == "" {
+		return false
+	}
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return false
+	}
+	c := findContainerByIdentity(containers, containerID)
+	if c == nil || strings.TrimSpace(c.ImageID) != strings.TrimSpace(spec.ResolvedImage) {
+		return false
+	}
+	if lifecycle, ok := classifyLifecycle(c.State); !ok || lifecycle != lifecycleRunning {
+		return false
+	}
+	if findContainerByName(containers, spec.Name) == nil {
+		return false
+	}
+	if c.Labels["io.podder.managed"] != "true" || c.Labels["io.podder.service"] != spec.Name || c.Labels["io.podder.schema-version"] != fmt.Sprintf("%d", CurrentSpecSchemaVersion) {
+		return false
+	}
+	ok, _, _ := portMappingSetEqual(spec.PortMappings, c.PortMappings)
+	return ok
+}
+
+func (p *PodmanService) containerAbsent(containerID, name string) bool {
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return false
+	}
+	return findContainerByIdentity(containers, containerID) == nil && findContainerByName(containers, name) == nil
 }
 
 // validateMappingsForCreate performs the final, mandatory backend validation

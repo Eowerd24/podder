@@ -499,7 +499,7 @@ func (p *PodmanService) CollectPortClaimsForDisplay() ([]PortClaim, error) {
 		if err == nil && regResult.Loaded {
 			localNode := resolveLocalNode(settings)
 			for _, rp := range regResult.Ports {
-				if !nodeApplies(rp.Node, localNode) {
+				if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
 					continue
 				}
 
@@ -630,7 +630,7 @@ func (p *PodmanService) CollectBlockingClaimsStrict() ([]PortClaim, error) {
 			if rp.State != "reserved" {
 				continue
 			}
-			if !nodeApplies(rp.Node, localNode) {
+			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
 				continue
 			}
 			owner := rp.Service
@@ -696,7 +696,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		}
 		for i := range registryResult.Ports {
 			rp := &registryResult.Ports[i]
-			if !nodeApplies(rp.Node, localNode) {
+			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
 				continue
 			}
 			if rp.Listener.Port == port &&
@@ -709,7 +709,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		if serviceName != "" {
 			for i := range registryResult.Ports {
 				rp := &registryResult.Ports[i]
-				if !nodeApplies(rp.Node, localNode) {
+				if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
 					continue
 				}
 				if rp.Listener.Port == port &&
@@ -890,7 +890,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			status := "DECLARED"
 			reconcileStatus := "DECLARED_MISSING"
 
-			if !nodeApplies(rp.Node, localNode) {
+			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
 				// A registry-wide (homelab, not single-instance) record
 				// scoped to a different node describes a service this
 				// Podder instance does not, and should not, observe

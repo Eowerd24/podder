@@ -118,24 +118,12 @@ func TestLegacySpecWithoutSchemaVersionMigratesToManaged(t *testing.T) {
 	if !spec.Managed {
 		t.Fatalf("expected a legacy (pre-schemaVersion) spec to migrate to Managed=true, since the prototype applied io.podder.managed=true unconditionally; got Managed=false — replaying this spec would silently strip the managed label from a container that currently carries it")
 	}
-	if spec.SchemaVersion != CurrentSpecSchemaVersion {
-		t.Errorf("expected migrated schema version %d, got %d", CurrentSpecSchemaVersion, spec.SchemaVersion)
+	if spec.SchemaVersion != 0 {
+		t.Errorf("expected legacy schema version to remain 0 and read-only, got %d", spec.SchemaVersion)
 	}
 
-	// BuildRunArgsFromSpec on the migrated spec must therefore still apply
-	// the managed label.
-	args, err := BuildRunArgsFromSpec(*spec)
-	if err != nil {
-		t.Fatalf("unexpected error building args: %v", err)
-	}
-	found := false
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "--label" && args[i+1] == "io.podder.managed=true" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected migrated legacy spec to still produce io.podder.managed=true, got args: %v", args)
+	if errs := ValidateSpec(*spec); len(errs) == 0 {
+		t.Fatal("expected legacy prototype spec to be blocked from destructive replay")
 	}
 
 	// A spec written by the CURRENT code (SchemaVersion already set) must
@@ -228,9 +216,12 @@ func TestCandidateSpecCommitAndDiscard(t *testing.T) {
 
 func TestBuildRunArgsFromSpecWithPodderLabels(t *testing.T) {
 	spec := ContainerSpec{
-		Name:    "flowise-service",
-		Image:   "alpine:latest",
-		Managed: true,
+		Name:           "flowise-service",
+		Image:          "alpine:latest",
+		Managed:        true,
+		SchemaVersion:  CurrentSpecSchemaVersion,
+		ResolvedImage:  "sha256:test-image",
+		ReplayComplete: true,
 		PortMappings: []PortMapping{
 			{HostIP: "127.0.0.1", HostPort: 3000, ContainerPort: 3000, Protocol: "tcp"},
 		},

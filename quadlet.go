@@ -254,6 +254,11 @@ func (p *PodmanService) MutateQuadletPorts(unitName string, newPorts []PortMappi
 		Success: false,
 		Steps:   []PortMutationStepResult{},
 	}
+	result.RequiresExternal = true
+	result.Guidance = "Automatic Quadlet mutation is disabled in this hardening build. Discovery and snippets remain available, but Podder does not yet have a version-aware Quadlet generator verification step strong enough to restart a workload safely."
+	result.QuadletSnippet = GenerateQuadletSnippet(newPorts)
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
+	return result, nil
 
 	filePath, scope, err := FindQuadletFile(unitName)
 	if err != nil {

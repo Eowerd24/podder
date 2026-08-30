@@ -414,8 +414,12 @@ type ContainerCreateRequest struct {
 	PortMappings []PortMapping     `json:"portMappings"`
 	Binds        []BindMountSpec   `json:"binds"`
 	Env          map[string]string `json:"env"`
-	Command      []string          `json:"command"`
-	Entrypoint   []string          `json:"entrypoint"`
+	// Command accepts either a JSON array (preferred) or a single
+	// shell-style string (tokenized via SplitShellCommand, e.g. from a
+	// free-text "Command" field in the Run Container UI) — see
+	// CommandArgv's UnmarshalJSON.
+	Command    CommandArgv `json:"command"`
+	Entrypoint []string    `json:"entrypoint"`
 }
 
 // ContainerCreateResult reports the outcome of a container creation request.
@@ -453,7 +457,7 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 		PortMappings:  req.PortMappings,
 		Binds:         req.Binds,
 		Env:           req.Env,
-		Command:       CommandArgv(req.Command),
+		Command:       req.Command,
 		Entrypoint:    req.Entrypoint,
 	}
 

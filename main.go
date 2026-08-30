@@ -65,9 +65,18 @@ type commandRunner func(name string, args ...string) error
 // main function serves as the application's entry point. It initializes the application, creates a window,
 // and starts the application.
 func main() {
-	// Disable WebKitGTK sandbox to prevent bubblewrap (bwrap) crash on systems with restricted user namespaces
-	// This is a known issue on Ubuntu 24.04 and other Linux systems with AppArmor restricting user namespaces.
-	os.Setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1")
+	// WebKitGTK's sandbox uses bubblewrap (bwrap), which crashes on startup
+	// on some Linux systems with restricted/disabled unprivileged user
+	// namespaces (a known issue on, e.g., Ubuntu 24.04 with AppArmor
+	// restricting them, and in some containers). Unconditionally disabling
+	// the sandbox for every user on every system is not a safe default —
+	// it silently weakens the embedded WebView's isolation from the rest
+	// of the OS even for the majority who don't hit the crash. Only opt
+	// into the workaround when explicitly requested, and say so loudly.
+	if os.Getenv("PODDER_DISABLE_WEBKIT_SANDBOX") == "1" {
+		fmt.Fprintln(os.Stderr, "WARNING: PODDER_DISABLE_WEBKIT_SANDBOX=1 is set. Running the embedded WebView WITHOUT its sandbox (WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS). Only use this as a workaround for a bubblewrap/user-namespace startup crash on this specific system — it reduces the WebView's isolation from the rest of the OS.")
+		os.Setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1")
+	}
 
 	// Disable WebKitGTK hardware acceleration/compositing features that fail in environments without DRI3
 	// This fixes the sluggishness and libEGL warnings.

@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -55,6 +53,10 @@ type PortClaim struct {
 	OwnerID     string `json:"ownerId,omitempty"`
 	OwnerName   string `json:"ownerName,omitempty"`
 	ContainerID string `json:"containerId,omitempty"`
+	// RangeSize, when > 1, means this claim actually occupies Port through
+	// Port+RangeSize-1 (a published port range). Conflict checks expand the
+	// claim to its full range instead of checking only the first port.
+	RangeSize int `json:"rangeSize,omitempty"`
 }
 
 // PortOverviewItem represents an entry in the aggregate Ports view.
@@ -217,19 +219,23 @@ func AddressesConflict(addrA, addrB string) bool {
 	return false
 }
 
-// ClaimsConflict checks if two PortClaims conflict.
+// ClaimsConflict checks if two PortClaims conflict, expanding either side's
+// RangeSize into individual ports first so a range (e.g. 8000-8005) is
+// checked port-by-port rather than only at its first port.
 func ClaimsConflict(claimA, claimB PortClaim) bool {
 	// Protocols must match
 	if NormalizeProtocol(claimA.Protocol) != NormalizeProtocol(claimB.Protocol) {
 		return false
 	}
 
-	// Ports must match
-	if claimA.Port != claimB.Port {
-		return false
+	for _, a := range expandClaimRange(claimA) {
+		for _, b := range expandClaimRange(claimB) {
+			if a.Port == b.Port && EndpointsConflict(a.Address, b.Address) {
+				return true
+			}
+		}
 	}
-
-	return AddressesConflict(claimA.Address, claimB.Address)
+	return false
 }
 
 // FindConflict finds the first conflicting claim from a list of existing claims.
@@ -369,39 +375,32 @@ func extractProcessInfo(procField string) (string, int) {
 	return name, pid
 }
 
-// ListHostListeners executes ss to discover all listening sockets on the host.
+// ListHostListeners executes ss (via the injectable CommandRunner, so tests
+// never depend on whatever happens to be listening on the developer/CI
+// machine) to discover all listening sockets on the host.
 func (p *PodmanService) ListHostListeners() ([]HostListener, error) {
 	var allListeners []HostListener
+	runner := p.cmdRunner()
 
 	// 1. TCP listeners
-	cmdTCP := exec.Command("ss", "-H", "-lntp")
-	var stdoutTCP, stderrTCP bytes.Buffer
-	cmdTCP.Stdout = &stdoutTCP
-	cmdTCP.Stderr = &stderrTCP
-	if err := cmdTCP.Run(); err != nil {
-		cmdTCP = exec.Command("ss", "-H", "-lnt")
-		stdoutTCP.Reset()
-		cmdTCP.Stdout = &stdoutTCP
-		if errFallback := cmdTCP.Run(); errFallback != nil {
-			return nil, fmt.Errorf("failed to run ss for TCP: %v, stderr: %s", err, stderrTCP.String())
+	stdoutTCP, stderrTCP, err := runner.Run("ss", "-H", "-lntp")
+	if err != nil {
+		stdoutTCP, stderrTCP, err = runner.Run("ss", "-H", "-lnt")
+		if err != nil {
+			return nil, fmt.Errorf("failed to run ss for TCP: %v, stderr: %s", err, stderrTCP)
 		}
 	}
-	allListeners = append(allListeners, parseSSOutput(stdoutTCP.String(), "tcp")...)
+	allListeners = append(allListeners, parseSSOutput(stdoutTCP, "tcp")...)
 
 	// 2. UDP listeners
-	cmdUDP := exec.Command("ss", "-H", "-lnup")
-	var stdoutUDP, stderrUDP bytes.Buffer
-	cmdUDP.Stdout = &stdoutUDP
-	cmdUDP.Stderr = &stderrUDP
-	if err := cmdUDP.Run(); err != nil {
-		cmdUDP = exec.Command("ss", "-H", "-lnu")
-		stdoutUDP.Reset()
-		cmdUDP.Stdout = &stdoutUDP
-		if errFallback := cmdUDP.Run(); errFallback != nil {
-			return nil, fmt.Errorf("failed to run ss for UDP: %v, stderr: %s", err, stderrUDP.String())
+	stdoutUDP, stderrUDP, err := runner.Run("ss", "-H", "-lnup")
+	if err != nil {
+		stdoutUDP, stderrUDP, err = runner.Run("ss", "-H", "-lnu")
+		if err != nil {
+			return nil, fmt.Errorf("failed to run ss for UDP: %v, stderr: %s", err, stderrUDP)
 		}
 	}
-	allListeners = append(allListeners, parseSSOutput(stdoutUDP.String(), "udp")...)
+	allListeners = append(allListeners, parseSSOutput(stdoutUDP, "udp")...)
 
 	return allListeners, nil
 }
@@ -427,6 +426,7 @@ func (p *PodmanService) CollectPortClaims() ([]PortClaim, error) {
 					OwnerID:     c.Id,
 					OwnerName:   cName,
 					ContainerID: c.Id,
+					RangeSize:   m.RangeSize,
 				})
 			}
 		}
@@ -577,6 +577,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				Port:        m.HostPort,
 				Protocol:    m.Protocol,
 				ContainerID: c.Id,
+				RangeSize:   m.RangeSize,
 			}
 			conflict := FindConflict(claims, claim, c.Id)
 			var conflictNote string

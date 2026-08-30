@@ -104,10 +104,13 @@ func (p *PodmanService) GetSettings() (*AppSettings, error) {
 	return &settings, nil
 }
 
-// SaveSettings persists settings atomically to disk.
+// SaveSettings persists settings atomically to disk. Config directory and
+// file permissions are kept restrictive (0700/0600) because settings (and,
+// more importantly, sibling spec files under the same config directory) can
+// contain credentials via environment variables.
 func (p *PodmanService) SaveSettings(settings AppSettings) error {
 	dir := getConfigDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
 
@@ -118,11 +121,12 @@ func (p *PodmanService) SaveSettings(settings AppSettings) error {
 
 	filePath := getSettingsFilePath()
 	tmpFile := filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0o644); err != nil {
+	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write temporary settings: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, filePath); err != nil {
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to commit settings file: %w", err)
 	}
 

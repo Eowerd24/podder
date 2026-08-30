@@ -114,6 +114,13 @@ type PortMappingRequest struct {
 	ContainerPort uint16 `json:"containerPort"`
 	Protocol      string `json:"protocol"`
 	ContainerID   string `json:"containerId,omitempty"`
+	// RangeSize, when > 1, means this request actually claims HostPort
+	// through HostPort+RangeSize-1 (and ContainerPort through
+	// ContainerPort+RangeSize-1) — a published port range. Final
+	// backend/runtime validation expands the full range instead of only
+	// checking the first port, so the rest of a range is never silently
+	// reported as free.
+	RangeSize int `json:"rangeSize,omitempty"`
 	// OldHostIP, when set, is the bind address this mapping is replacing
 	// (e.g. during a port mutation), letting ValidatePortMapping analyze
 	// the exposure TRANSITION instead of merely classifying the candidate
@@ -415,8 +422,16 @@ func (p *PodmanService) ListHostListeners() ([]HostListener, error) {
 	return allListeners, nil
 }
 
-// CollectPortClaims aggregates claims from running containers, host listeners, and optional registry.
-func (p *PodmanService) CollectPortClaims() ([]PortClaim, error) {
+// CollectPortClaimsForDisplay aggregates claims from running containers,
+// host listeners, and optional registry for DISPLAY/reconciliation purposes
+// only. It is deliberately tolerant: a failure to inspect any one source
+// (podman, ss, the registry file) is swallowed and that source is simply
+// omitted from the result, because the Ports overview must still render
+// whatever it *could* observe rather than going blank. This tolerance is
+// exactly why it must never be used to decide whether it is safe to mutate,
+// create, or adopt a workload — see CollectBlockingClaimsStrict for the
+// fail-closed counterpart used by every safety-critical validation path.
+func (p *PodmanService) CollectPortClaimsForDisplay() ([]PortClaim, error) {
 	var claims []PortClaim
 
 	// 1. Collect from Podman containers
@@ -507,6 +522,7 @@ func (p *PodmanService) CollectPortClaims() ([]PortClaim, error) {
 					Source:    claimSource,
 					OwnerID:   rp.ID,
 					OwnerName: owner,
+					RangeSize: rp.RangeSize,
 				})
 			}
 		}
@@ -515,30 +531,125 @@ func (p *PodmanService) CollectPortClaims() ([]PortClaim, error) {
 	return claims, nil
 }
 
-// CollectBlockingClaims returns only the claims that represent a genuinely
-// occupied or intentionally reserved endpoint — i.e. ones that should block
-// a new deployment attempt. A registry "active" record is a declaration of
-// intended state, not confirmation that a socket is open, and must not
-// block deploying the very service that owns that declaration; a "planned"
-// record is even less concrete. Only live runtime evidence (Podman
-// containers, host listeners) and explicit registry reservations are
-// treated as blocking. Use this (not CollectPortClaims) for
-// ValidatePortMapping/FindFreePort; use CollectPortClaims for
-// reconciliation/display, where "active" claims are meaningful ownership
-// evidence even though they don't block allocation.
-func (p *PodmanService) CollectBlockingClaims() ([]PortClaim, error) {
-	all, err := p.CollectPortClaims()
+// CollectBlockingClaimsStrict returns only the claims that represent a
+// genuinely occupied or intentionally reserved endpoint — i.e. ones that
+// should block a new deployment/mutation attempt. Unlike
+// CollectPortClaimsForDisplay, this is fail-closed: safety-critical port
+// validation (ValidatePortMapping, FindFreePort, and everything that gates a
+// destructive create/mutate/adopt operation) must never report a port as
+// "free" merely because Podder failed to observe the state that would have
+// proven otherwise. So this function returns an error — rather than
+// silently proceeding with a partial/empty claim set — whenever it cannot
+// reliably obtain:
+//
+//   - the local Podman container port mappings (`podman ps` failed)
+//   - the local host listener state (`ss` failed)
+//   - an enabled port registry's declared reservations (registry file
+//     configured and enabled, but failed to load/parse)
+//
+// A registry that is simply not enabled/configured is not an error — the
+// registry is optional. But if it IS enabled and expected to be enforced,
+// yet cannot be loaded, this fails closed rather than silently treating the
+// registry as if it declared nothing.
+//
+// A registry "active" or "planned" record is a declaration of intended
+// state, not confirmation that a socket is open, and must not block
+// deploying the very service that owns that declaration — only live runtime
+// evidence (Podman containers, host listeners) and explicit,
+// locally-scoped registry reservations are treated as blocking.
+func (p *PodmanService) CollectBlockingClaimsStrict() ([]PortClaim, error) {
+	var claims []PortClaim
+
+	containers, err := p.ListContainers(true)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot reliably determine port availability: failed to inspect local Podman containers: %w", err)
 	}
-	blocking := make([]PortClaim, 0, len(all))
-	for _, c := range all {
-		if c.Source == "registry-active" || c.Source == "registry-planned" {
-			continue
+	for _, c := range containers {
+		cName := "unnamed"
+		if len(c.Names) > 0 {
+			cName = c.Names[0]
 		}
-		blocking = append(blocking, c)
+		for _, m := range c.PortMappings {
+			claims = append(claims, PortClaim{
+				Address:     m.HostIP,
+				Port:        m.HostPort,
+				Protocol:    m.Protocol,
+				Source:      "podman",
+				OwnerID:     c.Id,
+				OwnerName:   cName,
+				ContainerID: c.Id,
+				RangeSize:   m.RangeSize,
+			})
+		}
 	}
-	return blocking, nil
+
+	listeners, err := p.ListHostListeners()
+	if err != nil {
+		return nil, fmt.Errorf("cannot reliably determine port availability: failed to inspect local host listener state: %w", err)
+	}
+	for _, l := range listeners {
+		alreadyCovered := false
+		for _, c := range claims {
+			if c.Source == "podman" &&
+				c.Port == l.Port &&
+				NormalizeProtocol(c.Protocol) == NormalizeProtocol(l.Protocol) &&
+				AddressesConflict(c.Address, l.Address) {
+				alreadyCovered = true
+				break
+			}
+		}
+		if !alreadyCovered {
+			owner := l.Process
+			if owner == "" {
+				owner = "Host Process"
+			}
+			claims = append(claims, PortClaim{
+				Address:   l.Address,
+				Port:      l.Port,
+				Protocol:  l.Protocol,
+				Source:    "host-listener",
+				OwnerName: owner,
+			})
+		}
+	}
+
+	settings, err := p.GetSettings()
+	if err != nil {
+		return nil, fmt.Errorf("cannot reliably determine port availability: failed to read settings: %w", err)
+	}
+	if settings.PortRegistry.Enabled && strings.TrimSpace(settings.PortRegistry.Path) != "" {
+		regResult, err := p.LoadPortRegistry(settings.PortRegistry.Path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot reliably determine port availability: port registry is enabled but failed to load: %w", err)
+		}
+		if !regResult.Loaded {
+			return nil, fmt.Errorf("cannot reliably determine port availability: port registry is enabled but failed to load: %s", regResult.Error)
+		}
+		localNode := resolveLocalNode(settings)
+		for _, rp := range regResult.Ports {
+			if rp.State != "reserved" {
+				continue
+			}
+			if !nodeApplies(rp.Node, localNode) {
+				continue
+			}
+			owner := rp.Service
+			if owner == "" {
+				owner = rp.ID
+			}
+			claims = append(claims, PortClaim{
+				Address:   rp.Listener.Address,
+				Port:      rp.Listener.Port,
+				Protocol:  rp.Protocol,
+				Source:    "registry-reserved",
+				OwnerID:   rp.ID,
+				OwnerName: owner,
+				RangeSize: rp.RangeSize,
+			})
+		}
+	}
+
+	return claims, nil
 }
 
 // GetPortOverview aggregates all port mapping data, host listeners, and external registry reconciliation.
@@ -612,7 +723,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	}
 
 	// 4. Collect claims for conflict cross-checking
-	claims, _ := p.CollectPortClaims()
+	claims, _ := p.CollectPortClaimsForDisplay()
 
 	totalPublished := 0
 	// Add container port mappings
@@ -941,6 +1052,32 @@ func (p *PodmanService) ValidatePortMapping(req PortMappingRequest) (*PortValida
 		})
 	}
 
+	if req.RangeSize > 1 {
+		overflow := false
+		if int(req.ContainerPort)+req.RangeSize-1 > 65535 {
+			overflow = true
+		}
+		if req.HostPort != 0 && int(req.HostPort)+req.RangeSize-1 > 65535 {
+			overflow = true
+		}
+		if overflow {
+			result.Valid = false
+			result.Checks = append(result.Checks, ValidationCheck{
+				Name:    "Port Range",
+				Passed:  false,
+				Message: fmt.Sprintf("Port range of size %d starting at host port %d / container port %d overflows past 65535", req.RangeSize, req.HostPort, req.ContainerPort),
+				Level:   "error",
+			})
+		} else {
+			result.Checks = append(result.Checks, ValidationCheck{
+				Name:    "Port Range",
+				Passed:  true,
+				Message: fmt.Sprintf("Port range of size %d is valid", req.RangeSize),
+				Level:   "ok",
+			})
+		}
+	}
+
 	// 2. Protocol check
 	proto := NormalizeProtocol(req.Protocol)
 	if proto != "tcp" && proto != "udp" {
@@ -1013,58 +1150,79 @@ func (p *PodmanService) ValidatePortMapping(req PortMappingRequest) (*PortValida
 	// host listeners, explicit registry reservations). A registry "active"
 	// or "planned" declaration is intended state, not a confirmed open
 	// socket, and must not block deploying the very service that owns that
-	// declaration — see CollectBlockingClaims.
-	claims, err := p.CollectBlockingClaims()
-	if err == nil && req.HostPort > 0 {
-		candidate := PortClaim{
-			Address:  req.HostIP,
-			Port:     req.HostPort,
-			Protocol: proto,
-		}
-		conflict := FindConflict(claims, candidate, req.ContainerID)
-		if conflict != nil {
-			if conflict.Source == "registry-reserved" {
-				result.Valid = false
-				result.ConflictWith = conflict
-				result.Checks = append(result.Checks, ValidationCheck{
-					Name:    "Registry Reservation",
-					Passed:  false,
-					Message: fmt.Sprintf("Port %d/%s is reserved in external registry for %s", req.HostPort, strings.ToUpper(proto), conflict.OwnerName),
-					Level:   "error",
-				})
-			} else {
-				result.Valid = false
-				result.ConflictWith = conflict
-				result.Checks = append(result.Checks, ValidationCheck{
-					Name:    "Port Availability",
-					Passed:  false,
-					Message: fmt.Sprintf("Port %d/%s is already in use by %s (%s)", req.HostPort, strings.ToUpper(proto), conflict.OwnerName, conflict.Source),
-					Level:   "error",
-				})
-			}
-		} else {
+	// declaration — see CollectBlockingClaimsStrict.
+	//
+	// This is fail-closed: if Podder could not reliably determine the
+	// current claim set (podman/ss/registry inspection failed), it must
+	// never report the port as free — an incomplete observation is not
+	// evidence of availability.
+	if req.HostPort > 0 {
+		claims, err := p.CollectBlockingClaimsStrict()
+		if err != nil {
+			result.Valid = false
 			result.Checks = append(result.Checks, ValidationCheck{
 				Name:    "Port Availability",
-				Passed:  true,
-				Message: fmt.Sprintf("Port %d/%s is free and available", req.HostPort, strings.ToUpper(proto)),
-				Level:   "ok",
+				Passed:  false,
+				Message: fmt.Sprintf("Could not reliably determine port availability, refusing to report this port as free: %v", err),
+				Level:   "error",
 			})
+		} else {
+			candidate := PortClaim{
+				Address:   req.HostIP,
+				Port:      req.HostPort,
+				Protocol:  proto,
+				RangeSize: req.RangeSize,
+			}
+			conflict := FindConflict(claims, candidate, req.ContainerID)
+			if conflict != nil {
+				if conflict.Source == "registry-reserved" {
+					result.Valid = false
+					result.ConflictWith = conflict
+					result.Checks = append(result.Checks, ValidationCheck{
+						Name:    "Registry Reservation",
+						Passed:  false,
+						Message: fmt.Sprintf("Port %d/%s is reserved in external registry for %s", req.HostPort, strings.ToUpper(proto), conflict.OwnerName),
+						Level:   "error",
+					})
+				} else {
+					result.Valid = false
+					result.ConflictWith = conflict
+					result.Checks = append(result.Checks, ValidationCheck{
+						Name:    "Port Availability",
+						Passed:  false,
+						Message: fmt.Sprintf("Port %d/%s is already in use by %s (%s)", req.HostPort, strings.ToUpper(proto), conflict.OwnerName, conflict.Source),
+						Level:   "error",
+					})
+				}
+			} else {
+				result.Checks = append(result.Checks, ValidationCheck{
+					Name:    "Port Availability",
+					Passed:  true,
+					Message: fmt.Sprintf("Port %d/%s is free and available", req.HostPort, strings.ToUpper(proto)),
+					Level:   "ok",
+				})
+			}
 		}
 	}
 
 	return result, nil
 }
 
-// FindFreePort finds the next available port on the host for the given protocol and bind address.
+// FindFreePort finds the next available port on the host for the given
+// protocol and bind address. It fails closed: if the current claim set
+// cannot be reliably determined, it returns an error rather than scanning
+// against an empty (and therefore falsely "all free") claim set — a
+// confident "free" result must never be produced from an incomplete
+// observation.
 func (p *PodmanService) FindFreePort(startPort uint16, protocol string, bindAddress string) (uint16, error) {
 	proto := NormalizeProtocol(protocol)
 	if startPort < 1024 {
 		startPort = 3000
 	}
 
-	claims, err := p.CollectBlockingClaims()
+	claims, err := p.CollectBlockingClaimsStrict()
 	if err != nil {
-		claims = []PortClaim{}
+		return 0, fmt.Errorf("cannot find a free port: %w", err)
 	}
 
 	for port := startPort; port < 65535; port++ {

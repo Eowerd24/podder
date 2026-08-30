@@ -278,6 +278,7 @@ func (p *PodmanService) MutateQuadletPorts(unitName string, newPorts []PortMappi
 			ContainerPort: m.ContainerPort,
 			Protocol:      m.Protocol,
 			ContainerID:   ignoreContainerID,
+			RangeSize:     m.RangeSize,
 		}
 		valResult, err := p.ValidatePortMapping(valReq)
 		if err != nil || (valResult != nil && !valResult.Valid) {

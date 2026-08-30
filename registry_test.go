@@ -172,7 +172,10 @@ func TestRegistryReservationConflict(t *testing.T) {
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
 
-	service := &PodmanService{}
+	// Strict port-availability validation is fail-closed: it must not rely
+	// on whatever real podman/ss happens (or doesn't happen) to be
+	// installed on the machine running the tests.
+	service := &PodmanService{runner: newFakeCommandRunner()}
 	if err := service.SaveSettings(AppSettings{
 		PortRegistry: PortRegistryConfig{
 			Enabled: true,

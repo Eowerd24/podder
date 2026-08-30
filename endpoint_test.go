@@ -83,6 +83,67 @@ func TestParsePublishSpecFormatPublishSpecRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFormatPublishSpecRange(t *testing.T) {
+	m := PortMapping{HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}
+	got := FormatPublishSpec(m)
+	want := "8000-8005:9000-9005/tcp"
+	if got != want {
+		t.Fatalf("FormatPublishSpec(range) = %q, want %q", got, want)
+	}
+
+	// A bound host address plus a range must bracket/prefix correctly.
+	m2 := PortMapping{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 3}
+	got2 := FormatPublishSpec(m2)
+	want2 := "127.0.0.1:8000-8002:9000-9002/tcp"
+	if got2 != want2 {
+		t.Fatalf("FormatPublishSpec(bound range) = %q, want %q", got2, want2)
+	}
+}
+
+func TestParsePublishSpecRange(t *testing.T) {
+	m, err := ParsePublishSpec("8000-8005:9000-9005/tcp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m.HostPort != 8000 || m.ContainerPort != 9000 || m.RangeSize != 6 {
+		t.Fatalf("unexpected parsed range mapping: %+v", m)
+	}
+
+	// Mismatched range counts between host and container sides must be
+	// rejected — Podman requires them to name the same number of ports.
+	if _, err := ParsePublishSpec("8000-8005:9000-9002/tcp"); err == nil {
+		t.Fatalf("expected mismatched host/container range counts to be rejected")
+	}
+
+	// A range end below its start is invalid.
+	if _, err := ParsePublishSpec("8005-8000:9000-9005/tcp"); err == nil {
+		t.Fatalf("expected inverted range to be rejected")
+	}
+
+	// A range that overflows past the maximum port must be rejected.
+	if _, err := ParsePublishSpec("65530-65540:9000-9010/tcp"); err == nil {
+		t.Fatalf("expected an overflowing port range to be rejected")
+	}
+}
+
+func TestParsePublishSpecFormatPublishSpecRangeRoundTrip(t *testing.T) {
+	inputs := []string{
+		"8000-8005:9000-9005/tcp",
+		"127.0.0.1:8000-8005:9000-9005/tcp",
+		"[::1]:8000-8002:9000-9002/udp",
+	}
+	for _, in := range inputs {
+		m, err := ParsePublishSpec(in)
+		if err != nil {
+			t.Fatalf("ParsePublishSpec(%q) failed: %v", in, err)
+		}
+		out := FormatPublishSpec(*m)
+		if out != in {
+			t.Errorf("range round trip mismatch: parsed %q, formatted back as %q", in, out)
+		}
+	}
+}
+
 func TestExpandPortRange(t *testing.T) {
 	m := PortMapping{HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 8000, Protocol: "tcp", RangeSize: 6}
 	got := ExpandPortRange(m)

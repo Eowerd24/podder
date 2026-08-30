@@ -71,8 +71,16 @@ func ValidateSpec(spec ContainerSpec) []string {
 		if proto != "tcp" && proto != "udp" {
 			errs = append(errs, fmt.Sprintf("port mapping #%d: protocol must be tcp or udp", i+1))
 		}
+		if m.RangeSize > 1 {
+			if int(m.ContainerPort)+m.RangeSize-1 > 65535 {
+				errs = append(errs, fmt.Sprintf("port mapping #%d: container port range overflows past 65535", i+1))
+			}
+			if m.HostPort != 0 && int(m.HostPort)+m.RangeSize-1 > 65535 {
+				errs = append(errs, fmt.Sprintf("port mapping #%d: host port range overflows past 65535", i+1))
+			}
+		}
 		if m.HostPort != 0 {
-			key := fmt.Sprintf("%s|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, proto)
+			key := fmt.Sprintf("%s|%d|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, m.RangeSize, proto)
 			if seenPorts[key] {
 				errs = append(errs, fmt.Sprintf("port mapping #%d duplicates another mapping in the same spec (%s)", i+1, m.DisplayString()))
 			}

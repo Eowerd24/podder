@@ -548,6 +548,7 @@ func (p *PodmanService) validateMappingsForCreate(mappings []PortMapping) error 
 			HostPort:      m.HostPort,
 			ContainerPort: m.ContainerPort,
 			Protocol:      m.Protocol,
+			RangeSize:     m.RangeSize,
 		}
 		valResult, err := p.ValidatePortMapping(req)
 		if err != nil {

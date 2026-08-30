@@ -581,7 +581,11 @@ func pollUntil(attempts int, interval time.Duration, check func() bool) bool {
 // not merely that the container reports "running".
 func portMappingSetEqual(want, got []PortMapping) (ok bool, missing, unexpected []PortMapping) {
 	key := func(m PortMapping) string {
-		return fmt.Sprintf("%s|%d|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, m.ContainerPort, NormalizeProtocol(m.Protocol))
+		rangeSize := m.RangeSize
+		if rangeSize <= 1 {
+			rangeSize = 1
+		}
+		return fmt.Sprintf("%s|%d|%d|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, m.ContainerPort, rangeSize, NormalizeProtocol(m.Protocol))
 	}
 	wantSet := make(map[string]PortMapping, len(want))
 	for _, m := range want {
@@ -673,6 +677,7 @@ func (p *PodmanService) validateMappingsForMutation(mappings []PortMapping, igno
 			ContainerPort: m.ContainerPort,
 			Protocol:      m.Protocol,
 			ContainerID:   ignoreContainerID,
+			RangeSize:     m.RangeSize,
 		}
 		valResult, err := p.ValidatePortMapping(valReq)
 		if err != nil || (valResult != nil && !valResult.Valid) {

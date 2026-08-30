@@ -120,8 +120,8 @@ const supportedRegistrySchemaVersion = 1
 
 // PortRegistryResult encapsulates parsing and load outcome.
 type PortRegistryResult struct {
-	Loaded       bool           `json:"loaded"`
-	Error        string         `json:"error,omitempty"`
+	Loaded bool   `json:"loaded"`
+	Error  string `json:"error,omitempty"`
 	// Warnings lists individual entries that were dropped during
 	// validation (duplicate ID, unsupported protocol/state vocabulary,
 	// missing port fields, ...). The registry as a whole still loads with

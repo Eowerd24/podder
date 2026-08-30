@@ -224,13 +224,13 @@ func TestAdoptionBlockers(t *testing.T) {
 			wantBlockPhrase: "security option",
 		},
 		{
-			name:        "user",
-			configExtra: `,"User":"1000:1000"`,
+			name:            "user",
+			configExtra:     `,"User":"1000:1000"`,
 			wantBlockPhrase: "custom user",
 		},
 		{
-			name:        "workdir",
-			configExtra: `,"WorkingDir":"/srv/app"`,
+			name:            "workdir",
+			configExtra:     `,"WorkingDir":"/srv/app"`,
 			wantBlockPhrase: "working directory",
 		},
 		{
@@ -264,8 +264,8 @@ func TestAdoptionBlockers(t *testing.T) {
 			wantBlockPhrase: "extra /etc/hosts",
 		},
 		{
-			name:        "tmpfs",
-			mountsExtra: `{"Type":"tmpfs","Destination":"/tmp/scratch"}`,
+			name:            "tmpfs",
+			mountsExtra:     `{"Type":"tmpfs","Destination":"/tmp/scratch"}`,
 			wantBlockPhrase: "tmpfs",
 		},
 		{

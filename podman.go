@@ -44,16 +44,16 @@ func (p *PodmanService) lookPathFn() lookPathFunc {
 }
 
 var supportedImageExtensions = map[string]struct{}{
-	".avif":  {},
-	".bmp":   {},
-	".gif":   {},
-	".jpeg":  {},
-	".jpg":   {},
-	".png":   {},
-	".svg":   {},
-	".tif":   {},
-	".tiff":  {},
-	".webp":  {},
+	".avif": {},
+	".bmp":  {},
+	".gif":  {},
+	".jpeg": {},
+	".jpg":  {},
+	".png":  {},
+	".svg":  {},
+	".tif":  {},
+	".tiff": {},
+	".webp": {},
 }
 
 // rawPodmanPort represents port structure in raw Podman JSON.

@@ -31,10 +31,10 @@ type PortMutationStepResult struct {
 // an assumption that a command with a nil error means the desired state was
 // reached.
 type RollbackResult struct {
-	Attempted         bool     `json:"attempted"`
-	RestoredName      bool     `json:"restoredName"`
-	RestoredLifecycle bool     `json:"restoredLifecycle"`
-	RemovedCandidate  bool     `json:"removedCandidate"`
+	Attempted         bool `json:"attempted"`
+	RestoredName      bool `json:"restoredName"`
+	RestoredLifecycle bool `json:"restoredLifecycle"`
+	RemovedCandidate  bool `json:"removedCandidate"`
 	// Verified is true only when the original workload was confirmed to
 	// exist again under its original name, in its original lifecycle state,
 	// with no errors recorded at any step. Callers must never report
@@ -45,12 +45,12 @@ type RollbackResult struct {
 
 // PortMutationResult contains the outcome of an atomic port mutation transaction.
 type PortMutationResult struct {
-	Success          bool                     `json:"success"`
-	NewContainerID   string                   `json:"newContainerId,omitempty"`
-	OldContainerID   string                   `json:"oldContainerId,omitempty"`
-	RolledBack       bool                     `json:"rolledBack"`
-	RollbackReason   string                   `json:"rollbackReason,omitempty"`
-	Rollback         *RollbackResult          `json:"rollback,omitempty"`
+	Success        bool            `json:"success"`
+	NewContainerID string          `json:"newContainerId,omitempty"`
+	OldContainerID string          `json:"oldContainerId,omitempty"`
+	RolledBack     bool            `json:"rolledBack"`
+	RollbackReason string          `json:"rollbackReason,omitempty"`
+	Rollback       *RollbackResult `json:"rollback,omitempty"`
 	// ManualRecoveryRequired is set when a rollback was attempted but could
 	// not be verified — the backup and/or candidate container names remain
 	// available (never deleted in this case) for manual recovery.

@@ -61,22 +61,22 @@ type PortClaim struct {
 
 // PortOverviewItem represents an entry in the aggregate Ports view.
 type PortOverviewItem struct {
-	ID                   string `json:"id"`
-	Source               string `json:"source"` // "podman", "host-listener", "registry-declared"
-	Owner                string `json:"owner"`
-	ContainerID          string `json:"containerId,omitempty"`
-	BindAddress          string `json:"bindAddress"`
-	HostPort             uint16 `json:"hostPort"`
-	ContainerPort        uint16 `json:"containerPort,omitempty"`
-	Protocol             string `json:"protocol"`
-	Exposure             string `json:"exposure"` // "loopback", "specific-ip", "wildcard", "lan", "public", etc.
-	Status               string `json:"status"`   // "ACTIVE", "STOPPED_CONFIGURED", "CONFLICT", "RESERVED", "MISSING", "PLANNED"
-	ConflictNote         string `json:"conflictNote,omitempty"`
-	IsContainer          bool   `json:"isContainer"`
-	RegistryID           string `json:"registryId,omitempty"`
-	RegistryState        string `json:"registryState,omitempty"`
-	Scope                string `json:"scope,omitempty"`
-	ApplicationProtocol  string `json:"applicationProtocol,omitempty"`
+	ID                   string             `json:"id"`
+	Source               string             `json:"source"` // "podman", "host-listener", "registry-declared"
+	Owner                string             `json:"owner"`
+	ContainerID          string             `json:"containerId,omitempty"`
+	BindAddress          string             `json:"bindAddress"`
+	HostPort             uint16             `json:"hostPort"`
+	ContainerPort        uint16             `json:"containerPort,omitempty"`
+	Protocol             string             `json:"protocol"`
+	Exposure             string             `json:"exposure"` // "loopback", "specific-ip", "wildcard", "lan", "public", etc.
+	Status               string             `json:"status"`   // "ACTIVE", "STOPPED_CONFIGURED", "CONFLICT", "RESERVED", "MISSING", "PLANNED"
+	ConflictNote         string             `json:"conflictNote,omitempty"`
+	IsContainer          bool               `json:"isContainer"`
+	RegistryID           string             `json:"registryId,omitempty"`
+	RegistryState        string             `json:"registryState,omitempty"`
+	Scope                string             `json:"scope,omitempty"`
+	ApplicationProtocol  string             `json:"applicationProtocol,omitempty"`
 	ReconciliationStatus string             `json:"reconciliationStatus"` // "MATCH", "UNDECLARED", "DECLARED_MISSING", "RESERVED_FREE", "RESERVED_IN_USE", "PLANNED", "HOST"
 	Purpose              string             `json:"purpose,omitempty"`
 	Provenance           WorkloadProvenance `json:"provenance,omitempty"`

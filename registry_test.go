@@ -575,4 +575,3 @@ func TestGetLocalNodeDefaultsToHostname(t *testing.T) {
 		t.Errorf("expected explicit LocalNode override to take precedence, got %q", node)
 	}
 }
-

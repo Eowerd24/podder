@@ -46,17 +46,17 @@ type inspectContainer struct {
 	Args   []string `json:"Args"`
 	Pod    string   `json:"Pod"`
 	Config struct {
-		Image        string            `json:"Image"`
-		Cmd          []string          `json:"Cmd"`
-		Entrypoint   []string          `json:"Entrypoint"`
-		Env          []string          `json:"Env"`
-		Labels       map[string]string `json:"Labels"`
-		WorkingDir   string            `json:"WorkingDir"`
-		User         string            `json:"User"`
-		Hostname     string            `json:"Hostname"`
-		StopSignal   string            `json:"StopSignal"`
-		StopTimeout  *int              `json:"StopTimeout"`
-		Healthcheck  *struct {
+		Image       string            `json:"Image"`
+		Cmd         []string          `json:"Cmd"`
+		Entrypoint  []string          `json:"Entrypoint"`
+		Env         []string          `json:"Env"`
+		Labels      map[string]string `json:"Labels"`
+		WorkingDir  string            `json:"WorkingDir"`
+		User        string            `json:"User"`
+		Hostname    string            `json:"Hostname"`
+		StopSignal  string            `json:"StopSignal"`
+		StopTimeout *int              `json:"StopTimeout"`
+		Healthcheck *struct {
 			Test []string `json:"Test"`
 		} `json:"Healthcheck"`
 	} `json:"Config"`

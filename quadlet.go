@@ -56,6 +56,10 @@ func getQuadletSearchDirs() []quadletSearchDir {
 
 	var dirs []quadletSearchDir
 
+	if xdgRuntime := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); xdgRuntime != "" {
+		dirs = append(dirs, quadletSearchDir{filepath.Join(xdgRuntime, "containers", "systemd"), QuadletScopeUser})
+	}
+
 	if xdgConfig := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdgConfig != "" {
 		dirs = append(dirs, quadletSearchDir{filepath.Join(xdgConfig, "containers", "systemd"), QuadletScopeUser})
 	} else if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
@@ -66,6 +70,8 @@ func getQuadletSearchDirs() []quadletSearchDir {
 	dirs = append(dirs,
 		quadletSearchDir{prefixed(filepath.Join("/etc/containers/systemd/users", uid)), QuadletScopeUser},
 		quadletSearchDir{prefixed("/etc/containers/systemd/users"), QuadletScopeUser},
+		quadletSearchDir{prefixed(filepath.Join("/usr/share/containers/systemd/users", uid)), QuadletScopeUser},
+		quadletSearchDir{prefixed("/usr/share/containers/systemd/users"), QuadletScopeUser},
 	)
 
 	dirs = append(dirs,
@@ -85,6 +91,8 @@ type QuadletFileDetails struct {
 	Exists       bool          `json:"exists"`
 	Content      string        `json:"content"`
 	PortMappings []PortMapping `json:"portMappings"`
+	ServiceName  string        `json:"serviceName"`
+	HasDropIns   bool          `json:"hasDropIns"`
 }
 
 // FindQuadletFile searches the standard Quadlet unit paths for a matching
@@ -105,7 +113,34 @@ func FindQuadletFile(unitName string) (path string, scope QuadletScope, err erro
 			p := filepath.Join(dir.path, cand)
 			if _, statErr := os.Stat(p); statErr == nil {
 				return p, dir.scope, nil
+			} else if !os.IsNotExist(statErr) {
+				return "", "", fmt.Errorf("cannot inspect Quadlet candidate %s: %w", p, statErr)
 			}
+		}
+		var found string
+		walkErr := filepath.WalkDir(dir.path, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				if os.IsNotExist(walkErr) {
+					return nil
+				}
+				return walkErr
+			}
+			if path == dir.path || entry.IsDir() {
+				return nil
+			}
+			for _, cand := range candidates {
+				if entry.Name() == cand {
+					found = path
+					return filepath.SkipAll
+				}
+			}
+			return nil
+		})
+		if walkErr != nil && !os.IsNotExist(walkErr) {
+			return "", "", fmt.Errorf("cannot recursively inspect Quadlet directory %s: %w", dir.path, walkErr)
+		}
+		if found != "" {
+			return found, dir.scope, nil
 		}
 	}
 
@@ -132,6 +167,25 @@ func ParseQuadletContent(content string) []PortMapping {
 	}
 
 	return mappings
+}
+
+func QuadletServiceName(content, filePath string) string {
+	serviceName := strings.TrimSuffix(filepath.Base(filePath), ".container")
+	section := ""
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToLower(line)
+			continue
+		}
+		if section == "[container]" && strings.HasPrefix(strings.ToLower(line), "servicename=") {
+			if value := strings.TrimSpace(line[len("ServiceName="):]); value != "" {
+				serviceName = strings.TrimSuffix(value, ".service")
+			}
+		}
+	}
+	return serviceName + ".service"
 }
 
 // UpdateQuadletContent replaces PublishPort lines under [Container] in a .container file.
@@ -202,6 +256,11 @@ func (p *PodmanService) InspectQuadlet(unitName string) (*QuadletFileDetails, er
 
 	content := string(data)
 	ports := ParseQuadletContent(content)
+	serviceName := QuadletServiceName(content, filePath)
+	dropIns, err := filepath.Glob(filePath + ".d/*.conf")
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect Quadlet drop-ins: %w", err)
+	}
 
 	return &QuadletFileDetails{
 		UnitName:     unitName,
@@ -210,198 +269,23 @@ func (p *PodmanService) InspectQuadlet(unitName string) (*QuadletFileDetails, er
 		Exists:       true,
 		Content:      content,
 		PortMappings: ports,
+		ServiceName:  serviceName,
+		HasDropIns:   len(dropIns) > 0,
 	}, nil
 }
 
 // quadletIgnoreContainerID finds the container systemd currently manages
 // for a given .service unit name, so preflight validation ignores that
 // container's OWN current port claims (section 4.1/17.3's "self-conflict"
-// fix): keeping an unchanged mapping must not fail because it appears to
-// conflict with itself.
-func (p *PodmanService) quadletIgnoreContainerID(systemctlService string) string {
-	containers, err := p.ListContainers(true)
-	if err != nil {
-		return ""
-	}
-	for _, c := range containers {
-		if c.Provenance.Type == "quadlet" && (c.Provenance.UnitName == systemctlService || c.Provenance.Name == systemctlService) {
-			return c.Id
-		}
-	}
-	return ""
-}
-
-// MutateQuadletPorts safely edits a rootless user .container unit file,
-// validates it, and reloads/restarts the service — verifying every step
-// and never claiming a rollback succeeded unless it is confirmed:
-//
-//   - System/rootful Quadlets are refused outright (read-only in Podder;
-//     no implicit sudo).
-//   - The unit's own currently-configured ports are ignored during
-//     preflight so an unchanged mapping never looks like a self-conflict.
-//   - The file is written atomically, preserving its original permissions.
-//   - `systemctl --user cat <service>` after daemon-reload validates that
-//     the generator produced a working unit BEFORE any restart is
-//     attempted — a malformed generated unit is caught before the running
-//     workload is touched.
-//   - If the unit was originally inactive, it is never force-started; only
-//     an originally-active unit is restarted and its activity verified.
-//   - Rollback restores the original file, reloads, and — only if the unit
-//     was originally active — restarts it, verifying is-active before ever
-//     reporting success.
+// MutateQuadletPorts is deliberately read-only. Automatic Quadlet edits remain
+// disabled until Podder can compute effective drop-ins, validate with the real
+// generator, observe lifecycle without conflating errors with inactivity, and
+// verify exact runtime ports for both apply and rollback.
 func (p *PodmanService) MutateQuadletPorts(unitName string, newPorts []PortMapping) (*PortMutationResult, error) {
-	result := &PortMutationResult{
-		Success: false,
-		Steps:   []PortMutationStepResult{},
-	}
+	result := &PortMutationResult{Success: false, Steps: []PortMutationStepResult{}}
 	result.RequiresExternal = true
-	result.Guidance = "Automatic Quadlet mutation is disabled in this hardening build. Discovery and snippets remain available, but Podder does not yet have a version-aware Quadlet generator verification step strong enough to restart a workload safely."
+	result.Guidance = "Automatic Quadlet mutation is disabled in this hardening build. Discovery and snippets remain available, but Podder does not yet compute effective drop-in configuration, run a version-aware generator validator, resolve lifecycle queries as a tri-state, and verify exact runtime ports and rollback."
 	result.QuadletSnippet = GenerateQuadletSnippet(newPorts)
 	result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
 	return result, nil
-
-	filePath, scope, err := FindQuadletFile(unitName)
-	if err != nil {
-		return nil, err
-	}
-
-	if scope == QuadletScopeSystem {
-		result.RequiresExternal = true
-		result.Guidance = fmt.Sprintf("Unit %s is a system/rootful Quadlet (%s). Podder only mutates rootless user Quadlets and never escalates privileges automatically. Edit this file and reload/restart it with the appropriate system privileges yourself.", unitName, filePath)
-		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
-		return result, nil
-	}
-
-	systemctlService := strings.TrimSuffix(filepath.Base(filePath), ".container") + ".service"
-	ignoreContainerID := p.quadletIgnoreContainerID(systemctlService)
-
-	// 1. Preflight Validation (self-conflict-safe)
-	for _, m := range newPorts {
-		valReq := PortMappingRequest{
-			HostIP:        m.HostIP,
-			HostPort:      m.HostPort,
-			ContainerPort: m.ContainerPort,
-			Protocol:      m.Protocol,
-			ContainerID:   ignoreContainerID,
-			RangeSize:     m.RangeSize,
-		}
-		valResult, err := p.ValidatePortMapping(valReq)
-		if err != nil || (valResult != nil && !valResult.Valid) {
-			errMsg := "Port conflict detected"
-			if valResult != nil && len(valResult.Checks) > 0 {
-				for _, c := range valResult.Checks {
-					if !c.Passed {
-						errMsg = c.Message
-						break
-					}
-				}
-			}
-			result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: errMsg})
-			return result, nil
-		}
-	}
-
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat %s: %w", filePath, err)
-	}
-	origContent, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", filePath, err)
-	}
-
-	// Capture original lifecycle so an intentionally-inactive unit is never
-	// force-started.
-	wasActive := p.quadletIsActive(systemctlService)
-
-	result.Steps = append(result.Steps, PortMutationStepResult{
-		Step: "PREFLIGHT", Passed: true,
-		Message: fmt.Sprintf("Preflight verified for %s (scope: %s, originally %s)", filePath, scope, activeLabel(wasActive)),
-	})
-
-	newContent := UpdateQuadletContent(string(origContent), newPorts)
-
-	rollback := func(reason string, reloadedNewContent bool) (*PortMutationResult, error) {
-		var errs []string
-		if err := writeFileAtomicPreservingMode(filePath, origContent, fileInfo.Mode().Perm()); err != nil {
-			errs = append(errs, fmt.Sprintf("failed to restore original unit file: %v", err))
-		}
-		if _, stderr, err := p.cmdRunner().Run("systemctl", "--user", "daemon-reload"); err != nil {
-			errs = append(errs, fmt.Sprintf("daemon-reload failed during rollback: %v (%s)", err, strings.TrimSpace(stderr)))
-		}
-
-		verified := len(errs) == 0
-		if verified && wasActive {
-			if _, stderr, err := p.cmdRunner().Run("systemctl", "--user", "restart", systemctlService); err != nil {
-				errs = append(errs, fmt.Sprintf("failed to restart original unit during rollback: %v (%s)", err, strings.TrimSpace(stderr)))
-				verified = false
-			} else if !p.quadletIsActive(systemctlService) {
-				errs = append(errs, fmt.Sprintf("unit %s is not active after rollback restart", systemctlService))
-				verified = false
-			}
-		}
-
-		result.RollbackReason = reason
-		if verified {
-			result.RolledBack = true
-			result.Steps = append(result.Steps, PortMutationStepResult{Step: "ROLLED_BACK", Passed: true, Message: reason})
-		} else {
-			result.ManualRecoveryRequired = true
-			result.Steps = append(result.Steps, PortMutationStepResult{
-				Step: "ROLLBACK_FAILED", Passed: false,
-				Message: fmt.Sprintf("ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: %s (%s)", reason, strings.Join(errs, "; ")),
-			})
-		}
-		return result, nil
-	}
-
-	// 2. Write the new file atomically, preserving permissions.
-	if err := writeFileAtomicPreservingMode(filePath, []byte(newContent), fileInfo.Mode().Perm()); err != nil {
-		return nil, fmt.Errorf("failed to write updated quadlet file: %w", err)
-	}
-	result.Steps = append(result.Steps, PortMutationStepResult{Step: "SNAPSHOT", Passed: true, Message: "Unit file staged; original content retained in memory for rollback."})
-
-	// 3. Reload, then validate the generated unit BEFORE ever restarting.
-	if _, stderr, err := p.cmdRunner().Run("systemctl", "--user", "daemon-reload"); err != nil {
-		return rollback(fmt.Sprintf("systemctl daemon-reload failed: %v (%s)", err, strings.TrimSpace(stderr)), false)
-	}
-	if _, stderr, err := p.cmdRunner().Run("systemctl", "--user", "cat", systemctlService); err != nil {
-		return rollback(fmt.Sprintf("Generated unit %s failed to validate after daemon-reload (the edited Quadlet file is likely malformed): %v (%s)", systemctlService, err, strings.TrimSpace(stderr)), true)
-	}
-
-	// 4. Only restart (and require activity) if the unit was originally
-	// active — never force an intentionally-inactive unit to start.
-	if wasActive {
-		if _, stderr, err := p.cmdRunner().Run("systemctl", "--user", "restart", systemctlService); err != nil {
-			return rollback(fmt.Sprintf("systemctl restart %s failed: %v (%s)", systemctlService, err, strings.TrimSpace(stderr)), true)
-		}
-		if !p.quadletIsActive(systemctlService) {
-			return rollback(fmt.Sprintf("Unit %s is not active after restart", systemctlService), true)
-		}
-	}
-
-	result.Steps = append(result.Steps, PortMutationStepResult{
-		Step: "PORT_VERIFY", Passed: true,
-		Message: fmt.Sprintf("Unit %s validated and reloaded (%s).", systemctlService, activeLabel(wasActive)),
-	})
-
-	result.Success = true
-	result.Steps = append(result.Steps, PortMutationStepResult{
-		Step: "COMMITTED", Passed: true,
-		Message: fmt.Sprintf("Quadlet unit %s updated successfully.", systemctlService),
-	})
-
-	return result, nil
-}
-
-func (p *PodmanService) quadletIsActive(systemctlService string) bool {
-	stdout, _, _ := p.cmdRunner().Run("systemctl", "--user", "is-active", systemctlService)
-	return strings.TrimSpace(stdout) == "active"
-}
-
-func activeLabel(active bool) string {
-	if active {
-		return "active"
-	}
-	return "inactive"
 }

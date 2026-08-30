@@ -199,18 +199,28 @@ func (s *mutationSim) Run(name string, args ...string) (string, string, error) {
 		s.containers[newName] = c
 		return "", "", nil
 	case "stop":
-		if c, ok := s.containers[args[1]]; ok {
-			c.state = "exited"
+		target := args[1]
+		for containerName, c := range s.containers {
+			if containerName == target || c.id == target {
+				c.state = "exited"
+			}
 		}
 		return "", "", nil
 	case "start":
-		if c, ok := s.containers[args[1]]; ok {
-			c.state = "running"
+		target := args[1]
+		for containerName, c := range s.containers {
+			if containerName == target || c.id == target {
+				c.state = "running"
+			}
 		}
 		return "", "", nil
 	case "rm":
 		target := args[len(args)-1]
-		delete(s.containers, target)
+		for containerName, c := range s.containers {
+			if containerName == target || c.id == target {
+				delete(s.containers, containerName)
+			}
+		}
 		return "", "", nil
 	case "run", "create":
 		cname, image, ports := parseNameAndPorts(args)
@@ -565,5 +575,97 @@ func TestNewBackupNameIsUnique(t *testing.T) {
 			t.Fatalf("expected unique backup names, got collision: %s", n)
 		}
 		seen[n] = true
+	}
+}
+
+func TestMutateContainerPortsReportsRealExposureWidening(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "exposure-app", "alpine:latest", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}})
+	result, err := svc.MutateContainerPorts(PortMutationRequest{
+		ContainerID: "exposure-app",
+		NewPorts:    []PortMapping{{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+	})
+	if err != nil || !result.Success {
+		t.Fatalf("expected successful mutation, result=%+v err=%v", result, err)
+	}
+	if len(result.ExposureWarnings) == 0 {
+		t.Fatalf("actual loopback-to-wildcard edit must report an exposure widening")
+	}
+}
+
+func TestMutateContainerPortsRenameFailureNeedsNoRollback(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "rename-safe", "alpine:latest", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}})
+	sim.failStep = "rename"
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "rename-safe", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success || result.Rollback != nil || result.RolledBack || result.ManualRecoveryRequired {
+		t.Fatalf("rename failure happened before mutation and must not trigger recovery: %+v", result)
+	}
+	if original := sim.containers["rename-safe"]; original == nil || original.state != "running" {
+		t.Fatalf("original workload changed despite rename failure: %+v", original)
+	}
+}
+
+type startErrorAfterSuccessSim struct {
+	sim *mutationSim
+}
+
+func (s *startErrorAfterSuccessSim) Run(name string, args ...string) (string, string, error) {
+	if name == "podman" && len(args) > 1 && args[0] == "start" {
+		s.sim.mu.Lock()
+		if c := s.sim.containers[args[1]]; c != nil {
+			c.state = "running"
+		}
+		s.sim.mu.Unlock()
+		return "", "reported failure after starting", fmt.Errorf("reported failure after starting")
+	}
+	return s.sim.Run(name, args...)
+}
+
+func TestRollbackUsesObservedStateWhenStartReportsError(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "start-observed", "alpine:latest", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}})
+	svc.runner = &startErrorAfterSuccessSim{sim: sim}
+	sim.failStep = "run"
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "start-observed", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rollback == nil || !result.Rollback.Verified || result.ManualRecoveryRequired {
+		t.Fatalf("final observed running state should make rollback verified despite start error: %+v", result)
+	}
+}
+
+type healthTransitionSim struct {
+	sim   *mutationSim
+	calls int
+}
+
+func (h *healthTransitionSim) Run(name string, args ...string) (string, string, error) {
+	if name == "podman" && len(args) > 0 && args[0] == "inspect" {
+		h.calls++
+		status := "starting"
+		if h.calls > 1 {
+			status = "unhealthy"
+		}
+		return fmt.Sprintf(`[{"State":{"Health":{"Status":"%s"}}}]`, status), "", nil
+	}
+	return h.sim.Run(name, args...)
+}
+
+func TestHealthStartingThenUnhealthyTriggersRollback(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "health-app", "alpine:latest", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}})
+	health := &healthTransitionSim{sim: sim}
+	svc.runner = health
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "health-app", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success || result.Rollback == nil || !result.Rollback.Verified {
+		t.Fatalf("final unhealthy state must fail and rollback the transaction: %+v", result)
 	}
 }

@@ -580,3 +580,93 @@ func TestGetLocalNodeDefaultsToHostname(t *testing.T) {
 		t.Errorf("expected explicit LocalNode override to take precedence, got %q", node)
 	}
 }
+
+func TestRegistrySameServiceAddressMismatchIsNotMatch(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	registry := `
+version: 1
+ports:
+  - id: web
+    service: web
+    node: rig9
+    protocol: tcp
+    listener:
+      address: 0.0.0.0
+      port: 3000
+    state: active
+`
+	if err := os.WriteFile(registryPath, []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"web-id","Names":["web"],"Image":"nginx","ImageID":"sha256:web","State":"running","Ports":[{"host_ip":"127.0.0.1","host_port":3000,"container_port":80,"protocol":"tcp"}],"Labels":{}}]`, "", nil
+	})
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath}, LocalNode: "rig9"}); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range overview.Items {
+		if item.ContainerID == "web-id" {
+			if item.ReconciliationStatus != "DECLARED_ENDPOINT_MISMATCH" || item.ReconciliationStatus == "MATCH" {
+				t.Fatalf("wildcard declaration must not match loopback runtime bind: %+v", item)
+			}
+			if item.ConflictNote == "" {
+				t.Fatalf("endpoint mismatch should expose expected and observed binds")
+			}
+			return
+		}
+	}
+	t.Fatalf("runtime container mapping not found in overview")
+}
+
+func TestUnscopedRegistryRecordIsInformationalByDefault(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	registry := `
+version: 1
+ports:
+  - id: unscoped
+    service: elsewhere
+    protocol: tcp
+    listener:
+      address: 0.0.0.0
+      port: 4555
+    state: active
+`
+	if err := os.WriteFile(registryPath, []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	service := &PodmanService{runner: newFakeCommandRunner()}
+	if err := service.SaveSettings(AppSettings{PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath}, LocalNode: "rig9"}); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Summary.RegistryMissing != 0 || overview.Summary.RegistryUnscoped != 1 {
+		t.Fatalf("unscoped declaration must be informational, summary: %+v", overview.Summary)
+	}
+	for _, item := range overview.Items {
+		if item.RegistryID == "unscoped" && item.ReconciliationStatus != "UNSCOPED" {
+			t.Fatalf("expected distinct UNSCOPED state, got %+v", item)
+		}
+	}
+	validation, err := service.ValidatePortMapping(PortMappingRequest{HostIP: "0.0.0.0", HostPort: 4555, ContainerPort: 4555, Protocol: "tcp"})
+	if err != nil || !validation.Valid {
+		t.Fatalf("unscoped record must not block local allocation: result=%+v err=%v", validation, err)
+	}
+}

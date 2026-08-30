@@ -89,6 +89,10 @@ func ParseNetworksInspectJSON(data []byte) ([]PodmanNetwork, error) {
 
 // ListNetworks lists all local Podman networks and attaches connected container IPs.
 func (p *PodmanService) ListNetworks() ([]PodmanNetwork, error) {
+	return p.listNetworks(false)
+}
+
+func (p *PodmanService) listNetworks(strictAttachments bool) ([]PodmanNetwork, error) {
 	// 1. Inspect all networks
 	stdout, stderr, err := p.runCommand("network", "inspect", "-a")
 	if err != nil {
@@ -114,7 +118,10 @@ func (p *PodmanService) ListNetworks() ([]PodmanNetwork, error) {
 	}
 
 	// 2. Discover connected container IP allocations from running containers
-	containers, _ := p.ListContainers(true)
+	containers, containersErr := p.ListContainers(true)
+	if containersErr != nil && strictAttachments {
+		return nil, fmt.Errorf("failed to inspect network attachments: %w", containersErr)
+	}
 	for _, c := range containers {
 		cName := "unnamed"
 		if len(c.Names) > 0 {
@@ -123,7 +130,13 @@ func (p *PodmanService) ListNetworks() ([]PodmanNetwork, error) {
 
 		// Inspect container networks
 		inspOut, _, inspErr := p.runCommand("inspect", "--format", "json", c.Id)
-		if inspErr == nil {
+		if inspErr != nil {
+			if strictAttachments {
+				return nil, fmt.Errorf("failed to inspect network attachments for container %s: %w", c.Id, inspErr)
+			}
+			continue
+		}
+		{
 			var inspList []struct {
 				NetworkSettings struct {
 					Networks map[string]struct {
@@ -133,7 +146,13 @@ func (p *PodmanService) ListNetworks() ([]PodmanNetwork, error) {
 					} `json:"Networks"`
 				} `json:"NetworkSettings"`
 			}
-			if json.Unmarshal([]byte(inspOut), &inspList) == nil && len(inspList) > 0 {
+			if err := json.Unmarshal([]byte(inspOut), &inspList); err != nil || len(inspList) == 0 {
+				if strictAttachments {
+					return nil, fmt.Errorf("failed to parse network attachments for container %s", c.Id)
+				}
+				continue
+			}
+			{
 				for netName, netInfo := range inspList[0].NetworkSettings.Networks {
 					for i := range networks {
 						if networks[i].Name == netName {
@@ -259,11 +278,16 @@ func (p *PodmanService) CreateNetwork(name string, driver string, subnet string,
 		}
 	}
 
-	if subnetNet != nil {
-		existing, err := p.ListNetworks()
-		if err != nil {
-			return fmt.Errorf("refusing to create network %q because existing subnets could not be inspected: %w", name, err)
+	existing, err := p.listNetworks(true)
+	if err != nil {
+		return fmt.Errorf("refusing to create network %q because existing networks and attachments could not be inspected: %w", name, err)
+	}
+	for _, network := range existing {
+		if network.Name == name {
+			return fmt.Errorf("network %q already exists", name)
 		}
+	}
+	if subnetNet != nil {
 		if conflict := findSubnetOverlap(existing, subnetNet); conflict != "" {
 			return fmt.Errorf("subnet %s overlaps with existing network %q", subnet, conflict)
 		}
@@ -308,7 +332,7 @@ func (p *PodmanService) RemoveNetwork(name string) error {
 		return fmt.Errorf("cannot remove default network '%s'", name)
 	}
 
-	networks, err := p.ListNetworks()
+	networks, err := p.listNetworks(true)
 	if err != nil {
 		return fmt.Errorf("refusing to remove network %q because current attachments could not be inspected: %w", name, err)
 	}

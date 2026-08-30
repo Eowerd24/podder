@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,6 +15,7 @@ type ComposeFileDetails struct {
 	ContainerID  string        `json:"containerId"`
 	WorkingDir   string        `json:"workingDir"`
 	ComposeFile  string        `json:"composeFile"`
+	Project      string        `json:"project"`
 	Service      string        `json:"service"`
 	Content      string        `json:"content"`
 	PortMappings []PortMapping `json:"portMappings"`
@@ -129,68 +128,79 @@ func ParseComposePorts(composeYAML, serviceName string) ([]PortMapping, error) {
 	if err := yaml.Unmarshal([]byte(composeYAML), &root); err != nil {
 		return nil, fmt.Errorf("failed to parse compose YAML: %w", err)
 	}
-
 	if len(root.Content) == 0 {
 		return []PortMapping{}, nil
 	}
-
 	servicesNode := findMapKeyNode(root.Content[0], "services")
 	if servicesNode == nil {
 		return []PortMapping{}, nil
 	}
-
 	serviceNode := findMapKeyNode(servicesNode, serviceName)
 	if serviceNode == nil {
 		return []PortMapping{}, nil
 	}
-
 	portsNode := findMapKeyNode(serviceNode, "ports")
-	if portsNode == nil || portsNode.Kind != yaml.SequenceNode {
+	if portsNode == nil {
 		return []PortMapping{}, nil
+	}
+	if portsNode.Kind == yaml.AliasNode {
+		return nil, fmt.Errorf("service %q uses a YAML alias for ports; automatic mutation is disabled", serviceName)
+	}
+	if portsNode.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("service %q ports must be a sequence; automatic mutation is disabled", serviceName)
 	}
 
 	var mappings []PortMapping
-	for _, item := range portsNode.Content {
-		if item.Kind == yaml.ScalarNode {
-			if pm := ParseComposePortEntry(item.Value); pm != nil {
-				mappings = append(mappings, *pm)
+	for i, item := range portsNode.Content {
+		switch item.Kind {
+		case yaml.ScalarNode:
+			entry := strings.TrimSpace(item.Value)
+			if entry == "" || strings.Contains(entry, "$") {
+				return nil, fmt.Errorf("service %q port entry #%d contains interpolation or is empty; automatic mutation is disabled", serviceName, i+1)
 			}
-		} else if item.Kind == yaml.MappingNode {
-			// Long-form port mapping: target: 80, published: 8080, host_ip: 127.0.0.1, protocol: tcp
+			pm, err := ParsePublishSpec(entry)
+			if err != nil || pm == nil {
+				return nil, fmt.Errorf("service %q port entry #%d (%q) is not representable: %v", serviceName, i+1, entry, err)
+			}
+			mappings = append(mappings, *pm)
+		case yaml.MappingNode:
+			if unsupported := composePortsUnsupportedLongFormKeys(&yaml.Node{Kind: yaml.SequenceNode, Content: []*yaml.Node{item}}); len(unsupported) > 0 {
+				return nil, fmt.Errorf("service %q port entry #%d uses unsupported long-form attribute(s) %s", serviceName, i+1, strings.Join(unsupported, ", "))
+			}
 			targetNode := findMapKeyNode(item, "target")
 			publishedNode := findMapKeyNode(item, "published")
-			hostIPNode := findMapKeyNode(item, "host_ip")
-			protoNode := findMapKeyNode(item, "protocol")
-
-			cPort := 0
-			hPort := 0
-			hIP := "0.0.0.0"
-			proto := "tcp"
-
-			if targetNode != nil {
-				cPort, _ = strconv.Atoi(targetNode.Value)
+			if targetNode == nil || publishedNode == nil || targetNode.Kind != yaml.ScalarNode || publishedNode.Kind != yaml.ScalarNode {
+				return nil, fmt.Errorf("service %q port entry #%d must have scalar target and published values", serviceName, i+1)
 			}
-			if publishedNode != nil {
-				hPort, _ = strconv.Atoi(publishedNode.Value)
+			hostIP := "0.0.0.0"
+			if n := findMapKeyNode(item, "host_ip"); n != nil {
+				if n.Kind != yaml.ScalarNode || strings.Contains(n.Value, "$") {
+					return nil, fmt.Errorf("service %q port entry #%d has an unrepresentable host_ip", serviceName, i+1)
+				}
+				hostIP = n.Value
 			}
-			if hostIPNode != nil {
-				hIP = hostIPNode.Value
+			protocol := "tcp"
+			if n := findMapKeyNode(item, "protocol"); n != nil {
+				if n.Kind != yaml.ScalarNode || strings.Contains(n.Value, "$") {
+					return nil, fmt.Errorf("service %q port entry #%d has an unrepresentable protocol", serviceName, i+1)
+				}
+				protocol = n.Value
 			}
-			if protoNode != nil {
-				proto = protoNode.Value
+			if strings.Contains(targetNode.Value, "$") || strings.Contains(publishedNode.Value, "$") {
+				return nil, fmt.Errorf("service %q port entry #%d contains interpolation; automatic mutation is disabled", serviceName, i+1)
 			}
-
-			if cPort > 0 {
-				mappings = append(mappings, PortMapping{
-					HostIP:        hIP,
-					HostPort:      uint16(hPort),
-					ContainerPort: uint16(cPort),
-					Protocol:      proto,
-				})
+			entry := fmt.Sprintf("%s:%s:%s/%s", hostIP, publishedNode.Value, targetNode.Value, protocol)
+			pm, err := ParsePublishSpec(entry)
+			if err != nil || pm == nil {
+				return nil, fmt.Errorf("service %q port entry #%d is not representable: %v", serviceName, i+1, err)
 			}
+			mappings = append(mappings, *pm)
+		case yaml.AliasNode:
+			return nil, fmt.Errorf("service %q port entry #%d uses a YAML alias; automatic mutation is disabled", serviceName, i+1)
+		default:
+			return nil, fmt.Errorf("service %q port entry #%d has unsupported YAML node type %d", serviceName, i+1, item.Kind)
 		}
 	}
-
 	return mappings, nil
 }
 
@@ -220,6 +230,10 @@ func UpdateComposePorts(composeYAML, serviceName string, newPorts []PortMapping)
 	serviceNode := findMapKeyNode(servicesNode, serviceName)
 	if serviceNode == nil {
 		return "", fmt.Errorf("service '%s' not found under 'services' in compose file", serviceName)
+	}
+
+	if _, err := ParseComposePorts(composeYAML, serviceName); err != nil {
+		return "", err
 	}
 
 	existingPortsNode := findMapKeyNode(serviceNode, "ports")
@@ -344,12 +358,16 @@ func (p *PodmanService) InspectCompose(containerID string) (*ComposeFileDetails,
 	}
 
 	content := string(data)
-	ports, _ := ParseComposePorts(content, serviceName)
+	ports, err := ParseComposePorts(content, serviceName)
+	if err != nil {
+		return nil, err
+	}
 
 	return &ComposeFileDetails{
 		ContainerID:  target.Id,
 		WorkingDir:   workingDir,
 		ComposeFile:  foundFile,
+		Project:      target.Provenance.Project,
 		Service:      serviceName,
 		Content:      content,
 		PortMappings: ports,
@@ -366,198 +384,22 @@ func findComposeServiceContainer(containers []Container, project, service string
 		if p.Type != "compose" {
 			continue
 		}
-		if p.Service == service && (project == "" || strings.HasPrefix(p.Name, project)) {
+		if p.Service == service && p.Project == project {
 			return c
 		}
 	}
 	return nil
 }
 
-// MutateComposePorts updates a compose file for a single service, applies
-// it via the resolved compose provider (reusing the same argv construction
-// and socket-readiness preflight as CLI passthrough and GUI actions), and
-// verifies the result before treating the file change as final:
-//
-//  1. block automatically if the project spans multiple compose files, or
-//     if the existing ports: entries use long-form attributes Podder can't
-//     faithfully preserve
-//  2. atomically rewrite only the target service's ports:, preserving the
-//     original file's permissions, and keep the original content in memory
-//     until verification succeeds
-//  3. redeploy only the target service (`compose up -d SERVICE`), not the
-//     whole project
-//  4. verify the service's container exists with the exact candidate port
-//     mappings before treating the apply as committed
-//  5. on any failure, restore the original file content AND re-deploy from
-//     it, verifying the original service is back before ever reporting
-//     RolledBack=true
+// MutateComposePorts is deliberately read-only. Automatic Compose edits remain
+// disabled until Podder can prove effective-project representability, exact
+// project/service identity, lifecycle preservation, and bounded apply/rollback
+// verification across providers.
 func (p *PodmanService) MutateComposePorts(containerID string, newPorts []PortMapping) (*PortMutationResult, error) {
-	result := &PortMutationResult{
-		Success: false,
-		Steps:   []PortMutationStepResult{},
-	}
+	result := &PortMutationResult{Success: false, Steps: []PortMutationStepResult{}}
 	result.RequiresExternal = true
-	result.Guidance = "Automatic in-place Compose mutation is disabled in this hardening build. Podder cannot yet prove complete effective-project identity, preserve every YAML construct, and verify rollback across provider implementations. Use the generated snippet and the authoritative Compose workflow manually."
+	result.Guidance = "Automatic in-place Compose mutation is disabled in this hardening build. Podder cannot yet prove complete effective-project identity, preserve every YAML construct, preserve stopped lifecycle, and verify apply and rollback across provider implementations. Use the generated snippet and authoritative Compose workflow manually."
 	result.ComposeSnippet = GenerateComposeSnippet("service", newPorts)
 	result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
-	return result, nil
-
-	details, err := p.InspectCompose(containerID)
-	if err != nil {
-		if errors.Is(err, ErrMultipleComposeFiles) {
-			result.RequiresExternal = true
-			result.Guidance = fmt.Sprintf("This Compose project is defined by multiple configuration files. Podder cannot safely determine which file is authoritative for this service's ports, so automatic mutation is disabled: %v. Please edit the appropriate file manually and re-run 'pod up'.", err)
-			result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
-			return result, nil
-		}
-		return nil, err
-	}
-
-	// 1. Preflight Validation
-	for _, m := range newPorts {
-		valReq := PortMappingRequest{
-			HostIP:        m.HostIP,
-			HostPort:      m.HostPort,
-			ContainerPort: m.ContainerPort,
-			Protocol:      m.Protocol,
-			ContainerID:   containerID,
-			RangeSize:     m.RangeSize,
-		}
-		valResult, err := p.ValidatePortMapping(valReq)
-		if err != nil || (valResult != nil && !valResult.Valid) {
-			errMsg := "Port conflict detected"
-			if valResult != nil && len(valResult.Checks) > 0 {
-				for _, c := range valResult.Checks {
-					if !c.Passed {
-						errMsg = c.Message
-						break
-					}
-				}
-			}
-			result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: errMsg})
-			return result, nil
-		}
-	}
-
-	fileInfo, err := os.Stat(details.ComposeFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat %s: %w", details.ComposeFile, err)
-	}
-
-	// Preflight-build the new content before touching anything, and refuse
-	// automatically if it isn't safely representable.
-	origContent, err := os.ReadFile(details.ComposeFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", details.ComposeFile, err)
-	}
-
-	newContent, err := UpdateComposePorts(string(origContent), details.Service, newPorts)
-	if err != nil {
-		result.RequiresExternal = true
-		result.Guidance = err.Error()
-		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: err.Error()})
-		return result, nil
-	}
-
-	provider, err := resolveComposeProviderWithLookPath("up", p.lookPathFn())
-	if err != nil {
-		return nil, err
-	}
-	if err := ensureComposeProviderReady(provider); err != nil {
-		return nil, err
-	}
-
-	result.Steps = append(result.Steps, PortMutationStepResult{
-		Step: "PREFLIGHT", Passed: true,
-		Message: fmt.Sprintf("Preflight verified for service '%s' in %s", details.Service, details.ComposeFile),
-	})
-
-	// 2. Write the new file atomically, preserving permissions. The
-	// original content is retained in memory (not merely a sibling backup
-	// file) until verification succeeds.
-	if err := writeFileAtomicPreservingMode(details.ComposeFile, []byte(newContent), fileInfo.Mode().Perm()); err != nil {
-		return nil, fmt.Errorf("failed to write updated compose file: %w", err)
-	}
-
-	result.Steps = append(result.Steps, PortMutationStepResult{
-		Step: "SNAPSHOT", Passed: true,
-		Message: "Compose file staged; original content retained in memory for rollback.",
-	})
-
-	rollback := func(reason string) (*PortMutationResult, error) {
-		restoreErr := writeFileAtomicPreservingMode(details.ComposeFile, origContent, fileInfo.Mode().Perm())
-		var errs []string
-		if restoreErr != nil {
-			errs = append(errs, fmt.Sprintf("failed to restore original compose file: %v", restoreErr))
-		}
-
-		verb, extra, _ := composeVerbAndArgs("up")
-		rbArgs := provider.BuildArgs(details.ComposeFile, verb, extra, details.Service)
-		_, rbStderr, rbErr := p.cmdRunner().Run(provider.path, rbArgs...)
-		if rbErr != nil {
-			errs = append(errs, fmt.Sprintf("failed to redeploy original service: %v (%s)", rbErr, strings.TrimSpace(rbStderr)))
-		}
-
-		verified := false
-		if restoreErr == nil {
-			time.Sleep(50 * time.Millisecond)
-			if containers, lcErr := p.ListContainers(true); lcErr == nil {
-				if c := findComposeServiceContainer(containers, "", details.Service); c != nil {
-					if eq, _, _ := portMappingSetEqual(details.PortMappings, c.PortMappings); eq {
-						verified = true
-					} else {
-						errs = append(errs, "original service is running again but its port mappings do not match the pre-mutation configuration")
-					}
-				} else {
-					errs = append(errs, "original service container was not found after rollback redeploy")
-				}
-			} else {
-				errs = append(errs, fmt.Sprintf("failed to verify rollback: %v", lcErr))
-			}
-		}
-
-		result.RollbackReason = reason
-		if verified {
-			result.RolledBack = true
-			result.Steps = append(result.Steps, PortMutationStepResult{Step: "ROLLED_BACK", Passed: true, Message: reason})
-		} else {
-			result.ManualRecoveryRequired = true
-			result.Steps = append(result.Steps, PortMutationStepResult{
-				Step: "ROLLBACK_FAILED", Passed: false,
-				Message: fmt.Sprintf("ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: %s (%s)", reason, strings.Join(errs, "; ")),
-			})
-		}
-		return result, nil
-	}
-
-	// 3. Apply: redeploy only the target service.
-	verb, extra, _ := composeVerbAndArgs("up")
-	applyArgs := provider.BuildArgs(details.ComposeFile, verb, extra, details.Service)
-	_, applyStderr, err := p.cmdRunner().Run(provider.path, applyArgs...)
-	if err != nil {
-		return rollback(fmt.Sprintf("Compose up failed: %v (%s)", err, strings.TrimSpace(applyStderr)))
-	}
-
-	// 4. Verify: the service's container exists with exactly the
-	// candidate port mappings before treating this as committed.
-	time.Sleep(50 * time.Millisecond)
-	containers, err := p.ListContainers(true)
-	if err != nil {
-		return rollback(fmt.Sprintf("Failed to verify service after compose up: %v", err))
-	}
-	newContainer := findComposeServiceContainer(containers, "", details.Service)
-	if newContainer == nil {
-		return rollback("Service container did not appear after compose up.")
-	}
-	if eq, missing, unexpected := portMappingSetEqual(newPorts, newContainer.PortMappings); !eq {
-		return rollback(fmt.Sprintf("Configured port mappings do not match after compose up (missing: %v, unexpected: %v).", missing, unexpected))
-	}
-
-	result.Success = true
-	result.Steps = append(result.Steps, PortMutationStepResult{
-		Step: "COMMITTED", Passed: true,
-		Message: fmt.Sprintf("Compose service '%s' successfully updated and re-deployed!", details.Service),
-	})
-
 	return result, nil
 }

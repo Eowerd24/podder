@@ -125,6 +125,14 @@ func TestLegacySpecWithoutSchemaVersionMigratesToManaged(t *testing.T) {
 	if errs := ValidateSpec(*spec); len(errs) == 0 {
 		t.Fatal("expected legacy prototype spec to be blocked from destructive replay")
 	}
+	legacyRunner := newFakeCommandRunner()
+	svc.runner = legacyRunner
+	if _, err := svc.DeploySpec("legacy-app"); err == nil {
+		t.Fatal("legacy command migration must not be treated as authoritative without runtime review or re-adoption")
+	}
+	if legacyRunner.CallCount() != 0 {
+		t.Fatalf("legacy command replay must be blocked before touching Podman, calls=%d", legacyRunner.CallCount())
+	}
 
 	// A spec written by the CURRENT code (SchemaVersion already set) must
 	// NOT be force-migrated — its explicit Managed value is authoritative.
@@ -266,5 +274,69 @@ func TestBuildRunArgsFromSpecUnmanagedHasNoLabels(t *testing.T) {
 		if args[i] == "--label" {
 			t.Errorf("expected no Podder labels for an unmanaged spec, got: %v", args)
 		}
+	}
+}
+
+func TestDeploySpecReplacementFailureRestoresOriginal(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "deploy-web", "nginx:alpine", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}})
+	sim.failStep = "run"
+
+	result, err := svc.DeploySpec("deploy-web")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success || result.Rollback == nil || !result.Rollback.Verified || result.ManualRecoveryRequired {
+		t.Fatalf("expected verified rollback after replacement failure, got %+v", result)
+	}
+	original := sim.containers["deploy-web"]
+	if original == nil || original.state != "running" || original.id != result.OldContainerID {
+		t.Fatalf("original workload was not restored exactly: %+v", original)
+	}
+}
+
+func TestDeploySpecStopFailurePreservesOriginal(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "deploy-db", "postgres:16", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 5432, ContainerPort: 5432, Protocol: "tcp"}})
+	sim.failStep = "stop"
+
+	result, err := svc.DeploySpec("deploy-db")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success || result.Rollback == nil || !result.Rollback.Verified || result.ManualRecoveryRequired {
+		t.Fatalf("expected stop failure to leave a verified original, got %+v", result)
+	}
+	if original := sim.containers["deploy-db"]; original == nil || original.state != "running" {
+		t.Fatalf("expected original workload to remain running, got %+v", original)
+	}
+}
+
+func TestDeploySpecBackupCleanupWarningIsSuccessful(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "deploy-cache", "redis:7", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 6379, ContainerPort: 6379, Protocol: "tcp"}})
+	sim.failStep = "rm"
+
+	result, err := svc.DeploySpec("deploy-cache")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success || !result.BackupCleanupRequired || result.ManualRecoveryRequired {
+		t.Fatalf("expected committed replacement with cleanup warning, got %+v", result)
+	}
+	if sim.containers["deploy-cache"] == nil || sim.containers[result.BackupContainerName] == nil {
+		t.Fatalf("expected verified replacement and recoverable backup to remain")
+	}
+}
+
+func TestDeploySpecPreservesStoppedLifecycle(t *testing.T) {
+	sim := newMutationSim()
+	svc := setupManagedContainer(t, sim, "deploy-idle", "alpine:latest", "exited", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8181, ContainerPort: 80, Protocol: "tcp"}})
+	result, err := svc.DeploySpec("deploy-idle")
+	if err != nil || !result.Success {
+		t.Fatalf("stopped deployment failed: result=%+v err=%v", result, err)
+	}
+	if replacement := sim.containers["deploy-idle"]; replacement == nil || replacement.state != "exited" {
+		t.Fatalf("DeploySpec silently changed stopped workload lifecycle: %+v", replacement)
 	}
 }

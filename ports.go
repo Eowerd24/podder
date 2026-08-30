@@ -97,8 +97,9 @@ type PortOverviewSummary struct {
 	// RegistryRemote counts registry records that are scoped to a
 	// different node than this Podder instance's local node — these are
 	// never counted toward RegistryMissing/RegistryReserved.
-	RegistryRemote int    `json:"registryRemote"`
-	LocalNode      string `json:"localNode,omitempty"`
+	RegistryRemote   int    `json:"registryRemote"`
+	RegistryUnscoped int    `json:"registryUnscoped"`
+	LocalNode        string `json:"localNode,omitempty"`
 }
 
 // PortOverview is the aggregate model returned to the frontend.
@@ -682,6 +683,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	registryMissingCount := 0
 	registryReservedCount := 0
 	registryRemoteCount := 0
+	registryUnscopedCount := 0
 
 	// Helper to find matching registry port. Uses
 	// EndpointsEquivalentForReconciliation (not EndpointsConflict/
@@ -690,7 +692,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	// 127.0.0.1:3000 — the two would conflict at the socket layer if both
 	// tried to bind, but they are not the same declaration. Records scoped
 	// to a different node are never matched against local runtime state.
-	findRegistryMatch := func(bind string, port uint16, protocol string, serviceName string) *RegistryPort {
+	findRegistryMatch := func(bind string, port uint16, protocol string, _ string) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded {
 			return nil
 		}
@@ -705,18 +707,20 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				return rp
 			}
 		}
-		// Fallback match by service name and port
-		if serviceName != "" {
-			for i := range registryResult.Ports {
-				rp := &registryResult.Ports[i]
-				if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
-					continue
-				}
-				if rp.Listener.Port == port &&
-					NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) &&
-					strings.EqualFold(rp.Service, serviceName) {
-					return rp
-				}
+		return nil
+	}
+
+	findRegistryBindMismatch := func(bind string, port uint16, protocol string, serviceName string) *RegistryPort {
+		if registryResult == nil || !registryResult.Loaded || serviceName == "" {
+			return nil
+		}
+		for i := range registryResult.Ports {
+			rp := &registryResult.Ports[i]
+			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
+				continue
+			}
+			if rp.Listener.Port == port && NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) && strings.EqualFold(rp.Service, serviceName) && !EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
+				return rp
 			}
 		}
 		return nil
@@ -771,6 +775,14 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				scope = regMatch.Scope
 				appProto = regMatch.ApplicationProtocol
 				purpose = regMatch.Purpose
+			} else if mismatch := findRegistryBindMismatch(m.HostIP, m.HostPort, m.Protocol, cName); mismatch != nil {
+				reconcileStatus = "DECLARED_ENDPOINT_MISMATCH"
+				matchedRegistryIDs[mismatch.ID] = true
+				regID = mismatch.ID
+				regState = mismatch.State
+				appProto = mismatch.ApplicationProtocol
+				purpose = mismatch.Purpose
+				conflictNote = fmt.Sprintf("Declared bind %s differs from observed bind %s", mismatch.Listener.Address, m.HostIP)
 			} else {
 				if registryResult != nil && registryResult.Loaded {
 					registryUndeclaredCount++
@@ -891,13 +903,15 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			reconcileStatus := "DECLARED_MISSING"
 
 			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
-				// A registry-wide (homelab, not single-instance) record
-				// scoped to a different node describes a service this
-				// Podder instance does not, and should not, observe
-				// locally. It must never be reported as locally missing.
-				registryRemoteCount++
-				status = "REMOTE"
-				reconcileStatus = "REMOTE"
+				if strings.TrimSpace(rp.Node) == "" {
+					registryUnscopedCount++
+					status = "UNSCOPED"
+					reconcileStatus = "UNSCOPED"
+				} else {
+					registryRemoteCount++
+					status = "REMOTE"
+					reconcileStatus = "REMOTE"
+				}
 
 				exposure := CategorizeExposure(rp.Listener.Address)
 				if rp.Scope != "" {
@@ -1003,6 +1017,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			RegistryMissing:        registryMissingCount,
 			RegistryReserved:       registryReservedCount,
 			RegistryRemote:         registryRemoteCount,
+			RegistryUnscoped:       registryUnscopedCount,
 			LocalNode:              localNode,
 		},
 	}

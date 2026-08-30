@@ -350,3 +350,81 @@ Restart=always
 		t.Errorf("expected other sections to be preserved")
 	}
 }
+
+func TestQuadletSearchDirsIncludeCurrentRootlessPathsInOrder(t *testing.T) {
+	root := t.TempDir()
+	oldRuntime, oldConfig, oldHome := os.Getenv("XDG_RUNTIME_DIR"), os.Getenv("XDG_CONFIG_HOME"), os.Getenv("HOME")
+	oldOverride := quadletRootOverride
+	defer func() {
+		os.Setenv("XDG_RUNTIME_DIR", oldRuntime)
+		os.Setenv("XDG_CONFIG_HOME", oldConfig)
+		os.Setenv("HOME", oldHome)
+		quadletRootOverride = oldOverride
+	}()
+	os.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
+	os.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	os.Setenv("HOME", filepath.Join(root, "home"))
+	quadletRootOverride = filepath.Join(root, "sysroot")
+
+	dirs := getQuadletSearchDirs()
+	uid := fmt.Sprintf("%d", os.Getuid())
+	wants := []string{
+		filepath.Join(root, "runtime", "containers", "systemd"),
+		filepath.Join(root, "config", "containers", "systemd"),
+		filepath.Join(root, "sysroot", "etc", "containers", "systemd", "users", uid),
+		filepath.Join(root, "sysroot", "etc", "containers", "systemd", "users"),
+		filepath.Join(root, "sysroot", "usr", "share", "containers", "systemd", "users", uid),
+		filepath.Join(root, "sysroot", "usr", "share", "containers", "systemd", "users"),
+	}
+	if len(dirs) < len(wants) {
+		t.Fatalf("missing rootless search paths: %+v", dirs)
+	}
+	for i, want := range wants {
+		if dirs[i].path != want || dirs[i].scope != QuadletScopeUser {
+			t.Fatalf("rootless precedence mismatch at %d: got %+v want %s", i, dirs[i], want)
+		}
+	}
+}
+
+func TestFindQuadletFileRecursesWithinUserSearchPath(t *testing.T) {
+	userDir, _ := withQuadletTestDirs(t)
+	nested := filepath.Join(userDir, "team", "apps")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(nested, "nested.container")
+	if err := os.WriteFile(unitPath, []byte("[Container]\nImage=alpine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path, scope, err := FindQuadletFile("nested.service")
+	if err != nil || path != unitPath || scope != QuadletScopeUser {
+		t.Fatalf("recursive Quadlet discovery failed: path=%q scope=%q err=%v", path, scope, err)
+	}
+}
+
+func TestInspectQuadletReportsDropInsAndServiceNameOverride(t *testing.T) {
+	userDir, _ := withQuadletTestDirs(t)
+	unitPath := filepath.Join(userDir, "web.container")
+	content := "[Container]\nImage=alpine\nServiceName=custom-web\nPublishPort=8080:80\n"
+	if err := os.WriteFile(unitPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dropInDir := unitPath + ".d"
+	if err := os.MkdirAll(dropInDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropInDir, "20-ports.conf"), []byte("[Container]\nPublishPort=9090:80\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	details, err := (&PodmanService{}).InspectQuadlet("web.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.ServiceName != "custom-web.service" || !details.HasDropIns {
+		t.Fatalf("Quadlet effective identity/ambiguity not exposed: %+v", details)
+	}
+	result, err := (&PodmanService{}).MutateQuadletPorts("web.service", []PortMapping{{HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}})
+	if err != nil || result.Success || !result.RequiresExternal {
+		t.Fatalf("drop-in-bearing Quadlet must remain read-only: result=%+v err=%v", result, err)
+	}
+}

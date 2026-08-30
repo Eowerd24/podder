@@ -14,9 +14,10 @@ import (
 // Compose project labels) is classified "ambiguous" and treated as
 // read-only rather than guessed at.
 type WorkloadProvenance struct {
-	Type              string            `json:"type"`              // "podder", "compose", "quadlet", "pod", "adhoc", "ambiguous"
-	DisplayType       string            `json:"displayType"`       // "Podder", "Compose", "Quadlet", "Pod", "Ad-Hoc", "Ambiguous"
-	Name              string            `json:"name"`              // Project name, unit name, pod name, service name
+	Type              string            `json:"type"`        // "podder", "compose", "quadlet", "pod", "adhoc", "ambiguous"
+	DisplayType       string            `json:"displayType"` // "Podder", "Compose", "Quadlet", "Pod", "Ad-Hoc", "Ambiguous"
+	Name              string            `json:"name"`        // Project name, unit name, pod name, service name
+	Project           string            `json:"project,omitempty"`
 	Service           string            `json:"service,omitempty"` // Compose service name or Podder service name
 	WorkingDir        string            `json:"workingDir,omitempty"`
 	ConfigFile        string            `json:"configFile,omitempty"`
@@ -68,6 +69,7 @@ func detectCompose(labels map[string]string) (bool, WorkloadProvenance) {
 		Type:              "compose",
 		DisplayType:       "Compose",
 		Name:              displayName,
+		Project:           composeProject,
 		Service:           composeService,
 		WorkingDir:        workingDir,
 		ConfigFile:        configFile,

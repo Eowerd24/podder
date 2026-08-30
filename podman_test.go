@@ -463,3 +463,42 @@ func TestValidateSpecRejectsFutureSchemaVersion(t *testing.T) {
 		t.Fatalf("expected a schema-version error, got: %v", errs)
 	}
 }
+
+func TestCreateContainerCleanupFailureReportsManualRecovery(t *testing.T) {
+	withTestHome(t)
+	withFastPolling(t)
+
+	runner := newFakeCommandRunner()
+	created := false
+	runner.On("podman image", func(string, []string) (string, string, error) {
+		return `[{"Id":"sha256:test-image"}]`, "", nil
+	})
+	runner.On("podman run", func(string, []string) (string, string, error) {
+		created = true
+		return "survivor-id", "", nil
+	})
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		if !created {
+			return "[]", "", nil
+		}
+		return `[{"Id":"survivor-id","Names":["survivor"],"Image":"alpine","ImageID":"sha256:test-image","State":"exited","Ports":[],"Labels":{"io.podder.managed":"true","io.podder.service":"survivor","io.podder.schema-version":"2"}}]`, "", nil
+	})
+	runner.On("podman rm", func(string, []string) (string, string, error) {
+		return "", "busy", fmt.Errorf("container is busy")
+	})
+
+	svc := &PodmanService{runner: runner}
+	result, err := svc.CreateContainer(ContainerCreateRequest{Image: "alpine", Name: "survivor", Managed: true})
+	if err != nil {
+		t.Fatalf("expected structured recovery result, got top-level error: %v", err)
+	}
+	if result.Success || !result.ManualRecoveryRequired || result.ContainerID != "survivor-id" || result.ContainerName != "survivor" {
+		t.Fatalf("cleanup failure did not expose surviving identity and recovery state: %+v", result)
+	}
+	if result.CandidateSpecPath == "" {
+		t.Fatalf("valid candidate spec must be retained for manual recovery")
+	}
+	if _, err := os.Stat(result.CandidateSpecPath); err != nil {
+		t.Fatalf("retained candidate spec is not accessible: %v", err)
+	}
+}

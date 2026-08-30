@@ -364,3 +364,45 @@ func TestWriteFileAtomicPreservingModePreservesPermissions(t *testing.T) {
 		t.Errorf("expected new content to be written, got: %s", data)
 	}
 }
+
+func TestComposePortsFailClosedOnUnrepresentableEntries(t *testing.T) {
+	cases := map[string]string{
+		"interpolation": "services:\n  web:\n    ports:\n      - \"${APP_PORT:-3000}:3000\"\n",
+		"alias":         "x-ports: &shared\n  - \"8080:80\"\nservices:\n  web:\n    ports: *shared\n",
+		"malformed":     "services:\n  web:\n    ports:\n      - \"not-a-port\"\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseComposePorts(content, "web"); err == nil {
+				t.Fatalf("expected %s entry to block automatic parsing", name)
+			}
+			if _, err := UpdateComposePorts(content, "web", []PortMapping{{HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}); err == nil {
+				t.Fatalf("expected %s entry to block automatic rewrite", name)
+			}
+		})
+	}
+}
+
+func TestComposePortRangeIsRepresentedExactly(t *testing.T) {
+	content := "services:\n  web:\n    ports:\n      - \"8000-8002:80-82/tcp\"\n"
+	ports, err := ParseComposePorts(content, "web")
+	if err != nil {
+		t.Fatalf("range should be supported end-to-end: %v", err)
+	}
+	if len(ports) != 1 || ports[0].RangeSize != 3 {
+		t.Fatalf("range was collapsed or skipped: %+v", ports)
+	}
+}
+
+func TestComposeVerificationRequiresExactProjectAndService(t *testing.T) {
+	containers := []Container{
+		{Id: "a", Provenance: WorkloadProvenance{Type: "compose", Project: "project-a", Service: "web"}},
+		{Id: "b", Provenance: WorkloadProvenance{Type: "compose", Project: "project-b", Service: "web"}},
+	}
+	if got := findComposeServiceContainer(containers, "project-b", "web"); got == nil || got.Id != "b" {
+		t.Fatalf("project-a/web must not satisfy project-b/web verification: %+v", got)
+	}
+	if got := findComposeServiceContainer(containers, "", "web"); got != nil {
+		t.Fatalf("empty project identity must not accept an arbitrary web service: %+v", got)
+	}
+}

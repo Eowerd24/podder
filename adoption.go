@@ -33,6 +33,8 @@ type AdoptionResult struct {
 	Message                string          `json:"message"`
 	Rollback               *RollbackResult `json:"rollback,omitempty"`
 	ManualRecoveryRequired bool            `json:"manualRecoveryRequired,omitempty"`
+	BackupCleanupRequired  bool            `json:"backupCleanupRequired,omitempty"`
+	BackupContainerName    string          `json:"backupContainerName,omitempty"`
 }
 
 // Raw inspect structures. These deliberately capture more than the fields
@@ -92,11 +94,15 @@ type inspectContainer struct {
 		Init *bool `json:"Init"`
 	} `json:"HostConfig"`
 	Mounts []struct {
-		Type        string `json:"Type"`
-		Name        string `json:"Name"`
-		Source      string `json:"Source"`
-		Destination string `json:"Destination"`
-		RW          bool   `json:"RW"`
+		Type        string   `json:"Type"`
+		Name        string   `json:"Name"`
+		Source      string   `json:"Source"`
+		Destination string   `json:"Destination"`
+		RW          bool     `json:"RW"`
+		Driver      string   `json:"Driver"`
+		Mode        string   `json:"Mode"`
+		Options     []string `json:"Options"`
+		Propagation string   `json:"Propagation"`
 	} `json:"Mounts"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -235,6 +241,20 @@ func assessRepresentability(raw inspectContainer) []string {
 			if strings.Contains(m.Source, "/run/secrets") || strings.Contains(m.Destination, "/run/secrets") {
 				add("container mounts a secret-style path at %q, which Podder does not yet reproduce", m.Destination)
 			}
+			if strings.TrimSpace(m.Driver) != "" || strings.TrimSpace(m.Mode) != "" {
+				add("bind mount at %q uses driver/mode semantics Podder cannot reproduce", m.Destination)
+			}
+			propagation := strings.ToLower(strings.TrimSpace(m.Propagation))
+			if propagation != "" && propagation != "rprivate" && propagation != "private" {
+				add("bind mount at %q uses non-default propagation %q, which Podder cannot reproduce", m.Destination, m.Propagation)
+			}
+			for _, option := range m.Options {
+				switch strings.ToLower(strings.TrimSpace(option)) {
+				case "", "rw", "ro", "rbind", "private", "rprivate":
+				default:
+					add("bind mount at %q uses non-default option %q, which Podder cannot reproduce", m.Destination, option)
+				}
+			}
 		}
 	}
 
@@ -340,6 +360,17 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		}
 	}
 
+	// Preserve ordinary workload labels exactly. Ownership markers are never
+	// copied: external ownership blocks adoption above, and Podder ownership
+	// is generated only after the replacement transaction succeeds.
+	labels := make(map[string]string)
+	for key, value := range raw.Config.Labels {
+		if isOwnershipLabel(key) {
+			continue
+		}
+		labels[key] = value
+	}
+
 	imageName := raw.Config.Image
 	if imageName == "" {
 		imageName = raw.Image
@@ -354,6 +385,7 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		PortMappings:   portMappings,
 		Binds:          binds,
 		Env:            envMap,
+		Labels:         labels,
 		// Command/Entrypoint come directly from Podman's own argv arrays —
 		// no shell string round trip, so no lossy re-tokenization.
 		Command:    CommandArgv(raw.Config.Cmd),
@@ -469,7 +501,7 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 	if ok, _, _ := portMappingSetEqual(candidateSpec.PortMappings, target.PortMappings); !ok {
 		return &AdoptionResult{Success: false, Message: "Adoption blocked: runtime port configuration changed after assessment."}, nil
 	}
-	if err := p.validateMappingsForMutation(candidateSpec.PortMappings, target.Id); err != nil {
+	if _, err := p.validateMappingsForMutation(candidateSpec.PortMappings, target.Id); err != nil {
 		return &AdoptionResult{Success: false, Message: "Adoption blocked by final backend port validation: " + err.Error()}, nil
 	}
 
@@ -532,6 +564,11 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed to recreate container: %v (stderr: %s).", err, strings.TrimSpace(stderr))), nil
 	}
 	newContainerID := strings.TrimSpace(stdout)
+	if newContainerID == "" {
+		discardCandidateSpec(candidatePath)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, false)
+		return adoptionRollbackResult(rb, "Adoption failed: replacement creation returned no container identity; ambiguous candidate was not deleted by name."), nil
+	}
 
 	var newContainer *Container
 	verified := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
@@ -555,33 +592,35 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 	})
 	if !verified || newContainer == nil {
 		discardCandidateSpec(candidatePath)
-		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, true)
+		rb := p.executeRollback(backupName, assessment.ContainerName, newContainerID, target.Id, originalLifecycle, true)
 		return adoptionRollbackResult(rb, "Adoption failed: replacement container did not verify."), nil
 	}
 
 	if eq, missing, unexpected := portMappingSetEqual(candidateSpec.PortMappings, newContainer.PortMappings); !eq {
 		discardCandidateSpec(candidatePath)
-		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, true)
+		rb := p.executeRollback(backupName, assessment.ContainerName, newContainerID, target.Id, originalLifecycle, true)
 		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: port mappings do not match after recreation (missing: %v, unexpected: %v).", missing, unexpected)), nil
 	}
 
-	if newContainer.Provenance.Type != "podder" {
+	if newContainer.Provenance.Type != "podder" || !containerMatchesSpecLabels(newContainer, candidateSpec) {
 		discardCandidateSpec(candidatePath)
-		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, true)
+		rb := p.executeRollback(backupName, assessment.ContainerName, newContainerID, target.Id, originalLifecycle, true)
 		return adoptionRollbackResult(rb, "Adoption failed: replacement container did not verify as Podder-managed."), nil
 	}
 
 	if err := p.commitCandidate(candidatePath, candidateSpec); err != nil {
-		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, true)
+		rb := p.executeRollback(backupName, assessment.ContainerName, newContainerID, target.Id, originalLifecycle, true)
 		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: could not commit spec: %v.", err)), nil
 	}
 
 	if err := p.RemoveContainer(backupName); err != nil {
 		return &AdoptionResult{
-			Success:     true,
-			ServiceName: serviceName,
-			Spec:        candidateSpec,
-			Message:     fmt.Sprintf("Workload '%s' adopted successfully, but backup container %s could not be removed automatically; manual cleanup recommended.", serviceName, backupName),
+			Success:               true,
+			ServiceName:           serviceName,
+			Spec:                  candidateSpec,
+			BackupCleanupRequired: true,
+			BackupContainerName:   backupName,
+			Message:               fmt.Sprintf("Workload '%s' adopted successfully, but backup container %s could not be removed automatically; manual cleanup recommended.", serviceName, backupName),
 		}, nil
 	}
 
@@ -591,6 +630,14 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 		Spec:        candidateSpec,
 		Message:     fmt.Sprintf("Workload '%s' successfully adopted into Podder.", serviceName),
 	}, nil
+}
+
+func isOwnershipLabel(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	return strings.HasPrefix(k, "io.podder.") ||
+		strings.HasPrefix(k, "com.docker.compose.") ||
+		strings.HasPrefix(k, "io.podman.compose.") ||
+		k == "podman_systemd_unit" || k == "io.systemd.unit"
 }
 
 func (p *PodmanService) findContainerForAdoption(containerID string) (*Container, error) {

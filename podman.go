@@ -423,6 +423,7 @@ type ContainerCreateRequest struct {
 	PortMappings []PortMapping     `json:"portMappings"`
 	Binds        []BindMountSpec   `json:"binds"`
 	Env          map[string]string `json:"env"`
+	Labels       map[string]string `json:"labels,omitempty"`
 	// Command accepts either a JSON array (preferred) or a single
 	// shell-style string (tokenized via SplitShellCommand, e.g. from a
 	// free-text "Command" field in the Run Container UI) — see
@@ -435,6 +436,7 @@ type ContainerCreateRequest struct {
 type ContainerCreateResult struct {
 	Success                bool   `json:"success"`
 	ContainerID            string `json:"containerId"`
+	ContainerName          string `json:"containerName,omitempty"`
 	Managed                bool   `json:"managed"`
 	Message                string `json:"message,omitempty"`
 	ManualRecoveryRequired bool   `json:"manualRecoveryRequired,omitempty"`
@@ -468,6 +470,7 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 		PortMappings:  req.PortMappings,
 		Binds:         req.Binds,
 		Env:           req.Env,
+		Labels:        req.Labels,
 		Command:       req.Command,
 		Entrypoint:    req.Entrypoint,
 	}
@@ -502,7 +505,7 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 		}
 	}
 
-	result := &ContainerCreateResult{Managed: spec.Managed}
+	result := &ContainerCreateResult{Managed: spec.Managed, ContainerName: spec.Name}
 	cleanupFailedManagedCreate := func(reason string) (*ContainerCreateResult, error) {
 		removeErr := p.RemoveContainer(result.ContainerID)
 		removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
@@ -601,11 +604,23 @@ func (p *PodmanService) verifyCreatedManagedContainer(containerID string, spec C
 	if findContainerByName(containers, spec.Name) == nil {
 		return false
 	}
-	if c.Labels["io.podder.managed"] != "true" || c.Labels["io.podder.service"] != spec.Name || c.Labels["io.podder.schema-version"] != fmt.Sprintf("%d", CurrentSpecSchemaVersion) {
+	if !containerMatchesSpecLabels(c, spec) {
 		return false
 	}
 	ok, _, _ := portMappingSetEqual(spec.PortMappings, c.PortMappings)
 	return ok
+}
+
+func containerMatchesSpecLabels(c *Container, spec ContainerSpec) bool {
+	if c == nil || c.Labels["io.podder.managed"] != "true" || c.Labels["io.podder.service"] != spec.Name || c.Labels["io.podder.schema-version"] != fmt.Sprintf("%d", CurrentSpecSchemaVersion) {
+		return false
+	}
+	for key, value := range spec.Labels {
+		if c.Labels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *PodmanService) containerAbsent(containerID, name string) bool {

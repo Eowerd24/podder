@@ -36,6 +36,18 @@ func BuildRunArgsFromSpec(spec ContainerSpec) ([]string, error) {
 		args = append(args, "--name", name)
 	}
 
+	// Ordinary user labels are replayed first, in deterministic order.
+	if len(spec.Labels) > 0 {
+		keys := make([]string, 0, len(spec.Labels))
+		for k := range spec.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "--label", fmt.Sprintf("%s=%s", k, spec.Labels[k]))
+		}
+	}
+
 	// Podder labels are applied if and only if the spec is explicitly
 	// Managed — never inferred from the presence of port mappings or any
 	// other field.

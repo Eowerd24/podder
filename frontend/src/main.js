@@ -580,6 +580,10 @@ function renderPortItems() {
                             statusBadge = `<span class="status-pill conflict">RESERVED (IN USE)</span>`;
                         } else if (item.status === 'PLANNED') {
                             statusBadge = `<span class="status-pill planned">PLANNED</span>`;
+                        } else if (item.status === 'UNSCOPED') {
+                            statusBadge = `<span class="status-pill planned" title="Registry record has no node scope and is informational only">UNSCOPED</span>`;
+                        } else if (item.status === 'REMOTE') {
+                            statusBadge = `<span class="status-pill planned" title="Registry record belongs to another node">REMOTE</span>`;
                         }
 
                         // Reconciliation badge
@@ -598,6 +602,12 @@ function renderPortItems() {
                                 reconcileBadge = `<span class="reconcile-pill conflict" title="Declared reservation occupied by socket">IN USE</span>`;
                             } else if (rec === 'PLANNED') {
                                 reconcileBadge = `<span class="reconcile-pill planned" title="Planned future service">PLANNED</span>`;
+                            } else if (rec === 'UNSCOPED') {
+                                reconcileBadge = `<span class="reconcile-pill planned" title="Informational registry record without a node scope">UNSCOPED</span>`;
+                            } else if (rec === 'REMOTE') {
+                                reconcileBadge = `<span class="reconcile-pill planned" title="Registry record belongs to another node">REMOTE</span>`;
+                            } else if (rec === 'DECLARED_ENDPOINT_MISMATCH') {
+                                reconcileBadge = `<span class="reconcile-pill conflict" title="${escapeAttr(item.conflictNote || 'Declared and observed bind addresses differ')}">BIND MISMATCH</span>`;
                             } else {
                                 reconcileBadge = `<span class="reconcile-pill host">HOST</span>`;
                             }

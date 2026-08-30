@@ -416,6 +416,7 @@ func (p *PodmanService) MutateComposePorts(containerID string, newPorts []PortMa
 			ContainerPort: m.ContainerPort,
 			Protocol:      m.Protocol,
 			ContainerID:   containerID,
+			RangeSize:     m.RangeSize,
 		}
 		valResult, err := p.ValidatePortMapping(valReq)
 		if err != nil || (valResult != nil && !valResult.Valid) {

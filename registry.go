@@ -97,12 +97,16 @@ type RegistryPort struct {
 	ApplicationProtocol string            `yaml:"application_protocol" json:"applicationProtocol,omitempty"`
 	Listener            RegistryListener  `yaml:"listener" json:"listener"`
 	Container           RegistryContainer `yaml:"container" json:"container,omitempty"`
-	Scope               string            `yaml:"scope" json:"scope"`           // "loopback", "lan", "public", "management", "cluster"
-	Class               string            `yaml:"class" json:"class,omitempty"` // "application", "observability", "infrastructure", etc.
-	State               string            `yaml:"state" json:"state"`           // "active", "reserved", "planned", "temporary", "deprecated", "retired"
-	Verification        string            `yaml:"verification" json:"verification,omitempty"`
-	Purpose             string            `yaml:"purpose" json:"purpose,omitempty"`
-	Notes               RegistryNotes     `yaml:"notes" json:"notes,omitempty"`
+	// RangeSize, when > 1, means this record declares a published port
+	// range of that many ports starting at Listener.Port (and, when set,
+	// Container.Port) rather than a single port.
+	RangeSize    int           `yaml:"range_size" json:"rangeSize,omitempty"`
+	Scope        string        `yaml:"scope" json:"scope"`           // "loopback", "lan", "public", "management", "cluster"
+	Class        string        `yaml:"class" json:"class,omitempty"` // "application", "observability", "infrastructure", etc.
+	State        string        `yaml:"state" json:"state"`           // "active", "reserved", "planned", "temporary", "deprecated", "retired"
+	Verification string        `yaml:"verification" json:"verification,omitempty"`
+	Purpose      string        `yaml:"purpose" json:"purpose,omitempty"`
+	Notes        RegistryNotes `yaml:"notes" json:"notes,omitempty"`
 }
 
 // PortRegistryFile models the top-level V1 YAML schema.

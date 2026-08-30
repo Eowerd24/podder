@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -373,6 +374,194 @@ func TestValidatePortMapping(t *testing.T) {
 	}
 	if !res4.ExposureChange {
 		t.Errorf("expected ExposureChange=true for a loopback->wildcard transition: %+v", res4)
+	}
+}
+
+// --- Item 9: safety-critical port discovery must fail closed ---
+
+func TestCollectBlockingClaimsStrict_PodmanFailureBlocksValidation(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return "", "podman: connection refused", fmt.Errorf("exit status 1")
+	})
+	service := &PodmanService{runner: runner}
+
+	if _, err := service.CollectBlockingClaimsStrict(); err == nil {
+		t.Fatalf("expected CollectBlockingClaimsStrict to fail when podman ps fails")
+	}
+
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected validation to fail closed when podman ps fails, got: %+v", validation.Checks)
+	}
+
+	if _, err := service.FindFreePort(3000, "tcp", "0.0.0.0"); err == nil {
+		t.Errorf("expected FindFreePort to fail rather than report a confident free port when podman ps fails")
+	}
+}
+
+func TestCollectBlockingClaimsStrict_SSFailureBlocksValidation(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return "[]", "", nil
+	})
+	runner.On("ss", func(n string, args []string) (string, string, error) {
+		return "", "ss: permission denied", fmt.Errorf("exit status 1")
+	})
+	service := &PodmanService{runner: runner}
+
+	if _, err := service.CollectBlockingClaimsStrict(); err == nil {
+		t.Fatalf("expected CollectBlockingClaimsStrict to fail when ss fails")
+	}
+
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected validation to fail closed when ss fails, got: %+v", validation.Checks)
+	}
+
+	if _, err := service.FindFreePort(3000, "tcp", "0.0.0.0"); err == nil {
+		t.Errorf("expected FindFreePort to fail rather than report a confident free port when ss fails")
+	}
+}
+
+func TestCollectBlockingClaimsStrict_EnabledRegistryReadFailureBlocksValidation(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	runner := newFakeCommandRunner()
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{
+			Enabled: true,
+			// Points at a file that does not exist: the registry is
+			// enabled and expected to be enforced, but cannot be read.
+			Path: filepath.Join(tempDir, "does-not-exist.yaml"),
+		},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	if _, err := service.CollectBlockingClaimsStrict(); err == nil {
+		t.Fatalf("expected CollectBlockingClaimsStrict to fail when the enabled registry file cannot be read")
+	}
+
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected validation to fail closed when the enabled registry cannot be read, got: %+v", validation.Checks)
+	}
+}
+
+func TestCollectBlockingClaimsStrict_MalformedEnabledRegistryBlocksValidation(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(malformedRegistryYAML), 0o644); err != nil {
+		t.Fatalf("failed to write malformed registry fixture: %v", err)
+	}
+
+	runner := newFakeCommandRunner()
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	if _, err := service.CollectBlockingClaimsStrict(); err == nil {
+		t.Fatalf("expected CollectBlockingClaimsStrict to fail when the enabled registry file is malformed")
+	}
+
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected validation to fail closed when the enabled registry is malformed, got: %+v", validation.Checks)
+	}
+}
+
+func TestCollectBlockingClaimsStrict_DisabledRegistryIsNotAnError(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	// The registry is optional: when it's simply not enabled, a missing or
+	// unreadable file at whatever stale path happens to be configured must
+	// not block ordinary (non-registry) validation.
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: false, Path: filepath.Join(tempDir, "does-not-exist.yaml")},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	claims, err := service.CollectBlockingClaimsStrict()
+	if err != nil {
+		t.Fatalf("expected no error when the registry is simply disabled, got: %v", err)
+	}
+	if len(claims) != 0 {
+		t.Errorf("expected no claims, got: %+v", claims)
+	}
+}
+
+// --- Item 8: a port range must be checked against existing claims across
+// every port it actually occupies, not merely its first port. ---
+
+func TestRangeVsExistingConflictDetected(t *testing.T) {
+	runner := newFakeCommandRunner()
+	// An existing container occupies port 8003 alone — squarely inside the
+	// middle of a candidate 8000-8005 range.
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return `[{"Id":"abc123","Names":["existing"],"State":"running","Ports":[{"host_ip":"0.0.0.0","container_port":8003,"host_port":8003,"range":1,"protocol":"tcp"}]}]`, "", nil
+	})
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected a range covering an already-claimed port to be rejected, got: %+v", validation.Checks)
+	}
+
+	// A range that does NOT touch the existing claim must be accepted.
+	clearValidation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8010, ContainerPort: 9010, Protocol: "tcp", RangeSize: 6,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !clearValidation.Valid {
+		t.Errorf("expected a non-overlapping range to be accepted, got: %+v", clearValidation.Checks)
 	}
 }
 

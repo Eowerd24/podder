@@ -28,21 +28,74 @@ func FormatHostBind(addr string) string {
 
 // FormatPublishSpec formats a PortMapping into a Podman/Compose/Quadlet
 // publish spec: "[hostIP:]hostPort:containerPort/protocol", or
-// "containerPort/protocol" alone when no host port is set. This is the one
-// canonical formatter for that grammar; the Podman -p builder, Compose
-// writer, Quadlet writer, and generated snippets all call this instead of
-// duplicating colon-splitting logic that breaks on IPv6 addresses.
+// "containerPort/protocol" alone when no host port is set. When RangeSize is
+// greater than 1, both the host and container port components are rendered
+// as an inclusive "start-end" range (e.g. "8000-8005:9000-9005/tcp") — the
+// Podman range syntax, which requires both sides to name the same count of
+// ports. This is the one canonical formatter for that grammar; the Podman -p
+// builder, Compose writer, Quadlet writer, and generated snippets all call
+// this instead of duplicating colon-splitting logic that breaks on IPv6
+// addresses.
 func FormatPublishSpec(m PortMapping) string {
 	proto := NormalizeProtocol(m.Protocol)
 	bind := FormatHostBind(m.HostIP)
+	hostComponent := formatPortComponent(m.HostPort, m.RangeSize)
+	containerComponent := formatPortComponent(m.ContainerPort, m.RangeSize)
 	switch {
 	case bind != "" && m.HostPort != 0:
-		return fmt.Sprintf("%s:%d:%d/%s", bind, m.HostPort, m.ContainerPort, proto)
+		return fmt.Sprintf("%s:%s:%s/%s", bind, hostComponent, containerComponent, proto)
 	case m.HostPort != 0:
-		return fmt.Sprintf("%d:%d/%s", m.HostPort, m.ContainerPort, proto)
+		return fmt.Sprintf("%s:%s/%s", hostComponent, containerComponent, proto)
 	default:
-		return fmt.Sprintf("%d/%s", m.ContainerPort, proto)
+		return fmt.Sprintf("%s/%s", containerComponent, proto)
 	}
+}
+
+// formatPortComponent renders a single port number, or (when rangeSize > 1)
+// an inclusive "start-end" range string.
+func formatPortComponent(start uint16, rangeSize int) string {
+	if rangeSize > 1 {
+		end := int(start) + rangeSize - 1
+		return fmt.Sprintf("%d-%d", start, end)
+	}
+	return strconv.Itoa(int(start))
+}
+
+// parsePortComponent parses a single publish-spec port component, which is
+// either a plain port number or an inclusive "start-end" range. It returns
+// the starting port and a count: 0 means the component was empty (not
+// specified at all), 1 means a single explicit port, and >1 means a range of
+// that many ports. This is the range-aware counterpart of a bare
+// strconv.ParseUint used before range support existed.
+func parsePortComponent(s string) (start uint16, count int, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, nil
+	}
+	if idx := strings.Index(s, "-"); idx != -1 {
+		startStr := s[:idx]
+		endStr := s[idx+1:]
+		st, errStart := strconv.ParseUint(startStr, 10, 32)
+		en, errEnd := strconv.ParseUint(endStr, 10, 32)
+		if errStart != nil || errEnd != nil {
+			return 0, 0, fmt.Errorf("invalid port range %q", s)
+		}
+		if st == 0 {
+			return 0, 0, fmt.Errorf("port range %q cannot start at port 0", s)
+		}
+		if en < st {
+			return 0, 0, fmt.Errorf("port range %q ends before it starts", s)
+		}
+		if en > 65535 {
+			return 0, 0, fmt.Errorf("port range %q exceeds the maximum port 65535", s)
+		}
+		return uint16(st), int(en-st) + 1, nil
+	}
+	v, parseErr := strconv.ParseUint(s, 10, 16)
+	if parseErr != nil {
+		return 0, 0, parseErr
+	}
+	return uint16(v), 1, nil
 }
 
 // ParsePublishSpec parses a Podman/Compose/Quadlet-style publish spec into a
@@ -54,6 +107,8 @@ func FormatPublishSpec(m PortMapping) string {
 //	127.0.0.1:8080:80/tcp
 //	[::1]:8080:80/tcp
 //	[::]:8080:80/tcp
+//	8000-8005:9000-9005/tcp  (port ranges; host and container ranges must
+//	                          contain the same number of ports)
 //
 // IPv6 host addresses MUST be bracketed, matching Podman/Compose grammar;
 // this is what makes the host-address / host-port / container-port split
@@ -113,17 +168,31 @@ func ParsePublishSpec(entry string) (*PortMapping, error) {
 		return nil, fmt.Errorf("unrecognized port spec %q", entry)
 	}
 
-	var hPort uint64
-	var err error
-	if hPortStr != "" {
-		hPort, err = strconv.ParseUint(hPortStr, 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid host port in spec %q: %w", entry, err)
-		}
+	hStart, hCount, err := parsePortComponent(hPortStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid host port in spec %q: %w", entry, err)
 	}
-	cPort, err := strconv.ParseUint(cPortStr, 10, 16)
-	if err != nil || cPort == 0 {
+	cStart, cCount, err := parsePortComponent(cPortStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid container port in spec %q: %w", entry, err)
+	}
+	if cCount == 0 || cStart == 0 {
 		return nil, fmt.Errorf("invalid container port in spec %q", entry)
+	}
+
+	rangeSize := 0
+	if hCount > 1 || cCount > 1 {
+		effectiveHostCount := hCount
+		if hPortStr == "" {
+			// No host port at all (container-only publish): nothing to
+			// reconcile counts against, the container-side range stands on
+			// its own.
+			effectiveHostCount = cCount
+		}
+		if effectiveHostCount != cCount {
+			return nil, fmt.Errorf("host and container port ranges in spec %q must contain the same number of ports (%d vs %d)", entry, effectiveHostCount, cCount)
+		}
+		rangeSize = cCount
 	}
 
 	bind := hostIP
@@ -133,9 +202,10 @@ func ParsePublishSpec(entry string) (*PortMapping, error) {
 
 	return &PortMapping{
 		HostIP:        bind,
-		HostPort:      uint16(hPort),
-		ContainerPort: uint16(cPort),
+		HostPort:      hStart,
+		ContainerPort: cStart,
 		Protocol:      proto,
+		RangeSize:     rangeSize,
 	}, nil
 }
 

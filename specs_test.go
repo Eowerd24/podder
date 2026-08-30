@@ -84,6 +84,74 @@ func TestSpecsCRUD(t *testing.T) {
 	}
 }
 
+func TestLegacySpecWithoutSchemaVersionMigratesToManaged(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	// Simulate a spec file written by the pre-hardening prototype: no
+	// schemaVersion, no managed field at all (both post-date this pass).
+	// Every such file was, in practice, written for a container that DID
+	// carry io.podder.managed=true — the prototype applied that label
+	// unconditionally.
+	legacyJSON := `{
+		"name": "legacy-app",
+		"image": "docker.io/library/nginx:alpine",
+		"portMappings": [{"hostIP":"127.0.0.1","hostPort":8080,"containerPort":80,"protocol":"tcp"}],
+		"command": "nginx -g \"daemon off;\""
+	}`
+
+	svc := &PodmanService{}
+	servicesDir := getServicesDir()
+	if err := os.MkdirAll(servicesDir, 0o700); err != nil {
+		t.Fatalf("failed to create services dir: %v", err)
+	}
+	if err := os.WriteFile(getSpecFilePath("legacy-app"), []byte(legacyJSON), 0o600); err != nil {
+		t.Fatalf("failed to write legacy fixture: %v", err)
+	}
+
+	spec, err := svc.GetSpec("legacy-app")
+	if err != nil {
+		t.Fatalf("unexpected error loading legacy spec: %v", err)
+	}
+	if !spec.Managed {
+		t.Fatalf("expected a legacy (pre-schemaVersion) spec to migrate to Managed=true, since the prototype applied io.podder.managed=true unconditionally; got Managed=false — replaying this spec would silently strip the managed label from a container that currently carries it")
+	}
+	if spec.SchemaVersion != CurrentSpecSchemaVersion {
+		t.Errorf("expected migrated schema version %d, got %d", CurrentSpecSchemaVersion, spec.SchemaVersion)
+	}
+
+	// BuildRunArgsFromSpec on the migrated spec must therefore still apply
+	// the managed label.
+	args, err := BuildRunArgsFromSpec(*spec)
+	if err != nil {
+		t.Fatalf("unexpected error building args: %v", err)
+	}
+	found := false
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--label" && args[i+1] == "io.podder.managed=true" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected migrated legacy spec to still produce io.podder.managed=true, got args: %v", args)
+	}
+
+	// A spec written by the CURRENT code (SchemaVersion already set) must
+	// NOT be force-migrated — its explicit Managed value is authoritative.
+	if err := svc.SaveSpec(ContainerSpec{Name: "explicit-unmanaged", Image: "alpine", Managed: false}); err != nil {
+		t.Fatalf("failed to save spec: %v", err)
+	}
+	explicit, err := svc.GetSpec("explicit-unmanaged")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if explicit.Managed {
+		t.Errorf("expected an explicitly-unmanaged current-schema spec to stay unmanaged, got Managed=true")
+	}
+}
+
 func TestSpecFilePermissionsAreRestrictive(t *testing.T) {
 	tempDir := t.TempDir()
 	origHome := os.Getenv("HOME")

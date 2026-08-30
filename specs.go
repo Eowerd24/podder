@@ -257,11 +257,33 @@ func (p *PodmanService) GetSpec(name string) (*ContainerSpec, error) {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return nil, fmt.Errorf("corrupted spec file for service %s: %w", name, err)
 	}
-	if spec.SchemaVersion == 0 {
-		spec.SchemaVersion = CurrentSpecSchemaVersion
-	}
+	migrateLegacySpec(&spec)
 
 	return &spec, nil
+}
+
+// migrateLegacySpec upgrades a spec loaded from a pre-hardening-pass file
+// (SchemaVersion 0, meaning the field didn't exist yet) in place.
+//
+// Every spec that predates SchemaVersion/Managed was written by a code path
+// that unconditionally applied io.podder.managed=true to the container it
+// described (both the pre-hardening RunContainerWithPortMappings and
+// AdoptContainer did this regardless of any UI checkbox — that blanket
+// behavior is exactly what this hardening pass fixed). So a legacy spec
+// with no explicit Managed value does NOT mean "this was an unmanaged
+// container that happened to get saved" — it means "Managed was true, but
+// the field didn't exist yet to record it". Defaulting it to false here
+// would be actively dangerous: a mutation or DeploySpec replay would then
+// build the replacement container WITHOUT io.podder.managed=true, silently
+// stripping managed status (and the label a mutation's own PREFLIGHT relies
+// on to recognize the container next time) from a workload that is, right
+// now, actually running with that label.
+func migrateLegacySpec(spec *ContainerSpec) {
+	if spec.SchemaVersion != 0 {
+		return
+	}
+	spec.SchemaVersion = CurrentSpecSchemaVersion
+	spec.Managed = true
 }
 
 // ListSpecs returns all stored, committed declarative container
@@ -290,9 +312,7 @@ func (p *PodmanService) ListSpecs() ([]ContainerSpec, error) {
 
 		var spec ContainerSpec
 		if err := json.Unmarshal(data, &spec); err == nil {
-			if spec.SchemaVersion == 0 {
-				spec.SchemaVersion = CurrentSpecSchemaVersion
-			}
+			migrateLegacySpec(&spec)
 			specs = append(specs, spec)
 		}
 	}

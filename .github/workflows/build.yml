@@ -47,6 +47,17 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev build-essential pkg-config
 
+    - name: Install Frontend NPM Dependencies
+      working-directory: ./frontend
+      run: npm ci
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: npm run build
+
+    # go vet/test must run AFTER the frontend build: main.go's
+    # `//go:embed all:frontend/dist` directive fails to even compile the
+    # package if frontend/dist doesn't exist yet.
     - name: go vet
       run: go vet ./...
 
@@ -58,14 +69,6 @@ jobs:
       # and build/android helper packages are platform-scaffolding, not
       # part of the tested application).
       run: go test -race .
-
-    - name: Install Frontend NPM Dependencies
-      working-directory: ./frontend
-      run: npm ci
-
-    - name: Build Frontend
-      working-directory: ./frontend
-      run: npm run build
 
     - name: Install Wails v3 CLI
       run: go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}

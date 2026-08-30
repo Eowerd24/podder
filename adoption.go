@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-// AdoptionAssessment models the safety analysis and proposed spec for adopting a container.
+// AdoptionAssessment models the safety analysis and proposed spec for
+// adopting a container. CanAdopt is default-deny: any inspected feature
+// Podder's current spec schema cannot faithfully reproduce is a Blocker,
+// not a Warning, and adoption refuses rather than silently dropping it.
 type AdoptionAssessment struct {
 	ContainerID   string        `json:"containerId"`
 	ContainerName string        `json:"containerName"`
@@ -19,27 +22,43 @@ type AdoptionAssessment struct {
 	RawInspect    string        `json:"rawInspect,omitempty"`
 }
 
-// AdoptionResult represents the outcome of an adoption transaction.
+// AdoptionResult represents the outcome of an adoption transaction. Success
+// is only ever true after a complete supported spec was built, the
+// container was safely recreated, its runtime configuration and Podder
+// labels were verified, and the spec commit itself succeeded.
 type AdoptionResult struct {
-	Success     bool          `json:"success"`
-	ServiceName string        `json:"serviceName"`
-	Spec        ContainerSpec `json:"spec"`
-	Message     string        `json:"message"`
+	Success                bool            `json:"success"`
+	ServiceName            string          `json:"serviceName"`
+	Spec                   ContainerSpec   `json:"spec"`
+	Message                string          `json:"message"`
+	Rollback               *RollbackResult `json:"rollback,omitempty"`
+	ManualRecoveryRequired bool            `json:"manualRecoveryRequired,omitempty"`
 }
 
-// Raw inspect structures
+// Raw inspect structures. These deliberately capture more than the fields
+// Podder can currently represent, so assessRepresentability can detect
+// unsupported non-default configuration instead of silently ignoring it.
 type inspectContainer struct {
-	Id      string `json:"Id"`
-	Name    string `json:"Name"`
-	Image   string `json:"Image"`
-	Path    string `json:"Path"`
-	Args    []string `json:"Args"`
-	Config  struct {
-		Image      string            `json:"Image"`
-		Cmd        []string          `json:"Cmd"`
-		Entrypoint []string          `json:"Entrypoint"`
-		Env        []string          `json:"Env"`
-		Labels     map[string]string `json:"Labels"`
+	Id     string   `json:"Id"`
+	Name   string   `json:"Name"`
+	Image  string   `json:"Image"`
+	Path   string   `json:"Path"`
+	Args   []string `json:"Args"`
+	Pod    string   `json:"Pod"`
+	Config struct {
+		Image       string            `json:"Image"`
+		Cmd         []string          `json:"Cmd"`
+		Entrypoint  []string          `json:"Entrypoint"`
+		Env         []string          `json:"Env"`
+		Labels      map[string]string `json:"Labels"`
+		WorkingDir  string            `json:"WorkingDir"`
+		User        string            `json:"User"`
+		Hostname    string            `json:"Hostname"`
+		StopSignal  string            `json:"StopSignal"`
+		StopTimeout *int              `json:"StopTimeout"`
+		Healthcheck *struct {
+			Test []string `json:"Test"`
+		} `json:"Healthcheck"`
 	} `json:"Config"`
 	HostConfig struct {
 		PortBindings map[string][]struct {
@@ -52,14 +71,174 @@ type inspectContainer struct {
 		RestartPolicy struct {
 			Name string `json:"Name"`
 		} `json:"RestartPolicy"`
+		CapAdd      []string `json:"CapAdd"`
+		CapDrop     []string `json:"CapDrop"`
+		SecurityOpt []string `json:"SecurityOpt"`
+		PidMode     string   `json:"PidMode"`
+		IpcMode     string   `json:"IpcMode"`
+		UsernsMode  string   `json:"UsernsMode"`
+		Dns         []string `json:"Dns"`
+		DnsSearch   []string `json:"DnsSearch"`
+		ExtraHosts  []string `json:"ExtraHosts"`
+		Devices     []struct {
+			PathOnHost string `json:"PathOnHost"`
+		} `json:"Devices"`
+		Memory     int64  `json:"Memory"`
+		NanoCpus   int64  `json:"NanoCpus"`
+		CpusetCpus string `json:"CpusetCpus"`
+		Ulimits    []struct {
+			Name string `json:"Name"`
+		} `json:"Ulimits"`
+		Init *bool `json:"Init"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Type        string `json:"Type"`
+		Name        string `json:"Name"`
 		Source      string `json:"Source"`
 		Destination string `json:"Destination"`
 		RW          bool   `json:"RW"`
 	} `json:"Mounts"`
-	Pod string `json:"Pod"`
+	NetworkSettings struct {
+		Networks map[string]struct {
+			Aliases    []string `json:"Aliases"`
+			IPAMConfig *struct {
+				IPv4Address string `json:"IPv4Address"`
+				IPv6Address string `json:"IPv6Address"`
+			} `json:"IPAMConfig"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
+}
+
+// assessRepresentability inspects every field Podder does not yet model and
+// reports each as a blocker. This is a default-deny gate: an unrecognized
+// or non-default field is treated as unsafe to ignore, never as harmless.
+func assessRepresentability(raw inspectContainer) []string {
+	var blockers []string
+	add := func(format string, args ...interface{}) {
+		blockers = append(blockers, fmt.Sprintf(format, args...))
+	}
+
+	if raw.HostConfig.Privileged {
+		add("container runs --privileged, which Podder does not yet reproduce")
+	}
+
+	netMode := strings.ToLower(strings.TrimSpace(raw.HostConfig.NetworkMode))
+	if netMode == "host" {
+		add("container uses host networking, which Podder does not yet reproduce")
+	}
+
+	restartName := strings.ToLower(strings.TrimSpace(raw.HostConfig.RestartPolicy.Name))
+	if restartName != "" && restartName != "no" {
+		add("container has a custom restart policy (%q), which Podder does not yet reproduce", raw.HostConfig.RestartPolicy.Name)
+	}
+
+	if len(raw.HostConfig.CapAdd) > 0 || len(raw.HostConfig.CapDrop) > 0 {
+		add("container adds or drops Linux capabilities, which Podder does not yet reproduce")
+	}
+
+	for _, opt := range raw.HostConfig.SecurityOpt {
+		if strings.TrimSpace(opt) != "" {
+			add("container sets a security option (%q, including SELinux options), which Podder does not yet reproduce", opt)
+			break
+		}
+	}
+
+	if pid := strings.TrimSpace(raw.HostConfig.PidMode); pid != "" {
+		add("container uses a non-default PID namespace (%q), which Podder does not yet reproduce", pid)
+	}
+
+	if ipc := strings.TrimSpace(raw.HostConfig.IpcMode); ipc != "" && ipc != "shareable" && ipc != "private" {
+		add("container uses a non-default IPC namespace (%q), which Podder does not yet reproduce", ipc)
+	}
+
+	if userns := strings.TrimSpace(raw.HostConfig.UsernsMode); userns != "" {
+		add("container uses a non-default user namespace (%q), which Podder does not yet reproduce", userns)
+	}
+
+	if len(raw.HostConfig.Dns) > 0 || len(raw.HostConfig.DnsSearch) > 0 {
+		add("container has custom DNS configuration, which Podder does not yet reproduce")
+	}
+
+	if len(raw.HostConfig.ExtraHosts) > 0 {
+		add("container has extra /etc/hosts entries, which Podder does not yet reproduce")
+	}
+
+	if len(raw.HostConfig.Devices) > 0 {
+		add("container has device mappings (including GPU passthrough), which Podder does not yet reproduce")
+	}
+
+	if raw.HostConfig.Memory > 0 {
+		add("container has a memory limit, which Podder does not yet reproduce")
+	}
+
+	if raw.HostConfig.NanoCpus > 0 || strings.TrimSpace(raw.HostConfig.CpusetCpus) != "" {
+		add("container has CPU limits or a cpuset, which Podder does not yet reproduce")
+	}
+
+	if len(raw.HostConfig.Ulimits) > 0 {
+		add("container has custom ulimits, which Podder does not yet reproduce")
+	}
+
+	if raw.HostConfig.Init != nil && *raw.HostConfig.Init {
+		add("container uses --init, which Podder does not yet reproduce")
+	}
+
+	if raw.Config.Healthcheck != nil && len(raw.Config.Healthcheck.Test) > 0 {
+		test := strings.Join(raw.Config.Healthcheck.Test, ",")
+		if !strings.EqualFold(test, "NONE") {
+			add("container defines a Podman healthcheck, which Podder does not yet reproduce")
+		}
+	}
+
+	if strings.TrimSpace(raw.Config.User) != "" {
+		add("container runs as a custom user (%q), which Podder does not yet reproduce", raw.Config.User)
+	}
+
+	if strings.TrimSpace(raw.Config.WorkingDir) != "" {
+		add("container sets a custom working directory (%q), which Podder does not yet reproduce", raw.Config.WorkingDir)
+	}
+
+	if hn := strings.TrimSpace(raw.Config.Hostname); hn != "" && !strings.HasPrefix(strings.TrimSpace(raw.Id), hn) {
+		add("container sets a custom hostname (%q), which Podder does not yet reproduce", hn)
+	}
+
+	if sig := strings.TrimSpace(raw.Config.StopSignal); sig != "" && !strings.EqualFold(sig, "SIGTERM") {
+		add("container sets a custom stop signal (%q), which Podder does not yet reproduce", sig)
+	}
+	if raw.Config.StopTimeout != nil && *raw.Config.StopTimeout != 0 && *raw.Config.StopTimeout != 10 {
+		add("container sets a custom stop timeout (%ds), which Podder does not yet reproduce", *raw.Config.StopTimeout)
+	}
+
+	for netName, net := range raw.NetworkSettings.Networks {
+		if netName != "" && netName != "podman" {
+			add("container is attached to network %q, which Podder does not yet reproduce (only the default network attachment is supported)", netName)
+		}
+		if len(net.Aliases) > 0 {
+			add("container has custom network aliases, which Podder does not yet reproduce")
+		}
+		if net.IPAMConfig != nil && (net.IPAMConfig.IPv4Address != "" || net.IPAMConfig.IPv6Address != "") {
+			add("container has a static container IP, which Podder does not yet reproduce")
+		}
+	}
+
+	for _, m := range raw.Mounts {
+		switch m.Type {
+		case "volume":
+			if strings.TrimSpace(m.Name) != "" {
+				add("container uses named volume %q, which Podder does not yet reproduce by name", m.Name)
+			} else {
+				add("container uses an anonymous volume mounted at %q, which Podder cannot safely reproduce (its contents would not be preserved)", m.Destination)
+			}
+		case "tmpfs":
+			add("container uses a tmpfs mount at %q, which Podder does not yet reproduce", m.Destination)
+		case "bind":
+			if strings.Contains(m.Source, "/run/secrets") || strings.Contains(m.Destination, "/run/secrets") {
+				add("container mounts a secret-style path at %q, which Podder does not yet reproduce", m.Destination)
+			}
+		}
+	}
+
+	return blockers
 }
 
 // ParseInspectToAssessment converts podman inspect JSON into an AdoptionAssessment.
@@ -84,7 +263,8 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		Warnings:      []string{},
 	}
 
-	// Provenance classification
+	// Provenance classification: an externally-owned workload is never
+	// adopted out from under its real owner.
 	prov := ClassifyProvenance(raw.Config.Labels, raw.Pod, "")
 	if prov.Type == "compose" {
 		assessment.CanAdopt = false
@@ -97,13 +277,16 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		assessment.Blockers = append(assessment.Blockers, fmt.Sprintf("Container is a member of Pod '%s'. Adopt the Pod rather than an individual member.", prov.PodName))
 	} else if prov.Type == "podder" {
 		assessment.Warnings = append(assessment.Warnings, "Container is already managed by Podder.")
+	} else if prov.Type == "ambiguous" {
+		assessment.CanAdopt = false
+		assessment.Blockers = append(assessment.Blockers, "Container has conflicting ownership evidence ("+prov.AmbiguityReason+"). Resolve the conflicting labels before adopting.")
 	}
 
-	if raw.HostConfig.Privileged {
-		assessment.Warnings = append(assessment.Warnings, "Container is running with elevated --privileged permissions.")
-	}
-	if raw.HostConfig.NetworkMode == "host" {
-		assessment.Warnings = append(assessment.Warnings, "Container is running in host network mode (ports are not isolated).")
+	// Default-deny representability gate: any inspected field Podder cannot
+	// faithfully reproduce blocks adoption outright.
+	for _, b := range assessRepresentability(raw) {
+		assessment.CanAdopt = false
+		assessment.Blockers = append(assessment.Blockers, b)
 	}
 
 	// 1. Port mappings
@@ -131,7 +314,8 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		}
 	}
 
-	// 2. Bind mounts
+	// 2. Bind mounts (named/anonymous volumes and tmpfs are handled as
+	// blockers above, not silently folded in here).
 	var binds []BindMountSpec
 	for _, m := range raw.Mounts {
 		if m.Type == "bind" {
@@ -140,8 +324,6 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 				ContainerPath: m.Destination,
 				ReadOnly:      !m.RW,
 			})
-		} else if m.Type == "volume" {
-			assessment.Warnings = append(assessment.Warnings, fmt.Sprintf("Volume '%s' mounted to '%s' (named/anonymous volume state).", m.Source, m.Destination))
 		}
 	}
 
@@ -152,17 +334,10 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 		if len(kv) == 2 {
 			k := kv[0]
 			v := kv[1]
-			// Omit standard base image envs
 			if k != "PATH" && k != "HOSTNAME" && k != "HOME" && k != "TERM" {
 				envMap[k] = v
 			}
 		}
-	}
-
-	// 4. Command
-	cmdStr := ""
-	if len(raw.Config.Cmd) > 0 {
-		cmdStr = strings.Join(raw.Config.Cmd, " ")
 	}
 
 	imageName := raw.Config.Image
@@ -171,14 +346,18 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 	}
 
 	assessment.ProposedSpec = ContainerSpec{
-		Name:         containerName,
-		Image:        imageName,
-		PortMappings: portMappings,
-		Binds:        binds,
-		Env:          envMap,
-		Command:      cmdStr,
-		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
-		UpdatedAt:    time.Now().UTC().Format(time.RFC3339),
+		SchemaVersion: CurrentSpecSchemaVersion,
+		Name:          containerName,
+		Image:         imageName,
+		PortMappings:  portMappings,
+		Binds:         binds,
+		Env:           envMap,
+		// Command/Entrypoint come directly from Podman's own argv arrays —
+		// no shell string round trip, so no lossy re-tokenization.
+		Command:    CommandArgv(raw.Config.Cmd),
+		Entrypoint: raw.Config.Entrypoint,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
 
 	return assessment, nil
@@ -204,7 +383,41 @@ func (p *PodmanService) InspectContainerForAdoption(containerID string) (*Adopti
 	return assessment, nil
 }
 
-// AdoptContainer persists the container's declarative spec and converts it to Podder-managed.
+func adoptionRollbackResult(rb *RollbackResult, reason string) *AdoptionResult {
+	res := &AdoptionResult{Success: false, Rollback: rb}
+	if rb != nil && rb.Verified {
+		res.Message = fmt.Sprintf("%s The original container was restored to its prior name and lifecycle.", reason)
+	} else {
+		res.ManualRecoveryRequired = true
+		errs := ""
+		if rb != nil {
+			errs = strings.Join(rb.Errors, "; ")
+		}
+		res.Message = fmt.Sprintf("%s ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: %s", reason, errs)
+	}
+	return res
+}
+
+// AdoptContainer converts an ad-hoc (or otherwise unmanaged) container into
+// a Podder-managed workload. It never marks ownership before conversion
+// succeeds:
+//
+//  1. assess representability (default-deny; any unsupported feature blocks
+//     adoption outright, and nothing is touched)
+//  2. build and validate a candidate spec, and persist it only as a
+//     candidate — not yet authoritative
+//  3. quiesce and recreate the container from the exact candidate spec,
+//     preserving its original lifecycle
+//  4. verify the replacement exists, has the expected lifecycle, has the
+//     exact candidate port mappings, and actually carries Podder's managed
+//     labels
+//  5. only then commit the candidate spec and remove the backup
+//
+// Every returned error or Success=false leaves the original workload
+// untouched (or restored via a reported, truthfully-verified rollback) and
+// commits no spec. The caller must inspect the returned result — this
+// function never silently ignores its own outcome, and it never reports
+// Success unconditionally.
 func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (*AdoptionResult, error) {
 	assessment, err := p.InspectContainerForAdoption(containerID)
 	if err != nil {
@@ -212,32 +425,148 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 	}
 
 	if !assessment.CanAdopt {
-		return nil, fmt.Errorf("container cannot be adopted: %s", strings.Join(assessment.Blockers, "; "))
+		return &AdoptionResult{
+			Success: false,
+			Message: fmt.Sprintf("Adoption blocked: %s", strings.Join(assessment.Blockers, "; ")),
+		}, nil
 	}
 
 	serviceName = strings.TrimSpace(serviceName)
 	if serviceName == "" {
 		serviceName = assessment.ContainerName
 	}
-	assessment.ProposedSpec.Name = serviceName
 
-	// 1. Save declarative spec under ~/.config/podder/services/<serviceName>.json
-	if err := p.SaveSpec(assessment.ProposedSpec); err != nil {
-		return nil, fmt.Errorf("failed to save adopted container spec: %w", err)
+	candidateSpec := assessment.ProposedSpec
+	candidateSpec.Name = serviceName
+	candidateSpec.Managed = true
+
+	if errs := ValidateSpec(candidateSpec); len(errs) > 0 {
+		return &AdoptionResult{Success: false, Message: fmt.Sprintf("Adoption blocked: candidate spec failed validation: %s", strings.Join(errs, "; "))}, nil
+	}
+	if _, err := BuildRunArgsFromSpec(candidateSpec); err != nil {
+		return &AdoptionResult{Success: false, Message: fmt.Sprintf("Adoption blocked: candidate spec is not replayable: %v", err)}, nil
 	}
 
-	// 2. Recreate / mutate container with Podder labels to formalize ownership
-	_, _ = p.MutateContainerPorts(PortMutationRequest{
-		ContainerID: containerID,
-		ServiceName: serviceName,
-		NewPorts:    assessment.ProposedSpec.PortMappings,
-		ForceAdHoc:  true,
+	target, err := p.findContainerForAdoption(containerID)
+	if err != nil {
+		return nil, err
+	}
+	originalLifecycle, lifecycleSupported := classifyLifecycle(target.State)
+	if !lifecycleSupported {
+		return &AdoptionResult{Success: false, Message: fmt.Sprintf("Adoption blocked: container lifecycle state %q cannot be safely reproduced.", target.State)}, nil
+	}
+
+	// Persist a candidate/draft spec only — ownership is never marked
+	// before the workload has successfully become reproducible and
+	// verified.
+	candidatePath, err := writeCandidateSpec(candidateSpec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to persist candidate spec: %w", err)
+	}
+
+	backupName := newBackupName(assessment.ContainerName)
+
+	if _, _, err := p.runCommand("rename", assessment.ContainerName, backupName); err != nil {
+		discardCandidateSpec(candidatePath)
+		return nil, fmt.Errorf("adoption failed: could not rename original container: %w", err)
+	}
+
+	if originalLifecycle == lifecycleRunning {
+		if err := p.StopContainer(backupName); err != nil {
+			discardCandidateSpec(candidatePath)
+			rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, false)
+			return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: could not stop original container: %v.", err)), nil
+		}
+	}
+
+	var createArgs []string
+	if originalLifecycle == lifecycleRunning {
+		createArgs, err = BuildRunArgsFromSpec(candidateSpec)
+	} else {
+		createArgs, err = BuildCreateArgsFromSpec(candidateSpec)
+	}
+	if err != nil {
+		discardCandidateSpec(candidatePath)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, false)
+		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: %v.", err)), nil
+	}
+
+	stdout, stderr, err := p.runCommand(createArgs...)
+	if err != nil {
+		discardCandidateSpec(candidatePath)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, false)
+		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed to recreate container: %v (stderr: %s).", err, strings.TrimSpace(stderr))), nil
+	}
+	newContainerID := strings.TrimSpace(stdout)
+
+	var newContainer *Container
+	verified := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+		cs, err := p.ListContainers(true)
+		if err != nil {
+			return false
+		}
+		c := findContainerByIdentity(cs, newContainerID)
+		if c == nil {
+			c = findContainerByName(cs, serviceName)
+		}
+		if c == nil {
+			return false
+		}
+		kind, _ := classifyLifecycle(c.State)
+		if kind != originalLifecycle {
+			return false
+		}
+		newContainer = c
+		return true
 	})
+	if !verified || newContainer == nil {
+		discardCandidateSpec(candidatePath)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, true)
+		return adoptionRollbackResult(rb, "Adoption failed: replacement container did not verify."), nil
+	}
+
+	if eq, missing, unexpected := portMappingSetEqual(candidateSpec.PortMappings, newContainer.PortMappings); !eq {
+		discardCandidateSpec(candidatePath)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, true)
+		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: port mappings do not match after recreation (missing: %v, unexpected: %v).", missing, unexpected)), nil
+	}
+
+	if newContainer.Provenance.Type != "podder" {
+		discardCandidateSpec(candidatePath)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, true)
+		return adoptionRollbackResult(rb, "Adoption failed: replacement container did not verify as Podder-managed."), nil
+	}
+
+	if err := commitCandidateSpec(candidatePath, candidateSpec); err != nil {
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, originalLifecycle, true)
+		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: could not commit spec: %v.", err)), nil
+	}
+
+	if err := p.RemoveContainer(backupName); err != nil {
+		return &AdoptionResult{
+			Success:     true,
+			ServiceName: serviceName,
+			Spec:        candidateSpec,
+			Message:     fmt.Sprintf("Workload '%s' adopted successfully, but backup container %s could not be removed automatically; manual cleanup recommended.", serviceName, backupName),
+		}, nil
+	}
 
 	return &AdoptionResult{
 		Success:     true,
 		ServiceName: serviceName,
-		Spec:        assessment.ProposedSpec,
-		Message:     fmt.Sprintf("Workload '%s' successfully adopted into Podder!", serviceName),
+		Spec:        candidateSpec,
+		Message:     fmt.Sprintf("Workload '%s' successfully adopted into Podder.", serviceName),
 	}, nil
+}
+
+func (p *PodmanService) findContainerForAdoption(containerID string) (*Container, error) {
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect local containers: %w", err)
+	}
+	target := findContainerByIdentity(containers, containerID)
+	if target == nil {
+		return nil, fmt.Errorf("container %s not found", containerID)
+	}
+	return target, nil
 }

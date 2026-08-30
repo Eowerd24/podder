@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -181,24 +183,27 @@ func TestSystemInfoJSONParsing(t *testing.T) {
 	}
 }
 
-func TestBuildRunContainerArgsWithBindMount(t *testing.T) {
+func TestBuildRunArgsFromSpecWithBindMount(t *testing.T) {
 	tempDir := t.TempDir()
 	hostPath := filepath.Join(tempDir, "content")
 	if err := os.Mkdir(hostPath, 0o755); err != nil {
 		t.Fatalf("failed to create host directory: %v", err)
 	}
 
-	args, err := buildRunContainerArgs(
-		"docker.io/library/nginx:latest",
-		"demo",
-		"8080:80",
-		"",
-		hostPath,
-		"/usr/share/nginx/html",
-		true,
-	)
+	spec := ContainerSpec{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:latest",
+		PortMappings: []PortMapping{
+			{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+		},
+		Binds: []BindMountSpec{
+			{HostPath: hostPath, ContainerPath: "/usr/share/nginx/html", ReadOnly: true},
+		},
+	}
+
+	args, err := BuildRunArgsFromSpec(spec)
 	if err != nil {
-		t.Fatalf("buildRunContainerArgs returned error: %v", err)
+		t.Fatalf("BuildRunArgsFromSpec returned error: %v", err)
 	}
 
 	expectedMount := "type=bind,src=" + hostPath + ",target=/usr/share/nginx/html,readonly"
@@ -215,16 +220,14 @@ func TestBuildRunContainerArgsWithBindMount(t *testing.T) {
 	}
 }
 
-func TestBuildRunContainerArgsRejectsIncompleteMount(t *testing.T) {
-	if _, err := buildRunContainerArgs(
-		"docker.io/library/alpine:latest",
-		"",
-		"",
-		"",
-		"/tmp/example",
-		"",
-		false,
-	); err == nil {
+func TestBuildRunArgsFromSpecRejectsIncompleteMount(t *testing.T) {
+	spec := ContainerSpec{
+		Image: "docker.io/library/alpine:latest",
+		Binds: []BindMountSpec{
+			{HostPath: "/tmp/example", ContainerPath: ""},
+		},
+	}
+	if _, err := BuildRunArgsFromSpec(spec); err == nil {
 		t.Fatal("expected missing container path to fail")
 	}
 }
@@ -236,5 +239,213 @@ func TestIsSupportedImageFile(t *testing.T) {
 
 	if isSupportedImageFile("/tmp/example.txt") {
 		t.Fatal("expected non-image file to be rejected")
+	}
+}
+
+// fakePsRunner is a minimal fake runner for CreateContainer tests: it scripts
+// `podman run` and reflects the resulting container back out of `podman ps`.
+func fakePsRunner(containerID, name string, running bool) *fakeCommandRunner {
+	f := newFakeCommandRunner()
+	f.On("podman run", func(name_ string, args []string) (string, string, error) {
+		return containerID + "\n", "", nil
+	})
+	state := "running"
+	if !running {
+		state = "exited"
+	}
+	f.On("podman ps", func(n string, args []string) (string, string, error) {
+		psJSON := `[{"Id":"` + containerID + `","Names":["` + name + `"],"State":"` + state + `","Labels":{"io.podder.managed":"true"}}]`
+		return psJSON, "", nil
+	})
+	return f
+}
+
+func TestCreateContainerManagedCommitsSpecOnSuccess(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	runner := fakePsRunner("abc123def456", "svc1", true)
+	svc := &PodmanService{runner: runner}
+
+	req := ContainerCreateRequest{
+		Image:   "alpine:latest",
+		Name:    "svc1",
+		Managed: true,
+		PortMappings: []PortMapping{
+			{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+		},
+	}
+
+	result, err := svc.CreateContainer(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success || !result.Managed {
+		t.Fatalf("expected successful managed creation, got %+v", result)
+	}
+
+	spec, err := svc.GetSpec("svc1")
+	if err != nil {
+		t.Fatalf("expected committed spec to be loadable: %v", err)
+	}
+	if !spec.Managed || spec.Image != "alpine:latest" {
+		t.Errorf("unexpected committed spec: %+v", spec)
+	}
+}
+
+func TestCreateContainerUnmanagedSavesNoSpec(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	runner := fakePsRunner("abc123", "svc2", true)
+	svc := &PodmanService{runner: runner}
+
+	req := ContainerCreateRequest{
+		Image: "alpine:latest",
+		Name:  "svc2",
+		PortMappings: []PortMapping{
+			{HostPort: 8081, ContainerPort: 80, Protocol: "tcp"},
+		},
+	}
+
+	result, err := svc.CreateContainer(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success || result.Managed {
+		t.Fatalf("expected successful unmanaged creation, got %+v", result)
+	}
+
+	if _, err := svc.GetSpec("svc2"); err == nil {
+		t.Errorf("expected no spec to be persisted for an unmanaged creation")
+	}
+
+	// Also verify no io.podder.managed label reached the run invocation.
+	for _, call := range runner.CallsMatching("io.podder.managed") {
+		t.Errorf("unmanaged creation must not apply the managed label, got call: %v", call)
+	}
+}
+
+func TestCreateContainerFailedCreateLeavesNoCandidateSpec(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman run", func(n string, args []string) (string, string, error) {
+		return "", "some failure", fmt.Errorf("exit status 1")
+	})
+	svc := &PodmanService{runner: runner}
+
+	req := ContainerCreateRequest{
+		Image:   "alpine:latest",
+		Name:    "svc3",
+		Managed: true,
+	}
+
+	if _, err := svc.CreateContainer(req); err == nil {
+		t.Fatalf("expected error when container creation fails")
+	}
+
+	if _, err := svc.GetSpec("svc3"); err == nil {
+		t.Errorf("a failed create must not leave a committed spec claiming the workload exists")
+	}
+
+	entries, _ := os.ReadDir(getServicesDir())
+	for _, e := range entries {
+		t.Errorf("expected no leftover candidate spec files, found: %s", e.Name())
+	}
+}
+
+func TestCreateContainerVerifyFailureRemovesContainerAndSpec(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman run", func(n string, args []string) (string, string, error) {
+		return "deadbeef\n", "", nil
+	})
+	// `podman ps` never reports the new container back — simulating a
+	// verification failure.
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return "[]", "", nil
+	})
+	var removeCalled bool
+	runner.On("podman rm", func(n string, args []string) (string, string, error) {
+		removeCalled = true
+		return "", "", nil
+	})
+	svc := &PodmanService{runner: runner}
+
+	req := ContainerCreateRequest{
+		Image:   "alpine:latest",
+		Name:    "svc4",
+		Managed: true,
+	}
+
+	if _, err := svc.CreateContainer(req); err == nil {
+		t.Fatalf("expected error when the created container fails to verify")
+	}
+	if !removeCalled {
+		t.Errorf("expected the unverified container to be removed")
+	}
+	if _, err := svc.GetSpec("svc4"); err == nil {
+		t.Errorf("a verify failure must not leave a committed managed spec")
+	}
+}
+
+func TestValidateSpecCatchesDuplicatePortsAndBadBinds(t *testing.T) {
+	spec := ContainerSpec{
+		Image: "alpine",
+		PortMappings: []PortMapping{
+			{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{HostPort: 8080, ContainerPort: 81, Protocol: "tcp"},
+		},
+		Binds: []BindMountSpec{{HostPath: "", ContainerPath: "/x"}},
+	}
+	errs := ValidateSpec(spec)
+	if len(errs) < 2 {
+		t.Fatalf("expected at least 2 validation errors, got: %v", errs)
+	}
+}
+
+func TestCreateContainerRejectsIntraRequestPortConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+
+	svc := &PodmanService{runner: newFakeCommandRunner()}
+	req := ContainerCreateRequest{
+		Image: "alpine",
+		Name:  "clashing",
+		PortMappings: []PortMapping{
+			{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 81, Protocol: "tcp"},
+		},
+	}
+	if _, err := svc.CreateContainer(req); err == nil {
+		t.Fatalf("expected two mappings claiming the same host port within one request to be rejected")
+	}
+}
+
+func TestValidateSpecRejectsFutureSchemaVersion(t *testing.T) {
+	spec := ContainerSpec{Image: "alpine", SchemaVersion: CurrentSpecSchemaVersion + 1}
+	errs := ValidateSpec(spec)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "newer") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a schema-version error, got: %v", errs)
 	}
 }

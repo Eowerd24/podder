@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -221,23 +224,17 @@ func TestParseContainersJSONWithPorts(t *testing.T) {
 	}
 }
 
-func TestBuildRunContainerArgsWithMappings(t *testing.T) {
-	mappings := []PortMapping{
-		{
-			HostIP:        "127.0.0.1",
-			HostPort:      8080,
-			ContainerPort: 80,
-			Protocol:      "tcp",
-		},
-		{
-			HostIP:        "127.0.0.1",
-			HostPort:      5353,
-			ContainerPort: 5353,
-			Protocol:      "udp",
+func TestBuildRunArgsFromSpecWithMappings(t *testing.T) {
+	spec := ContainerSpec{
+		Name:  "web",
+		Image: "nginx:alpine",
+		PortMappings: []PortMapping{
+			{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: 5353, ContainerPort: 5353, Protocol: "udp"},
 		},
 	}
 
-	args, err := buildRunContainerArgsWithMappings("nginx:alpine", "web", mappings, "", "", "", false)
+	args, err := BuildRunArgsFromSpec(spec)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -263,26 +260,47 @@ func TestBuildRunContainerArgsWithMappings(t *testing.T) {
 	}
 }
 
-func TestBuildRunContainerArgsMultiString(t *testing.T) {
-	portsStr := "8080:80, 5353:5353/udp"
-	args, err := buildRunContainerArgs("alpine:latest", "demo", portsStr, "", "", "", false)
+func TestBuildRunArgsFromSpecMultipleBindsAndEnv(t *testing.T) {
+	tempDir := t.TempDir()
+	hostA := filepath.Join(tempDir, "a")
+	hostB := filepath.Join(tempDir, "b")
+	if err := os.Mkdir(hostA, 0o755); err != nil {
+		t.Fatalf("failed to create dir a: %v", err)
+	}
+	if err := os.Mkdir(hostB, 0o755); err != nil {
+		t.Fatalf("failed to create dir b: %v", err)
+	}
+
+	spec := ContainerSpec{
+		Name:  "multi",
+		Image: "alpine:latest",
+		Binds: []BindMountSpec{
+			{HostPath: hostA, ContainerPath: "/data/a", ReadOnly: true},
+			{HostPath: hostB, ContainerPath: "/data/b"},
+		},
+		Env: map[string]string{"FOO": "bar", "BAZ": "qux"},
+	}
+
+	args, err := BuildRunArgsFromSpec(spec)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	found8080 := false
-	found5353 := false
+	mountCount := 0
+	envCount := 0
 	for i := 0; i < len(args)-1; i++ {
-		if args[i] == "-p" && args[i+1] == "8080:80" {
-			found8080 = true
+		if args[i] == "--mount" {
+			mountCount++
 		}
-		if args[i] == "-p" && args[i+1] == "5353:5353/udp" {
-			found5353 = true
+		if args[i] == "--env" {
+			envCount++
 		}
 	}
-
-	if !found8080 || !found5353 {
-		t.Fatalf("expected both port flags in args: %v", args)
+	if mountCount != 2 {
+		t.Errorf("expected 2 --mount flags (both binds preserved), got %d in %v", mountCount, args)
+	}
+	if envCount != 2 {
+		t.Errorf("expected 2 --env flags (all env vars preserved), got %d in %v", envCount, args)
 	}
 }
 
@@ -317,7 +335,9 @@ func TestValidatePortMapping(t *testing.T) {
 		t.Errorf("expected container port 0 to be invalid")
 	}
 
-	// 3. Wildcard exposure warning
+	// 3. Wildcard exposure classification: a brand-new mapping has nothing
+	// to have "changed" from, so ExposureChange must stay false absent an
+	// OldHostIP to compare against — only the classification is reported.
 	res3, err := service.ValidatePortMapping(PortMappingRequest{
 		HostIP:        "0.0.0.0",
 		HostPort:      59999,
@@ -327,8 +347,32 @@ func TestValidatePortMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !res3.ExposureChange || res3.Exposure != "wildcard" {
-		t.Errorf("expected wildcard exposure detection: %+v", res3)
+	if res3.ExposureChange {
+		t.Errorf("expected no ExposureChange for a brand-new mapping with no prior state: %+v", res3)
+	}
+	if res3.Exposure != "wildcard" {
+		t.Errorf("expected wildcard exposure classification: %+v", res3)
+	}
+	for _, c := range res3.Checks {
+		if strings.Contains(c.Message, "Public Exposure") {
+			t.Errorf("expected wildcard wording to avoid asserting Internet-'public' reachability, got: %q", c.Message)
+		}
+	}
+
+	// 4. A genuine exposure transition (loopback -> wildcard) IS reported
+	// when the caller supplies the previous bind address.
+	res4, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP:        "0.0.0.0",
+		HostPort:      59998,
+		ContainerPort: 80,
+		Protocol:      "tcp",
+		OldHostIP:     "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res4.ExposureChange {
+		t.Errorf("expected ExposureChange=true for a loopback->wildcard transition: %+v", res4)
 	}
 }
 

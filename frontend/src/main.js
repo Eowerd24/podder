@@ -1,5 +1,95 @@
-import * as Podman from "../bindings/changeme/podmanservice.js";
+import * as Podman from "../bindings/github.com/Eowerd24/podder/podmanservice.js";
 import { Call as WailsCall } from "@wailsio/runtime";
+
+// --- Trust boundary: escaping helpers for untrusted data ---
+//
+// Podman labels, container/image names, Compose project/service metadata,
+// registry YAML strings, process names, and network names all originate
+// outside Podder's control (a container's own labels, a homelab-wide
+// registry file, host process listings, ...) and must never be rendered
+// as raw HTML. Prefer textContent/dataset/addEventListener for dynamic
+// content; where a template literal must interpolate untrusted text into
+// markup, always pass it through escapeHtml first. Do not rely on
+// ad hoc `.replace(/"/g, '&quot;')` calls — that only covers straight
+// double quotes and leaves '<', '>', '&', and single quotes as breakout
+// vectors.
+function escapeHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Alias documenting intent at attribute-value call sites; escapeHtml's
+// output (which escapes '"', "'", '&', '<', '>') is already safe inside a
+// double- or single-quoted HTML attribute.
+function escapeAttr(value) {
+    return escapeHtml(value);
+}
+
+// Encodes a value for safe embedding inside a single-quoted JS string
+// literal that itself sits inside a double-quoted HTML onclick attribute
+// (e.g. onclick="fn('${...}')"). HTML-escaping the outer attribute alone is
+// NOT sufficient here: an event-handler attribute's value is HTML-decoded
+// by the browser BEFORE being compiled as JS, so an HTML entity for a
+// single quote (e.g. &#39;) decodes right back into a literal ' before the
+// JS parser ever sees it, and can still terminate the inline string early.
+// This backslash-escapes the JS string content first (so a literal quote
+// in the value can't break the JS string), then HTML-escapes the result
+// (so it can't break the HTML attribute either) — either step alone is
+// insufficient for this specific nested context.
+function jsStringLiteral(value) {
+    const jsEscaped = String(value === null || value === undefined ? '' : value)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+    return escapeHtml(jsEscaped);
+}
+
+// Encodes a JSON-serializable value for safe embedding as an HTML
+// attribute value (e.g. inside onclick="fn(...)"), escaping every
+// character that could break out of the attribute or reopen markup —
+// unlike a bare `.replace(/"/g, '&quot;')`, which leaves '<', '>', '&',
+// and single quotes unescaped.
+function jsonToSafeAttr(value) {
+    return escapeHtml(JSON.stringify(value));
+}
+
+// Case-insensitive fragments of environment variable / spec field names
+// treated as sensitive. Matching values are masked by default wherever a
+// spec or adoption preview is rendered, since a stored spec's Env map can
+// contain real credentials. The underlying value is never altered on disk
+// — only its on-screen rendering is masked.
+const SENSITIVE_KEY_PATTERNS = /password|token|secret|api[_-]?key|private[_-]?key|credential/i;
+
+function maskSensitiveValue() {
+    return '••••••••';
+}
+
+// Returns a deep-cloned spec/assessment object with values masked for any
+// key matching SENSITIVE_KEY_PATTERNS (currently just the `env` map, the
+// one place a spec carries values that can plausibly be credentials).
+function withMaskedSecrets(spec) {
+    if (!spec || typeof spec !== 'object') return spec;
+    const clone = JSON.parse(JSON.stringify(spec));
+    if (clone.env && typeof clone.env === 'object') {
+        for (const key of Object.keys(clone.env)) {
+            if (SENSITIVE_KEY_PATTERNS.test(key)) {
+                clone.env[key] = maskSensitiveValue();
+            }
+        }
+    }
+    if (clone.proposedSpec) {
+        clone.proposedSpec = withMaskedSecrets(clone.proposedSpec);
+    }
+    return clone;
+}
 
 // Active Tab state
 let currentTab = 'dashboard';
@@ -217,8 +307,8 @@ window.loadContainers = async () => {
                             const expClass = isLoopback ? 'exp-loopback' : (bind === '0.0.0.0' || bind === '*' ? 'exp-wildcard' : 'exp-specific');
                             return `
                                 <div class="port-badge-row">
-                                    <span class="port-proto-tag ${proto.toLowerCase()}">${proto}</span>
-                                    <span class="port-mapping-text ${expClass}">${bind}:${m.hostPort} &rarr; ${m.containerPort}</span>
+                                    <span class="port-proto-tag ${proto.toLowerCase() === 'udp' ? 'udp' : 'tcp'}">${escapeHtml(proto)}</span>
+                                    <span class="port-mapping-text ${expClass}">${escapeHtml(bind)}:${escapeHtml(m.hostPort)} &rarr; ${escapeHtml(m.containerPort)}</span>
                                 </div>
                             `;
                         }).join('')}
@@ -236,35 +326,39 @@ window.loadContainers = async () => {
                 provText = `${prov.displayType}: ${prov.name}`;
             }
 
-            // Safe json strings for onclick handler
-            const safeProvJson = JSON.stringify(prov).replace(/"/g, '&quot;');
-            const safeMappingsJson = JSON.stringify(mappings).replace(/"/g, '&quot;');
-            
+            // prov/mappings are untrusted (container labels): encode as a
+            // safe JS object-literal argument, and encode the name/id as
+            // safe single-quoted JS string arguments — see jsStringLiteral.
+            const safeProvJson = jsonToSafeAttr(prov);
+            const safeMappingsJson = jsonToSafeAttr(mappings);
+            const idArg = jsStringLiteral(c.Id);
+            const nameArg = jsStringLiteral(name);
+
             return `
                 <div class="container-card">
                     <div>
                         <div class="card-header-row">
                             <div>
-                                <div class="card-title">${name}</div>
-                                <span class="prov-badge ${provClass}" title="${prov.guidance || ''}">${provText}</span>
+                                <div class="card-title">${escapeHtml(name)}</div>
+                                <span class="prov-badge ${escapeAttr(provClass)}" title="${escapeAttr(prov.guidance || '')}">${escapeHtml(provText)}</span>
                             </div>
                             <span class="status-badge ${statusClass}">
                                 <span style="width: 6px; height: 6px; border-radius: 50%; background: currentColor;"></span>
-                                ${state}
+                                ${escapeHtml(state)}
                             </span>
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">ID</span>
-                            <span class="card-detail-value">${shortId}</span>
+                            <span class="card-detail-value">${escapeHtml(shortId)}</span>
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">Image</span>
-                            <span class="card-detail-value" title="${c.Image}">${c.Image}</span>
+                            <span class="card-detail-value" title="${escapeAttr(c.Image)}">${escapeHtml(c.Image)}</span>
                         </div>
                         ${c.PodName ? `
                             <div class="card-detail-item">
                                 <span class="card-detail-label">Pod</span>
-                                <span class="card-detail-value" style="color: #a78bfa;">${c.PodName}</span>
+                                <span class="card-detail-value" style="color: #a78bfa;">${escapeHtml(c.PodName)}</span>
                             </div>
                         ` : ''}
                         <div class="card-detail-item">
@@ -273,43 +367,43 @@ window.loadContainers = async () => {
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">Status</span>
-                            <span class="card-detail-value" style="font-family: inherit; font-size: 13px; color: var(--text-muted);">${c.Status || '-'}</span>
+                            <span class="card-detail-value" style="font-family: inherit; font-size: 13px; color: var(--text-muted);">${escapeHtml(c.Status || '-')}</span>
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">Command</span>
-                            <span class="card-detail-value" title="${command}">${command}</span>
+                            <span class="card-detail-value" title="${escapeAttr(command)}">${escapeHtml(command)}</span>
                         </div>
                     </div>
                     <div class="card-actions-row">
-                        <button class="btn btn-secondary btn-icon" onclick="viewLogs('${c.Id}', '${name}')" title="View Logs">
+                        <button class="btn btn-secondary btn-icon" onclick="viewLogs('${idArg}', '${nameArg}')" title="View Logs">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
                         </button>
-                        <button class="btn btn-secondary btn-icon" onclick="openEditPortsModal('${c.Id}', '${name}', ${safeProvJson}, ${safeMappingsJson})" title="Edit Port Mappings">
+                        <button class="btn btn-secondary btn-icon" onclick="openEditPortsModal('${idArg}', '${nameArg}', ${safeProvJson}, ${safeMappingsJson})" title="Edit Port Mappings">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                         </button>
                         ${prov.type === 'adhoc' ? `
-                            <button class="btn btn-secondary btn-icon" onclick="openAdoptModal('${c.Id}', '${name}')" title="Adopt Workload (Create Declarative Spec)">
+                            <button class="btn btn-secondary btn-icon" onclick="openAdoptModal('${idArg}', '${nameArg}')" title="Adopt Workload (Create Declarative Spec)">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
                             </button>
                         ` : ''}
                         ${prov.type === 'podder' ? `
-                            <button class="btn btn-secondary btn-icon" onclick="viewContainerSpec('${name}')" title="View Declarative Spec">
+                            <button class="btn btn-secondary btn-icon" onclick="viewContainerSpec('${nameArg}')" title="View Declarative Spec">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
                             </button>
                         ` : ''}
                         ${isRunning ? `
-                            <button class="btn btn-secondary btn-icon" onclick="stopContainer('${c.Id}')" title="Stop Container">
+                            <button class="btn btn-secondary btn-icon" onclick="stopContainer('${idArg}')" title="Stop Container">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/></svg>
                             </button>
                         ` : `
-                            <button class="btn btn-secondary btn-icon" onclick="startContainer('${c.Id}')" title="Start Container">
+                            <button class="btn btn-secondary btn-icon" onclick="startContainer('${idArg}')" title="Start Container">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                             </button>
                         `}
-                        <button class="btn btn-secondary btn-icon" onclick="restartContainer('${c.Id}')" title="Restart Container">
+                        <button class="btn btn-secondary btn-icon" onclick="restartContainer('${idArg}')" title="Restart Container">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
                         </button>
-                        <button class="btn btn-danger btn-icon" onclick="removeContainer('${c.Id}')" title="Remove Container">
+                        <button class="btn btn-danger btn-icon" onclick="removeContainer('${idArg}')" title="Remove Container">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
                         </button>
                     </div>
@@ -362,7 +456,7 @@ function renderRegistryStatusBar(summary) {
     bar.innerHTML = `
         <div class="reg-summary-item">
             <span class="reg-dot active"></span>
-            <strong>Registry Active:</strong> <code>${summary.registryPath}</code>
+            <strong>Registry Active:</strong> <code>${escapeHtml(summary.registryPath)}</code>
         </div>
         <div class="reg-summary-metrics">
             <span class="reg-metric match" title="Observed runtime workloads matching registry definition">
@@ -475,7 +569,7 @@ function renderPortItems() {
 
                         let statusBadge = `<span class="status-pill active">ACTIVE</span>`;
                         if (item.status === 'CONFLICT') {
-                            statusBadge = `<span class="status-pill conflict" title="${item.conflictNote || 'Conflict'}">CONFLICT</span>`;
+                            statusBadge = `<span class="status-pill conflict" title="${escapeAttr(item.conflictNote || 'Conflict')}">CONFLICT</span>`;
                         } else if (item.status === 'STOPPED_CONFIGURED') {
                             statusBadge = `<span class="status-pill stopped">CONFIGURED</span>`;
                         } else if (item.status === 'DECLARED_MISSING') {
@@ -512,7 +606,7 @@ function renderPortItems() {
                         // Provenance pill for table
                         let provBadge = '';
                         if (item.provenance && item.provenance.type) {
-                            provBadge = `<span class="prov-mini-badge ${item.provenance.type}" title="${item.provenance.guidance || ''}">${item.provenance.displayType}</span>`;
+                            provBadge = `<span class="prov-mini-badge ${escapeAttr(item.provenance.type)}" title="${escapeAttr(item.provenance.guidance || '')}">${escapeHtml(item.provenance.displayType)}</span>`;
                         }
 
                         const targetStr = item.isContainer && item.containerPort ? `${item.containerPort}/${proto}` : '&mdash;';
@@ -520,23 +614,27 @@ function renderPortItems() {
                         const urlHost = (bind === '0.0.0.0' || bind === '*' || bind === '') ? 'localhost' : bind;
                         const candidateUrl = `http://${urlHost}:${item.hostPort}`;
 
-                        const safeProvJson = JSON.stringify(item.provenance || {}).replace(/"/g, '&quot;');
+                        const safeProvJson = jsonToSafeAttr(item.provenance || {});
+                        const ownerArg = jsStringLiteral(item.owner);
+                        const containerIdArg = jsStringLiteral(item.containerId);
+                        const endpointArg = jsStringLiteral(endpointStr);
+                        const urlArg = jsStringLiteral(candidateUrl);
 
                         return `
                             <tr>
                                 <td>${sourceBadge}</td>
                                 <td>
                                     <div style="display: flex; align-items: center; gap: 6px;">
-                                        <div style="font-weight: 600; color: var(--text-primary); font-size: 14px;">${item.owner}</div>
+                                        <div style="font-weight: 600; color: var(--text-primary); font-size: 14px;">${escapeHtml(item.owner)}</div>
                                         ${provBadge}
                                     </div>
-                                    ${item.purpose ? `<div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${item.purpose}</div>` : ''}
-                                    ${item.isContainer && item.containerId ? `<div style="font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">${item.containerId.substring(0, 12)}</div>` : ''}
-                                    ${item.registryId && item.source !== 'registry-declared' ? `<div style="font-size: 10px; color: var(--color-emerald); font-family: var(--font-mono);">reg: ${item.registryId}</div>` : ''}
+                                    ${item.purpose ? `<div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">${escapeHtml(item.purpose)}</div>` : ''}
+                                    ${item.isContainer && item.containerId ? `<div style="font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">${escapeHtml(item.containerId.substring(0, 12))}</div>` : ''}
+                                    ${item.registryId && item.source !== 'registry-declared' ? `<div style="font-size: 10px; color: var(--color-emerald); font-family: var(--font-mono);">reg: ${escapeHtml(item.registryId)}</div>` : ''}
                                 </td>
                                 <td>
-                                    <span class="endpoint-code"><span class="proto-tag ${proto.toLowerCase()}">${proto}</span> ${endpointStr}</span>
-                                    ${item.applicationProtocol ? `<div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">app: ${item.applicationProtocol}</div>` : ''}
+                                    <span class="endpoint-code"><span class="proto-tag ${proto.toLowerCase() === 'udp' ? 'udp' : 'tcp'}">${escapeHtml(proto)}</span> ${escapeHtml(endpointStr)}</span>
+                                    ${item.applicationProtocol ? `<div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">app: ${escapeHtml(item.applicationProtocol)}</div>` : ''}
                                 </td>
                                 <td>
                                     <span style="font-family: var(--font-mono); font-size: 13px;">${targetStr}</span>
@@ -545,20 +643,20 @@ function renderPortItems() {
                                 ${hasRegistry ? `<td>${reconcileBadge}</td>` : ''}
                                 <td>
                                     ${statusBadge}
-                                    ${item.conflictNote ? `<div style="font-size: 11px; color: var(--color-rose); margin-top: 4px;">${item.conflictNote}</div>` : ''}
+                                    ${item.conflictNote ? `<div style="font-size: 11px; color: var(--color-rose); margin-top: 4px;">${escapeHtml(item.conflictNote)}</div>` : ''}
                                 </td>
                                 <td style="text-align: right;">
                                     <div style="display: inline-flex; gap: 6px;">
                                         ${item.isContainer && item.containerId ? `
-                                            <button class="btn btn-secondary btn-xs" onclick="openEditPortsModal('${item.containerId}', '${item.owner}', ${safeProvJson}, [])" title="Edit Container Ports">
+                                            <button class="btn btn-secondary btn-xs" onclick="openEditPortsModal('${containerIdArg}', '${ownerArg}', ${safeProvJson}, [])" title="Edit Container Ports">
                                                 Edit Ports
                                             </button>
                                         ` : ''}
-                                        <button class="btn btn-secondary btn-xs" onclick="copyText('${endpointStr}', 'Endpoint copied!')" title="Copy Host Endpoint">
+                                        <button class="btn btn-secondary btn-xs" onclick="copyText('${endpointArg}', 'Endpoint copied!')" title="Copy Host Endpoint">
                                             Copy Endpoint
                                         </button>
                                         ${isHttpCandidate ? `
-                                            <button class="btn btn-secondary btn-xs" onclick="copyText('${candidateUrl}', 'URL copied!')" title="Copy URL">
+                                            <button class="btn btn-secondary btn-xs" onclick="copyText('${urlArg}', 'URL copied!')" title="Copy URL">
                                                 Copy URL
                                             </button>
                                         ` : ''}
@@ -674,17 +772,18 @@ window.testRegistryFile = async () => {
         const result = await Podman.LoadPortRegistry(path);
         if (!result || !result.loaded) {
             banner.className = 'registry-status-banner error';
-            banner.innerHTML = `<strong>Failed to load registry:</strong> ${result ? result.error : 'Unknown error'}`;
+            banner.innerHTML = `<strong>Failed to load registry:</strong> ${escapeHtml(result ? result.error : 'Unknown error')}`;
         } else {
             banner.className = 'registry-status-banner success';
             banner.innerHTML = `
-                <div style="font-weight: 700; color: var(--color-emerald); margin-bottom: 4px;">&check; Registry Validated (V${result.version})</div>
-                <div>Loaded <strong>${result.totalEntries}</strong> declared port entries from <code>${result.path}</code></div>
+                <div style="font-weight: 700; color: var(--color-emerald); margin-bottom: 4px;">&check; Registry Validated (V${escapeHtml(result.version)})</div>
+                <div>Loaded <strong>${escapeHtml(result.totalEntries)}</strong> declared port entries from <code>${escapeHtml(result.path)}</code></div>
+                ${result.warnings && result.warnings.length > 0 ? `<div style="margin-top: 6px; color: var(--color-amber, #f59e0b); font-size: 12px;">${result.warnings.map(w => escapeHtml(w)).join('<br>')}</div>` : ''}
             `;
         }
     } catch (err) {
         banner.className = 'registry-status-banner error';
-        banner.innerHTML = `<strong>Error:</strong> ${err}`;
+        banner.innerHTML = `<strong>Error:</strong> ${escapeHtml(String(err))}`;
     }
 };
 
@@ -742,27 +841,27 @@ async function loadImages() {
                 <div class="image-card">
                     <div>
                         <div class="card-header-row" style="margin-bottom: 16px;">
-                            <div class="card-title" style="max-width: 100%; font-size: 15px; font-family: var(--font-mono);">${tag}</div>
+                            <div class="card-title" style="max-width: 100%; font-size: 15px; font-family: var(--font-mono);">${escapeHtml(tag)}</div>
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">Image ID</span>
-                            <span class="card-detail-value">${shortId}</span>
+                            <span class="card-detail-value">${escapeHtml(shortId)}</span>
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">Virtual Size</span>
-                            <span class="card-detail-value">${size}</span>
+                            <span class="card-detail-value">${escapeHtml(size)}</span>
                         </div>
                         <div class="card-detail-item">
                             <span class="card-detail-label">Created At</span>
-                            <span class="card-detail-value">${created}</span>
+                            <span class="card-detail-value">${escapeHtml(created)}</span>
                         </div>
                     </div>
                     <div class="card-actions-row">
-                        <button class="btn btn-secondary" onclick="openRunModal('${tag}')">
+                        <button class="btn btn-secondary" onclick="openRunModal('${jsStringLiteral(tag)}')">
                             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                             Run Image
                         </button>
-                        <button class="btn btn-danger btn-icon" onclick="removeImage('${img.Id}')" title="Delete Image">
+                        <button class="btn btn-danger btn-icon" onclick="removeImage('${jsStringLiteral(img.Id)}')" title="Delete Image">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
                         </button>
                     </div>
@@ -995,15 +1094,15 @@ function renderRunPortRows() {
             <div class="port-input-row" id="port-row-${row.id}">
                 <div class="port-field-group" style="flex: 1.5;">
                     <span class="field-mini-label">Bind IP</span>
-                    <input type="text" class="form-input" value="${row.hostIP}" placeholder="127.0.0.1" onchange="updateRunPortField(${row.id}, 'hostIP', this.value)"/>
+                    <input type="text" class="form-input" value="${escapeAttr(row.hostIP)}" placeholder="127.0.0.1" onchange="updateRunPortField(${row.id}, 'hostIP', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Host Port</span>
-                    <input type="number" class="form-input" value="${row.hostPort}" placeholder="8080" min="1" max="65535" oninput="updateRunPortField(${row.id}, 'hostPort', this.value)"/>
+                    <input type="number" class="form-input" value="${escapeAttr(row.hostPort)}" placeholder="8080" min="1" max="65535" oninput="updateRunPortField(${row.id}, 'hostPort', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Target Port</span>
-                    <input type="number" class="form-input" value="${row.containerPort}" placeholder="80" min="1" max="65535" oninput="updateRunPortField(${row.id}, 'containerPort', this.value)"/>
+                    <input type="number" class="form-input" value="${escapeAttr(row.containerPort)}" placeholder="80" min="1" max="65535" oninput="updateRunPortField(${row.id}, 'containerPort', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 0.8;">
                     <span class="field-mini-label">Proto</span>
@@ -1022,7 +1121,7 @@ function renderRunPortRows() {
                 </div>
             </div>
             ${row.statusText ? `
-                <div class="row-validation-msg ${row.statusLevel}">${row.statusText}</div>
+                <div class="row-validation-msg ${escapeAttr(row.statusLevel)}">${escapeHtml(row.statusText)}</div>
             ` : ''}
         `;
     }).join('');
@@ -1061,9 +1160,18 @@ window.submitRunContainer = async () => {
     const hostPath = document.getElementById('run-host-path').value.trim();
     const containerPath = document.getElementById('run-container-path').value.trim();
     const mountReadOnly = document.getElementById('run-mount-readonly').checked;
-    
+    // The UI setting explicitly controls whether the workload becomes
+    // Podder-managed — never inferred from whether port mappings were set.
+    const saveSpecCheckbox = document.getElementById('run-save-spec');
+    const managed = !!(saveSpecCheckbox && saveSpecCheckbox.checked);
+
     if (!image) {
         showNotification("Image name is required.", true);
+        return;
+    }
+
+    if (managed && !name) {
+        showNotification("A container name is required to save this as a Podder-managed workload.", true);
         return;
     }
 
@@ -1086,34 +1194,32 @@ window.submitRunContainer = async () => {
             });
         }
     }
-    
+
+    const binds = [];
+    if (hostPath && containerPath) {
+        binds.push({ hostPath, containerPath, readOnly: mountReadOnly });
+    }
+
     try {
         showNotification("Creating and starting container...", false);
         closeModal('run-modal');
 
-        if (structuredPortMappings.length > 0) {
-            await Podman.RunContainerWithPortMappings(
-                image,
-                name,
-                structuredPortMappings,
-                command,
-                hostPath,
-                containerPath,
-                mountReadOnly
-            );
-        } else {
-            await Podman.RunContainer(
-                image,
-                name,
-                "",
-                command,
-                hostPath,
-                containerPath,
-                mountReadOnly
-            );
-        }
+        const result = await Podman.CreateContainer({
+            image,
+            name,
+            managed,
+            portMappings: structuredPortMappings,
+            binds,
+            env: {},
+            command,
+            entrypoint: []
+        });
 
-        showNotification("Container created and running successfully", false, true);
+        if (result && result.managed) {
+            showNotification("Container created and saved as a Podder-managed workload.", false, true);
+        } else {
+            showNotification("Container created and running successfully", false, true);
+        }
 
         resetRunModal();
         switchTab('containers');
@@ -1153,14 +1259,17 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
     document.getElementById('edit-ports-container-id').value = containerId;
     document.getElementById('edit-ports-service-name').value = containerName || '';
     document.getElementById('edit-ports-unit-name').value = currentEditProvenance.unitName || currentEditProvenance.name || '';
-    document.getElementById('edit-ports-title').textContent = `Edit Ports: ${containerName || containerId.substring(0, 12)}`;
+    document.getElementById('edit-ports-title').textContent = `Edit Ports: ${containerName || (containerId || '').substring(0, 12)}`;
 
-    // Render provenance pill in modal header
-    const provClass = currentEditProvenance.type || 'adhoc';
-    const provText = currentEditProvenance.displayType || 'Ad-Hoc';
-    document.getElementById('edit-ports-provenance').innerHTML = `
-        <span class="prov-badge ${provClass}">${provText}</span>
-    `;
+    // Render provenance pill in modal header (label/type/guidance are
+    // untrusted — sourced from container labels — so build it via
+    // textContent/dataset rather than innerHTML string interpolation).
+    const provPillHost = document.getElementById('edit-ports-provenance');
+    provPillHost.textContent = '';
+    const provPill = document.createElement('span');
+    provPill.className = `prov-badge ${currentEditProvenance.type || 'adhoc'}`;
+    provPill.textContent = currentEditProvenance.displayType || 'Ad-Hoc';
+    provPillHost.appendChild(provPill);
 
     const modeBar = document.getElementById('edit-ports-mode-bar');
     const guidanceBox = document.getElementById('edit-ports-guidance-box');
@@ -1169,7 +1278,6 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
     const snippetText = document.getElementById('edit-ports-snippet-text');
     const interactiveArea = document.getElementById('edit-ports-interactive-area');
     const fileInfo = document.getElementById('edit-ports-file-info');
-    const adhocConfirmBox = document.getElementById('edit-ports-adhoc-confirm-box');
     const stepsBox = document.getElementById('edit-ports-steps-box');
     const submitBtn = document.getElementById('btn-submit-port-mutation');
 
@@ -1177,7 +1285,7 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
     document.getElementById('edit-ports-steps-list').innerHTML = '';
     modeBar.style.display = 'none';
     fileInfo.style.display = 'none';
-    adhocConfirmBox.style.display = 'none';
+    fileInfo.textContent = '';
 
     // Initialize rows from current mappings
     editPortRows = [];
@@ -1193,16 +1301,32 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
         return;
     }
 
+    // Direct mutation of an ad-hoc (or otherwise unrecognized/ambiguous)
+    // container is permanently disabled: Podder has no authoritative spec
+    // for it and cannot prove it can reproduce it. There is no
+    // confirmation checkbox that makes recreating it safe — adopt the
+    // workload first.
+    if (currentEditProvenance.type === 'adhoc' || currentEditProvenance.type === 'ambiguous' || !currentEditProvenance.type) {
+        guidanceBox.style.display = 'block';
+        guidanceText.textContent = 'This container is not safely reproducible by Podder. Adopt it into Podder before editing its deployment configuration.';
+        snippetWrapper.style.display = 'none';
+        interactiveArea.style.display = 'none';
+        submitBtn.style.display = 'none';
+        openModal('edit-ports-modal');
+        return;
+    }
+
     if (currentEditProvenance.type === 'quadlet') {
         modeBar.style.display = 'block';
         setEditPortsMode('inplace');
+        submitBtn.style.display = 'inline-block';
         submitBtn.textContent = 'Apply to .container & Restart Unit';
 
         try {
             const quadletDetails = await Podman.InspectQuadlet(currentEditProvenance.unitName || currentEditProvenance.name);
             if (quadletDetails && quadletDetails.exists) {
                 fileInfo.style.display = 'block';
-                fileInfo.innerHTML = `<strong>Unit File:</strong> <code>${quadletDetails.filePath}</code>`;
+                setFileInfoLine(fileInfo, 'Unit File:', quadletDetails.filePath);
                 if (quadletDetails.portMappings && quadletDetails.portMappings.length > 0) {
                     portMappings = quadletDetails.portMappings;
                 }
@@ -1219,13 +1343,14 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
     } else if (currentEditProvenance.type === 'compose') {
         modeBar.style.display = 'block';
         setEditPortsMode('inplace');
+        submitBtn.style.display = 'inline-block';
         submitBtn.textContent = 'Apply to compose.yml & Compose Up';
 
         try {
             const composeDetails = await Podman.InspectCompose(containerId);
             if (composeDetails && composeDetails.composeFile) {
                 fileInfo.style.display = 'block';
-                fileInfo.innerHTML = `<strong>Compose File:</strong> <code>${composeDetails.composeFile}</code> (service: <code>${composeDetails.service}</code>)`;
+                setFileInfoLine(fileInfo, 'Compose File:', composeDetails.composeFile, `service: ${composeDetails.service}`);
                 if (composeDetails.portMappings && composeDetails.portMappings.length > 0) {
                     portMappings = composeDetails.portMappings;
                 }
@@ -1239,11 +1364,8 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
         snippetWrapper.style.display = 'block';
         snippetText.textContent = currentEditSnippet;
         guidanceText.textContent = `Update the ports definition in your compose file and re-run 'pod up'.`;
-    } else if (currentEditProvenance.type === 'adhoc') {
-        adhocConfirmBox.style.display = 'block';
-        document.getElementById('edit-ports-adhoc-confirm').checked = false;
-        submitBtn.textContent = 'Mutate Ports (Atomic Transaction)';
     } else {
+        submitBtn.style.display = 'inline-block';
         submitBtn.textContent = 'Mutate Ports (Atomic Transaction)';
     }
 
@@ -1363,15 +1485,15 @@ function renderEditPortRows() {
             <div class="port-input-row" id="edit-port-row-${row.id}">
                 <div class="port-field-group" style="flex: 1.5;">
                     <span class="field-mini-label">Bind IP</span>
-                    <input type="text" class="form-input" value="${row.hostIP}" placeholder="127.0.0.1" onchange="updateEditPortField(${row.id}, 'hostIP', this.value)"/>
+                    <input type="text" class="form-input" value="${escapeAttr(row.hostIP)}" placeholder="127.0.0.1" onchange="updateEditPortField(${row.id}, 'hostIP', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Host Port</span>
-                    <input type="number" class="form-input" value="${row.hostPort}" placeholder="8080" min="1" max="65535" oninput="updateEditPortField(${row.id}, 'hostPort', this.value)"/>
+                    <input type="number" class="form-input" value="${escapeAttr(row.hostPort)}" placeholder="8080" min="1" max="65535" oninput="updateEditPortField(${row.id}, 'hostPort', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Target Port</span>
-                    <input type="number" class="form-input" value="${row.containerPort}" placeholder="80" min="1" max="65535" oninput="updateEditPortField(${row.id}, 'containerPort', this.value)"/>
+                    <input type="number" class="form-input" value="${escapeAttr(row.containerPort)}" placeholder="80" min="1" max="65535" oninput="updateEditPortField(${row.id}, 'containerPort', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 0.8;">
                     <span class="field-mini-label">Proto</span>
@@ -1390,7 +1512,7 @@ function renderEditPortRows() {
                 </div>
             </div>
             ${row.statusText ? `
-                <div class="row-validation-msg ${row.statusLevel}">${row.statusText}</div>
+                <div class="row-validation-msg ${escapeAttr(row.statusLevel)}">${escapeHtml(row.statusText)}</div>
             ` : ''}
         `;
     }).join('');
@@ -1420,6 +1542,22 @@ function updateEditExposureWarning() {
     }
 }
 
+// Renders "<label> <code>path</code> (extra)" via safe DOM construction —
+// path is a filesystem path derived from container/Compose labels and must
+// never be interpolated into innerHTML.
+function setFileInfoLine(el, label, path, extra) {
+    el.textContent = '';
+    const strong = document.createElement('strong');
+    strong.textContent = label + ' ';
+    const code = document.createElement('code');
+    code.textContent = path || '';
+    el.appendChild(strong);
+    el.appendChild(code);
+    if (extra) {
+        el.appendChild(document.createTextNode(' (' + extra + ')'));
+    }
+}
+
 window.copyEditPortsSnippet = () => {
     if (currentEditSnippet) {
         copyText(currentEditSnippet, "Configuration snippet copied!");
@@ -1430,15 +1568,8 @@ window.submitPortMutation = async () => {
     const containerId = document.getElementById('edit-ports-container-id').value;
     const serviceName = document.getElementById('edit-ports-service-name').value;
     const unitName = document.getElementById('edit-ports-unit-name').value;
-    const adhocConfirm = document.getElementById('edit-ports-adhoc-confirm');
-    const isAdhoc = currentEditProvenance && currentEditProvenance.type === 'adhoc';
     const isQuadlet = currentEditProvenance && currentEditProvenance.type === 'quadlet';
     const isCompose = currentEditProvenance && currentEditProvenance.type === 'compose';
-
-    if (isAdhoc && (!adhocConfirm || !adhocConfirm.checked)) {
-        showNotification("Please check the confirmation box to proceed with recreating this unmanaged container.", true);
-        return;
-    }
 
     const structuredPorts = [];
     for (const row of editPortRows) {
@@ -1479,8 +1610,7 @@ window.submitPortMutation = async () => {
             res = await Podman.MutateContainerPorts({
                 containerId: containerId,
                 serviceName: serviceName,
-                newPorts: structuredPorts,
-                forceAdHoc: isAdhoc && adhocConfirm.checked
+                newPorts: structuredPorts
             });
         }
 
@@ -1489,12 +1619,14 @@ window.submitPortMutation = async () => {
             return;
         }
 
-        // Render steps log
+        // Render steps log. Step/message text originates from the backend
+        // transaction, but may echo container/file identifiers derived
+        // from labels — escape defensively rather than trust it.
         if (res.steps && res.steps.length > 0) {
             stepsList.innerHTML = res.steps.map(s => {
                 const color = s.passed ? 'var(--color-emerald)' : 'var(--color-rose)';
                 const icon = s.passed ? '&check;' : '&times;';
-                return `<div style="color: ${color};"><strong>${icon} [${s.step}]:</strong> ${s.message}</div>`;
+                return `<div style="color: ${color};"><strong>${icon} [${escapeHtml(s.step)}]:</strong> ${escapeHtml(s.message)}</div>`;
             }).join('');
         }
 
@@ -1523,6 +1655,8 @@ window.submitPortMutation = async () => {
                 if (currentTab === 'containers') loadContainers();
                 if (currentTab === 'ports') loadPorts();
             }, 1200);
+        } else if (res.manualRecoveryRequired) {
+            showNotification(`ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: ${res.rollbackReason || 'see transaction log above'}`, true);
         } else if (res.rolledBack) {
             showNotification(`Mutation aborted & rolled back: ${res.rollbackReason}`, true);
         } else {
@@ -1556,7 +1690,7 @@ window.viewContainerSpec = async (serviceName) => {
             return;
         }
         document.getElementById('spec-modal-title').textContent = `Declarative Spec: ${serviceName}`;
-        document.getElementById('spec-text').textContent = JSON.stringify(spec, null, 2);
+        document.getElementById('spec-text').textContent = JSON.stringify(withMaskedSecrets(spec), null, 2);
         openModal('spec-modal');
         showNotification("Spec loaded", false, true);
     } catch (err) {
@@ -1595,19 +1729,19 @@ window.openAdoptModal = async (containerId, containerName) => {
         }
 
         contentDiv.style.display = 'block';
-        previewPre.textContent = JSON.stringify(assessment.proposedSpec, null, 2);
+        previewPre.textContent = JSON.stringify(withMaskedSecrets(assessment.proposedSpec), null, 2);
 
         if (!assessment.canAdopt) {
             warningsBox.style.display = 'block';
             warningsBox.className = 'exposure-warning-banner';
-            warningsBox.innerHTML = `<strong>Adoption Blocked:</strong> ${assessment.blockers.join(' ')}`;
+            warningsBox.innerHTML = `<strong>Adoption Blocked:</strong> ${escapeHtml((assessment.blockers || []).join(' '))}`;
             submitBtn.disabled = true;
         } else {
             submitBtn.disabled = false;
             if (assessment.warnings && assessment.warnings.length > 0) {
                 warningsBox.style.display = 'block';
                 warningsBox.className = 'exposure-warning-banner';
-                warningsBox.innerHTML = `<strong>Adoption Notes:</strong><ul style="margin: 4px 0 0 16px; padding: 0;">${assessment.warnings.map(w => `<li>${w}</li>`).join('')}</ul>`;
+                warningsBox.innerHTML = `<strong>Adoption Notes:</strong><ul style="margin: 4px 0 0 16px; padding: 0;">${assessment.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`;
             } else {
                 warningsBox.style.display = 'none';
             }
@@ -1914,7 +2048,7 @@ window.loadNetworks = async () => {
         renderNetworksList(allNetworks);
     } catch (err) {
         showNotification(`Failed to load networks: ${err}`, true);
-        listContainer.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: var(--color-rose);">Error loading networks: ${err}</div>`;
+        listContainer.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: var(--color-rose);">Error loading networks: ${escapeHtml(String(err))}</div>`;
     }
 };
 
@@ -1934,14 +2068,14 @@ window.renderNetworksList = (networks) => {
     listContainer.innerHTML = networks.map(net => {
         const isDefault = (net.name === 'podman' || net.name === 'default');
         const subnetsHtml = (net.subnets && net.subnets.length > 0)
-            ? net.subnets.map(s => `<code>${s.subnet}</code>${s.gateway ? ` <span style="color: var(--text-muted); font-size: 11px;">(gw: ${s.gateway})</span>` : ''}`).join(', ')
+            ? net.subnets.map(s => `<code>${escapeHtml(s.subnet)}</code>${s.gateway ? ` <span style="color: var(--text-muted); font-size: 11px;">(gw: ${escapeHtml(s.gateway)})</span>` : ''}`).join(', ')
             : '<span style="color: var(--text-muted);">Auto / None</span>';
 
         const endpointsHtml = (net.connectedContainers && net.connectedContainers.length > 0)
             ? net.connectedContainers.map(c => `
                 <div style="display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; background: rgba(255, 255, 255, 0.03); border-radius: var(--radius-sm); font-size: 12px; margin-top: 4px;">
                     <span style="font-weight: 500; color: var(--text-main);">${escapeHtml(c.name)}</span>
-                    <span style="font-family: var(--font-mono); color: #6ee7b7;">${c.ipv4Address || c.ipv6Address || '-'}</span>
+                    <span style="font-family: var(--font-mono); color: #6ee7b7;">${escapeHtml(c.ipv4Address || c.ipv6Address || '-')}</span>
                 </div>
             `).join('')
             : '<div style="font-size: 12px; color: var(--text-muted); font-style: italic; padding: 4px 0;">No active endpoints</div>';
@@ -1952,14 +2086,14 @@ window.renderNetworksList = (networks) => {
                     <div>
                         <div style="display: flex; align-items: center; gap: 8px;">
                             <span class="card-title">${escapeHtml(net.name)}</span>
-                            <span class="prov-badge ${net.driver === 'bridge' ? 'podder' : 'adhoc'}">${net.driver || 'bridge'}</span>
+                            <span class="prov-badge ${net.driver === 'bridge' ? 'podder' : 'adhoc'}">${escapeHtml(net.driver || 'bridge')}</span>
                             ${isDefault ? `<span class="prov-badge quadlet" style="font-size: 10px;">DEFAULT</span>` : ''}
                         </div>
-                        <div class="card-subtitle">ID: ${(net.id || '').substring(0, 12)}</div>
+                        <div class="card-subtitle">ID: ${escapeHtml((net.id || '').substring(0, 12))}</div>
                     </div>
                     <div style="display: flex; gap: 4px;">
                         ${!isDefault ? `
-                            <button class="btn btn-danger btn-icon" onclick="removeNetwork('${escapeHtml(net.name)}')" title="Remove Network">
+                            <button class="btn btn-danger btn-icon" onclick="removeNetwork('${jsStringLiteral(net.name)}')" title="Remove Network">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                             </button>
                         ` : ''}

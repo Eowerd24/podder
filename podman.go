@@ -13,19 +13,47 @@ import (
 )
 
 // PodmanService handles execution of Podman CLI commands and parsing of JSON outputs.
-type PodmanService struct{}
+type PodmanService struct {
+	// runner executes external commands. The zero value (nil) falls back to
+	// the real host executor in production; tests inject a scripted fake so
+	// every failure point of a transaction can be exercised deterministically.
+	runner CommandRunner
+	// lookPath resolves which compose provider binary is on PATH. The zero
+	// value (nil) falls back to exec.LookPath in production; tests inject a
+	// scripted fake so Compose mutation is exercisable without a real
+	// podman-compose/docker-compose install.
+	lookPath lookPathFunc
+}
+
+// cmdRunner returns the configured CommandRunner, falling back to the real
+// host executor when none was injected.
+func (p *PodmanService) cmdRunner() CommandRunner {
+	if p.runner != nil {
+		return p.runner
+	}
+	return defaultCommandRunner
+}
+
+// lookPathFn returns the configured lookPathFunc, falling back to the real
+// exec.LookPath when none was injected.
+func (p *PodmanService) lookPathFn() lookPathFunc {
+	if p.lookPath != nil {
+		return p.lookPath
+	}
+	return exec.LookPath
+}
 
 var supportedImageExtensions = map[string]struct{}{
-	".avif":  {},
-	".bmp":   {},
-	".gif":   {},
-	".jpeg":  {},
-	".jpg":   {},
-	".png":   {},
-	".svg":   {},
-	".tif":   {},
-	".tiff":  {},
-	".webp":  {},
+	".avif": {},
+	".bmp":  {},
+	".gif":  {},
+	".jpeg": {},
+	".jpg":  {},
+	".png":  {},
+	".svg":  {},
+	".tif":  {},
+	".tiff": {},
+	".webp": {},
 }
 
 // rawPodmanPort represents port structure in raw Podman JSON.
@@ -103,12 +131,7 @@ type SystemInfo struct {
 
 // runCommand runs a Podman command with arguments.
 func (p *PodmanService) runCommand(args ...string) (string, string, error) {
-	cmd := exec.Command("podman", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
+	return p.cmdRunner().Run("podman", args...)
 }
 
 // GetSystemInfo fetches information about the Podman host and storage.
@@ -380,181 +403,178 @@ func (p *PodmanService) PullImage(name string) error {
 	return nil
 }
 
-// RunContainer runs a container from an image with optional configuration.
-func (p *PodmanService) RunContainer(image string, name string, ports string, cmd string, hostPath string, containerPath string, readOnly bool) error {
-	args, err := buildRunContainerArgs(image, name, ports, cmd, hostPath, containerPath, readOnly)
-	if err != nil {
-		return err
-	}
-
-	_, stderr, err := p.runCommand(args...)
-	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(stderr))
-	}
-	return nil
+// ContainerCreateRequest is the full request for creating a new container.
+// Managed explicitly controls whether the workload becomes Podder-managed —
+// it is never inferred from the presence of port mappings or any other
+// field.
+type ContainerCreateRequest struct {
+	Image        string            `json:"image"`
+	Name         string            `json:"name"`
+	Managed      bool              `json:"managed"`
+	PortMappings []PortMapping     `json:"portMappings"`
+	Binds        []BindMountSpec   `json:"binds"`
+	Env          map[string]string `json:"env"`
+	// Command accepts either a JSON array (preferred) or a single
+	// shell-style string (tokenized via SplitShellCommand, e.g. from a
+	// free-text "Command" field in the Run Container UI) — see
+	// CommandArgv's UnmarshalJSON.
+	Command    CommandArgv `json:"command"`
+	Entrypoint []string    `json:"entrypoint"`
 }
 
-// RunContainerWithPortMappings runs a container from an image with structured port mappings.
-func (p *PodmanService) RunContainerWithPortMappings(image string, name string, portMappings []PortMapping, cmd string, hostPath string, containerPath string, readOnly bool) error {
-	args, err := buildRunContainerArgsWithMappings(image, name, portMappings, cmd, hostPath, containerPath, readOnly)
-	if err != nil {
-		return err
-	}
-
-	_, stderr, err := p.runCommand(args...)
-	if err != nil {
-		return fmt.Errorf("%s", strings.TrimSpace(stderr))
-	}
-
-	// Auto-persist declarative spec if a workload name was provided
-	trimmedName := strings.TrimSpace(name)
-	if trimmedName != "" {
-		var binds []BindMountSpec
-		if hostPath != "" && containerPath != "" {
-			binds = append(binds, BindMountSpec{
-				HostPath:      hostPath,
-				ContainerPath: containerPath,
-				ReadOnly:      readOnly,
-			})
-		}
-		_ = p.SaveSpec(ContainerSpec{
-			Name:         trimmedName,
-			Image:        image,
-			PortMappings: portMappings,
-			Binds:        binds,
-			Command:      cmd,
-		})
-	}
-
-	return nil
+// ContainerCreateResult reports the outcome of a container creation request.
+type ContainerCreateResult struct {
+	Success     bool   `json:"success"`
+	ContainerID string `json:"containerId"`
+	Managed     bool   `json:"managed"`
+	Message     string `json:"message,omitempty"`
 }
 
-func buildPortArg(m PortMapping) string {
-	proto := strings.ToLower(strings.TrimSpace(m.Protocol))
-	if proto == "" {
-		proto = "tcp"
+// CreateContainer creates a new container from an explicit request. It is
+// the single entry point for both managed and unmanaged creation:
+//
+//  1. validate the requested spec (pure, local checks)
+//  2. run final backend validation on every port mapping (registry/runtime
+//     collisions cannot be bypassed by calling this method directly, and
+//     mappings are checked against each other within the same request)
+//  3. build the exact run arguments via BuildRunArgsFromSpec
+//  4. if Managed, persist a candidate spec BEFORE creating the container
+//  5. create the container
+//  6. verify it exists with the expected identity
+//  7. commit the candidate spec (rename into place) — a container is never
+//     left labeled io.podder.managed=true without a matching authoritative
+//     spec on disk, and a spec is never committed for a container that
+//     doesn't exist
+//
+// Unmanaged creation remains fully supported: Managed=false simply skips
+// steps 4 and 7, and no io.podder.managed label is ever applied.
+func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerCreateResult, error) {
+	spec := ContainerSpec{
+		SchemaVersion: CurrentSpecSchemaVersion,
+		Name:          strings.TrimSpace(req.Name),
+		Image:         strings.TrimSpace(req.Image),
+		Managed:       req.Managed,
+		PortMappings:  req.PortMappings,
+		Binds:         req.Binds,
+		Env:           req.Env,
+		Command:       req.Command,
+		Entrypoint:    req.Entrypoint,
 	}
-	hostIP := strings.TrimSpace(m.HostIP)
-	if hostIP != "" && hostIP != "0.0.0.0" && hostIP != "*" {
-		return fmt.Sprintf("%s:%d:%d/%s", hostIP, m.HostPort, m.ContainerPort, proto)
-	}
-	if m.HostPort != 0 {
-		return fmt.Sprintf("%d:%d/%s", m.HostPort, m.ContainerPort, proto)
-	}
-	return fmt.Sprintf("%d/%s", m.ContainerPort, proto)
-}
 
-func buildRunContainerArgsWithMappings(image string, name string, portMappings []PortMapping, cmd string, hostPath string, containerPath string, readOnly bool) ([]string, error) {
-	image = strings.TrimSpace(image)
-	if image == "" {
-		return nil, fmt.Errorf("image name cannot be empty")
+	if errs := ValidateSpec(spec); len(errs) > 0 {
+		return nil, fmt.Errorf("invalid container spec: %s", strings.Join(errs, "; "))
 	}
 
-	args := []string{"run", "-d"}
-
-	name = strings.TrimSpace(name)
-	if name != "" {
-		args = append(args, "--name", name)
-		args = append(args, "--label", "io.podder.managed=true")
-		args = append(args, "--label", "io.podder.service="+name)
-	} else {
-		args = append(args, "--label", "io.podder.managed=true")
+	if err := p.validateMappingsForCreate(spec.PortMappings); err != nil {
+		return nil, err
 	}
 
-	for _, m := range portMappings {
-		if m.ContainerPort > 0 {
-			args = append(args, "-p", buildPortArg(m))
+	args, err := BuildRunArgsFromSpec(spec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build run arguments: %w", err)
+	}
+
+	var candidatePath string
+	if spec.Managed {
+		candidatePath, err = writeCandidateSpec(spec)
+		if err != nil {
+			return nil, fmt.Errorf("failed to persist candidate spec: %w", err)
 		}
 	}
 
-	hostPath = strings.TrimSpace(hostPath)
-	containerPath = strings.TrimSpace(containerPath)
-	if hostPath == "" && containerPath != "" {
-		return nil, fmt.Errorf("host path is required when a container mount path is provided")
+	stdout, stderr, err := p.runCommand(args...)
+	if err != nil {
+		discardCandidateSpec(candidatePath)
+		return nil, fmt.Errorf("failed to create container: %v (stderr: %s)", err, strings.TrimSpace(stderr))
 	}
-	if hostPath != "" && containerPath == "" {
-		return nil, fmt.Errorf("container mount path is required when a host path is provided")
-	}
-	if hostPath != "" {
-		if _, err := os.Stat(hostPath); err != nil {
-			return nil, fmt.Errorf("host path is not accessible: %w", err)
+
+	containerID := strings.TrimSpace(stdout)
+	result := &ContainerCreateResult{ContainerID: containerID}
+
+	if spec.Managed {
+		if !p.containerExistsByIdentity(containerID, spec.Name) {
+			discardCandidateSpec(candidatePath)
+			_ = p.RemoveContainer(containerID)
+			return nil, fmt.Errorf("container failed to verify after creation; managed state was not committed and the container was removed")
 		}
-
-		mountSpec := fmt.Sprintf("type=bind,src=%s,target=%s", hostPath, containerPath)
-		if readOnly {
-			mountSpec += ",readonly"
+		if err := commitCandidateSpec(candidatePath, spec); err != nil {
+			discardCandidateSpec(candidatePath)
+			_ = p.RemoveContainer(containerID)
+			return nil, fmt.Errorf("failed to commit managed spec, container removed to avoid an unmanaged-but-labeled state: %w", err)
 		}
-		args = append(args, "--mount", mountSpec)
 	}
 
-	args = append(args, image)
-
-	cmd = strings.TrimSpace(cmd)
-	if cmd != "" {
-		args = append(args, strings.Fields(cmd)...)
-	}
-
-	return args, nil
+	result.Success = true
+	result.Managed = spec.Managed
+	result.Message = "Container created successfully."
+	return result, nil
 }
 
-func buildRunContainerArgs(image string, name string, ports string, cmd string, hostPath string, containerPath string, readOnly bool) ([]string, error) {
-	image = strings.TrimSpace(image)
-	if image == "" {
-		return nil, fmt.Errorf("image name cannot be empty")
+// containerExistsByIdentity verifies a just-created container is visible to
+// Podman under the expected ID (or name), used as the "verify" step before
+// committing managed state.
+func (p *PodmanService) containerExistsByIdentity(containerID, name string) bool {
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return false
 	}
-
-	args := []string{"run", "-d"}
-
-	name = strings.TrimSpace(name)
-	if name != "" {
-		args = append(args, "--name", name)
-	}
-
-	ports = strings.TrimSpace(ports)
-	if ports != "" {
-		portItems := strings.FieldsFunc(ports, func(r rune) bool {
-			return r == ',' || r == ' ' || r == ';'
-		})
-		if len(portItems) > 0 {
-			for _, pItem := range portItems {
-				pTrimmed := strings.TrimSpace(pItem)
-				if pTrimmed != "" {
-					args = append(args, "-p", pTrimmed)
+	for _, c := range containers {
+		if c.Id == containerID || (containerID != "" && strings.HasPrefix(c.Id, containerID)) {
+			return true
+		}
+		if name != "" {
+			for _, n := range c.Names {
+				if strings.TrimPrefix(n, "/") == name {
+					return true
 				}
 			}
-		} else {
-			args = append(args, "-p", ports)
 		}
 	}
+	return false
+}
 
-	hostPath = strings.TrimSpace(hostPath)
-	containerPath = strings.TrimSpace(containerPath)
-	if hostPath == "" && containerPath != "" {
-		return nil, fmt.Errorf("host path is required when a container mount path is provided")
-	}
-	if hostPath != "" && containerPath == "" {
-		return nil, fmt.Errorf("container mount path is required when a host path is provided")
-	}
-	if hostPath != "" {
-		if _, err := os.Stat(hostPath); err != nil {
-			return nil, fmt.Errorf("host path is not accessible: %w", err)
+// validateMappingsForCreate performs the final, mandatory backend validation
+// of every requested port mapping immediately before it is ever handed to
+// Podman: each mapping must independently pass ValidatePortMapping (which
+// checks registry reservations and live runtime collisions), and mappings
+// must not conflict with one another within the same request. This cannot
+// be bypassed by calling CreateContainer directly through the Wails bridge —
+// frontend validation is advisory only.
+func (p *PodmanService) validateMappingsForCreate(mappings []PortMapping) error {
+	var seen []PortClaim
+	for _, m := range mappings {
+		req := PortMappingRequest{
+			HostIP:        m.HostIP,
+			HostPort:      m.HostPort,
+			ContainerPort: m.ContainerPort,
+			Protocol:      m.Protocol,
+		}
+		valResult, err := p.ValidatePortMapping(req)
+		if err != nil {
+			return fmt.Errorf("failed to validate port mapping %s: %w", m.DisplayString(), err)
+		}
+		if valResult == nil || !valResult.Valid {
+			msg := "invalid port mapping"
+			if valResult != nil {
+				for _, c := range valResult.Checks {
+					if !c.Passed {
+						msg = c.Message
+						break
+					}
+				}
+			}
+			return fmt.Errorf("port mapping %s rejected: %s", m.DisplayString(), msg)
 		}
 
-		mountSpec := fmt.Sprintf("type=bind,src=%s,target=%s", hostPath, containerPath)
-		if readOnly {
-			mountSpec += ",readonly"
+		if m.HostPort != 0 {
+			candidate := PortClaim{Address: m.HostIP, Port: m.HostPort, Protocol: m.Protocol, RangeSize: m.RangeSize}
+			if conflict := FindConflict(seen, candidate, ""); conflict != nil {
+				return fmt.Errorf("port mapping %s conflicts with another mapping in this same request", m.DisplayString())
+			}
+			seen = append(seen, candidate)
 		}
-		args = append(args, "--mount", mountSpec)
 	}
-
-	args = append(args, image)
-
-	cmd = strings.TrimSpace(cmd)
-	if cmd != "" {
-		args = append(args, strings.Fields(cmd)...)
-	}
-
-	return args, nil
+	return nil
 }
 
 func isSupportedImageFile(path string) bool {
@@ -619,28 +639,23 @@ func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
 		dir = filepath.Dir(path)
 	}
 
-	var composeCmd *exec.Cmd
-	if _, err := exec.LookPath("podman-compose"); err == nil {
-		if action == "up" {
-			composeCmd = exec.Command("podman-compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("podman-compose", "down")
-		}
-	} else if _, err := exec.LookPath("docker-compose"); err == nil {
-		if action == "up" {
-			composeCmd = exec.Command("docker-compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("docker-compose", "down")
-		}
-	} else {
-		// Fallback to "podman compose"
-		if action == "up" {
-			composeCmd = exec.Command("podman", "compose", "up", "-d")
-		} else {
-			composeCmd = exec.Command("podman", "compose", "down")
-		}
+	// Reuse the exact same provider resolution and readiness preflight as
+	// CLI passthrough and Compose mutation, instead of a third hand-rolled
+	// implementation with its own (previously buggy) argv construction.
+	provider, err := resolveComposeProviderWithLookPath(action, p.lookPathFn())
+	if err != nil {
+		return "", err
+	}
+	if err := ensureComposeProviderReady(provider); err != nil {
+		return "", err
 	}
 
+	verb, extra, err := composeVerbAndArgs(action)
+	if err != nil {
+		return "", err
+	}
+
+	composeCmd := exec.Command(provider.path, provider.BuildArgs("", verb, extra, "")...)
 	composeCmd.Dir = dir
 
 	output, err := composeCmd.CombinedOutput()

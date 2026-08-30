@@ -10,9 +10,9 @@ version: "1.2.0"
 section: "default"
 priority: "extra"
 maintainer: ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>
-description: "A podder application"
-vendor: "My Company"
-homepage: "https://wails.io"
+description: "A lightweight desktop GUI and CLI for managing local Podman containers, images, and Compose/Quadlet workloads"
+vendor: "Podder"
+homepage: "https://github.com/Eowerd24/podder"
 license: "MIT"
 release: "1"
 

@@ -2,6 +2,21 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8"/>
+    <!--
+        Content-Security-Policy: restricts the WebView to same-origin
+        resources — no remote scripts, styles, images, fonts, or fetch/XHR
+        targets, and no <object>/<embed>, framing, or off-origin form
+        submission. This is a Wails-embedded app with no CDN or remote API
+        dependencies, so 'self' is sufficient for every resource type.
+        script-src/style-src still include 'unsafe-inline' because the UI
+        currently uses inline onclick="" handlers and style="" attributes
+        throughout; CSP event-handler attributes cannot be allow-listed via
+        nonce/hash the way <script> tags can, so removing 'unsafe-inline'
+        would require first migrating those handlers to
+        addEventListener-based binding. Treat this as the safe interim
+        policy alongside that outstanding refactor, not a substitute for it.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';"/>
     <link rel="icon" type="image/svg+xml" href="/wails.png"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
     <link rel="stylesheet" href="/style.css"/>
@@ -536,14 +551,6 @@
                             <!-- Dynamically managed port rows -->
                         </div>
                         <div id="edit-ports-exposure-warning" class="exposure-warning-banner" style="display: none;"></div>
-                    </div>
-
-                    <!-- Ad-Hoc Confirmation Checkbox -->
-                    <div id="edit-ports-adhoc-confirm-box" style="display: none; margin-top: 12px; padding: 10px; border-radius: var(--radius-sm); background: rgba(244, 63, 94, 0.08); border: 1px solid rgba(244, 63, 94, 0.2);">
-                        <label class="checkbox-row" style="margin-bottom: 0;">
-                            <input type="checkbox" id="edit-ports-adhoc-confirm"/>
-                            <span style="font-size: 12px; color: #fecdd3;">I understand this unmanaged container will be recreated and unmounted ephemeral data will be lost.</span>
-                        </label>
                     </div>
 
                     <!-- Mutation Transaction Steps Log -->

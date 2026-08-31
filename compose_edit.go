@@ -358,10 +358,12 @@ func (p *PodmanService) InspectCompose(containerID string) (*ComposeFileDetails,
 	}
 
 	content := string(data)
-	ports, err := ParseComposePorts(content, serviceName)
-	if err != nil {
-		return nil, err
-	}
+	// InspectCompose is a read-only display helper, not the (already
+	// disabled) mutation path: a service whose ports: use YAML aliases,
+	// ${VAR} interpolation, or another unrepresentable construct should
+	// still return the compose file's location/content rather than fail
+	// outright — the caller degrades to already-known live Podman ports.
+	ports, _ := ParseComposePorts(content, serviceName)
 
 	return &ComposeFileDetails{
 		ContainerID:  target.Id,

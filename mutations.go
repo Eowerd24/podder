@@ -463,7 +463,17 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 
 	stdout, stderr, err := p.runCommand(createArgs...)
 	if err != nil {
-		return fail("CONTAINER_CREATE", fmt.Sprintf("Failed to create replacement container: %v (stderr: %s)", err, strings.TrimSpace(stderr)), false)
+		// Podman can report a create/run failure (e.g. the OCI runtime
+		// failing to start the container) after the container object was
+		// nonetheless created under containerName. Detect that so
+		// executeRollback actually stops/removes the leftover candidate
+		// instead of assuming there is nothing to clean up and then
+		// colliding with it when renaming the backup back.
+		candidateWasCreated := p.containerExistsByIdentity(strings.TrimSpace(stdout), containerName)
+		if candidateWasCreated {
+			candidateID = containerName
+		}
+		return fail("CONTAINER_CREATE", fmt.Sprintf("Failed to create replacement container: %v (stderr: %s)", err, strings.TrimSpace(stderr)), candidateWasCreated)
 	}
 
 	newContainerID := strings.TrimSpace(stdout)
@@ -530,15 +540,25 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		result.ListenerObserved = allObserved
 
 		if _, hasHealthcheck := p.containerHealthStatus(newContainer.Id); hasHealthcheck {
-			healthy := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			var finalStatus string
+			pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
 				s, ok := p.containerHealthStatus(newContainer.Id)
+				if ok {
+					finalStatus = s
+				}
 				return ok && s == "healthy"
 			})
-			if healthy {
+			switch finalStatus {
+			case "healthy":
 				result.HealthVerified = true
-			} else {
-				finalStatus, _ := p.containerHealthStatus(newContainer.Id)
-				return fail("PORT_VERIFY", fmt.Sprintf("Replacement container healthcheck did not become healthy within the verification window (final status: %q).", finalStatus), true)
+			case "unhealthy":
+				return fail("PORT_VERIFY", fmt.Sprintf("Replacement container healthcheck reports unhealthy (final status: %q).", finalStatus), true)
+			default:
+				// Still "starting" (or unknown) after the bounded wait:
+				// recorded as unverified (HealthVerified stays false), but
+				// not treated as fatal — many real healthchecks have a
+				// start_period far longer than this poll window, and
+				// "not yet verified" is not the same as "unhealthy".
 			}
 		}
 	}

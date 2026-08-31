@@ -559,8 +559,15 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 
 	stdout, stderr, err := p.runCommand(createArgs...)
 	if err != nil {
+		// Podman can report a create/run failure (e.g. the OCI runtime
+		// failing to start the container) after the container object was
+		// nonetheless created under serviceName. Detect that so
+		// executeRollback actually stops/removes the leftover candidate
+		// instead of assuming there is nothing to clean up and then
+		// colliding with it when renaming the backup back.
 		discardCandidateSpec(candidatePath)
-		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, false)
+		candidateWasCreated := p.containerExistsByIdentity(strings.TrimSpace(stdout), serviceName)
+		rb := p.executeRollback(backupName, assessment.ContainerName, serviceName, target.Id, originalLifecycle, candidateWasCreated)
 		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed to recreate container: %v (stderr: %s).", err, strings.TrimSpace(stderr))), nil
 	}
 	newContainerID := strings.TrimSpace(stdout)

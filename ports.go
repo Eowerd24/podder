@@ -670,6 +670,14 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 
 	// 3. Load external registry if enabled
 	settings, _ := p.GetSettings()
+	if settings == nil {
+		// GetSettings fails closed (nil, err) on an unreadable/corrupted
+		// config.json; fall back to an empty settings value so the rest of
+		// this function can keep dereferencing settings.* without a nil
+		// panic. The registry simply reports as not loaded, which is the
+		// correct degraded state.
+		settings = &AppSettings{}
+	}
 	var registryResult *PortRegistryResult
 	if settings != nil && settings.PortRegistry.Enabled && settings.PortRegistry.Path != "" {
 		registryResult, _ = p.LoadPortRegistry(settings.PortRegistry.Path)

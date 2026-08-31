@@ -478,7 +478,18 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 	if spec.Managed {
 		resolved, resolveErr := p.resolveImageID(spec.Image)
 		if resolveErr != nil {
-			return nil, fmt.Errorf("managed creation requires an immutable image identity: %w", resolveErr)
+			// `podman image inspect` never pulls, unlike `podman run`,
+			// which would auto-pull an image not yet present locally.
+			// Reproduce that for managed creates too instead of failing
+			// outright on the ordinary "first managed container from this
+			// image" flow — pull once, then retry resolution.
+			if pullErr := p.PullImage(spec.Image); pullErr != nil {
+				return nil, fmt.Errorf("managed creation requires an immutable image identity, and the image could not be pulled: %v (original inspect error: %v)", pullErr, resolveErr)
+			}
+			resolved, resolveErr = p.resolveImageID(spec.Image)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("managed creation requires an immutable image identity: %w", resolveErr)
+			}
 		}
 		spec.ResolvedImage = resolved
 		spec.ReplayComplete = true
@@ -533,7 +544,17 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 	}
 
 	if spec.Managed {
-		if !p.verifyCreatedManagedContainer(result.ContainerID, spec) {
+		// Bounded-poll this exactly like every other equivalent
+		// post-create verification in this codebase (DeploySpec,
+		// MutateContainerPorts, AdoptContainer, and even the removal
+		// check in cleanupFailedManagedCreate below) — a single immediate
+		// snapshot risks losing a race against Podman settling the new
+		// container's lifecycle/port state and destroying a container
+		// that was actually created successfully.
+		verified := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			return p.verifyCreatedManagedContainer(result.ContainerID, spec)
+		})
+		if !verified {
 			return cleanupFailedManagedCreate("Container failed post-create verification: exact ID, name, lifecycle, image identity, managed labels, or configured ports did not match the candidate spec.")
 		}
 		if err := p.commitCandidate(candidatePath, spec); err != nil {

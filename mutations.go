@@ -41,6 +41,12 @@ type RollbackResult struct {
 	// "rolled back successfully" unless this is true.
 	Verified bool     `json:"verified"`
 	Errors   []string `json:"errors,omitempty"`
+	// Notes carries non-fatal, informational observations from the
+	// rollback (e.g. a redundant start command returning an error on a
+	// container that turned out to already be running) that must NOT by
+	// themselves fail Verified — only the actual final observed state
+	// (RestoredName/RestoredLifecycle/RemovedCandidate) decides that.
+	Notes []string `json:"notes,omitempty"`
 }
 
 // PortMutationResult contains the outcome of an atomic port mutation transaction.
@@ -386,8 +392,23 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		Message: fmt.Sprintf("Candidate spec staged; backup identity reserved as %s. Current known-good spec untouched.", backupName),
 	})
 
+	// quiesced tracks whether the original container was actually renamed
+	// out of the way yet. If the very first QUIESCE step (the rename)
+	// fails, the original container was never touched — there is no
+	// backup to roll back from, and attempting one anyway would rename a
+	// nonexistent backup name back, which fails and spuriously reports
+	// "ROLLBACK FAILED / MANUAL RECOVERY REQUIRED" for a workload that
+	// was never at risk. Every failure from QUIESCE onward that actually
+	// happens after the rename must still trigger real rollback.
+	quiesced := false
+
 	fail := func(step, message string, candidateWasCreated bool) (*PortMutationResult, error) {
 		discardCandidateSpec(candidatePath)
+		if !quiesced {
+			result.RollbackReason = message
+			result.Steps = append(result.Steps, PortMutationStepResult{Step: step, Passed: false, Message: message})
+			return result, nil
+		}
 		rb := p.executeRollback(backupName, containerName, containerName, originalLifecycle, candidateWasCreated)
 		result.Rollback = rb
 		result.RollbackReason = message
@@ -409,6 +430,7 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 	if _, _, err := p.runCommand("rename", containerName, backupName); err != nil {
 		return fail("QUIESCE", fmt.Sprintf("Failed to rename existing container to backup: %v", err), false)
 	}
+	quiesced = true
 
 	if originalLifecycle == lifecycleRunning {
 		if err := p.StopContainer(backupName); err != nil {
@@ -735,7 +757,15 @@ func (p *PodmanService) executeRollback(backupName, originalName, candidateName,
 
 	if originalLifecycle == lifecycleRunning {
 		if err := p.StartContainer(originalName); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("failed to restart original container %q: %v", originalName, err))
+			// A start command returning an error is not itself fatal —
+			// Podman may report one for a container that is already
+			// running (a redundant/idempotent start), or a race with the
+			// rename above. What actually matters is the container's
+			// REAL observed state, checked below; recording this as an
+			// Error here would make a successfully-restored, already-
+			// running original be reported as a failed rollback merely
+			// because a redundant command returned non-nil.
+			result.Notes = append(result.Notes, fmt.Sprintf("start command for original container %q returned an error (verifying actual state before deciding outcome): %v", originalName, err))
 		}
 	}
 

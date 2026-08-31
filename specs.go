@@ -337,45 +337,400 @@ func (p *PodmanService) DeleteSpec(name string) error {
 	return nil
 }
 
+// DeploySpecResult reports the outcome of a DeploySpec transaction. It
+// follows the same honesty rules as PortMutationResult: Success is only
+// ever true after the workload was actually verified, and a failure from
+// QUIESCE onward is either a truthfully-verified rollback or an explicit
+// ManualRecoveryRequired — never a silent "probably fine".
+type DeploySpecResult struct {
+	Success bool `json:"success"`
+	// ContainerID is the new/current container's ID: the freshly-created
+	// one when there was no existing container to replace, or the
+	// replacement's ID once CREATE succeeds.
+	ContainerID string `json:"containerId,omitempty"`
+	// OldContainerID is set only when an existing container occupying the
+	// spec's name was found and replaced.
+	OldContainerID         string                   `json:"oldContainerId,omitempty"`
+	Replaced               bool                     `json:"replaced"`
+	RolledBack             bool                     `json:"rolledBack"`
+	RollbackReason         string                   `json:"rollbackReason,omitempty"`
+	Rollback               *RollbackResult          `json:"rollback,omitempty"`
+	ManualRecoveryRequired bool                     `json:"manualRecoveryRequired,omitempty"`
+	BackupContainerName    string                   `json:"backupContainerName,omitempty"`
+	Steps                  []PortMutationStepResult `json:"steps"`
+	ConfigurationVerified  bool                     `json:"configurationVerified,omitempty"`
+	ListenerObserved       bool                     `json:"listenerObserved,omitempty"`
+	HealthVerified         bool                     `json:"healthVerified,omitempty"`
+	// CleanupWarning is set when the deployment itself committed
+	// successfully but a purely cosmetic follow-up (removing the backup
+	// container) failed. It must never be confused with the transaction
+	// itself failing — Success stays true.
+	CleanupWarning string `json:"cleanupWarning,omitempty"`
+}
+
 // DeploySpec recreates and runs a container from its stored declarative
 // specification, using the single authoritative BuildRunArgsFromSpec
 // builder so replay is exact: every bind, every environment variable, the
 // full command argv, and all published ports are applied — not just the
 // first bind, and not a spec with Env silently ignored.
-func (p *PodmanService) DeploySpec(name string) (string, error) {
+//
+// This is fully transactional, mirroring MutateContainerPorts and reusing
+// its same primitives (classifyLifecycle, newBackupName, pollUntil,
+// portMappingSetEqual, executeRollback):
+//
+//	PREFLIGHT  - load + migrate the spec, validate it, resolve any existing
+//	             container occupying its name, capture that container's
+//	             lifecycle, and prove the candidate spec builds into valid
+//	             run/create arguments and passes final port-collision
+//	             validation — all before touching anything.
+//	SNAPSHOT   - compute a collision-resistant backup name.
+//	QUIESCE    - rename the existing container out of the way and stop it
+//	             if it was running, verifying the stop.
+//	CREATE     - recreate entirely from the authoritative spec, preserving
+//	             the existing container's original lifecycle.
+//	VERIFY     - identity, expected lifecycle, exact port mappings, and
+//	             (for a Managed spec) the expected Podder labels; for a
+//	             running replacement, best-effort listener/health evidence.
+//	COMMIT     - remove the backup container.
+//	ROLLBACK   - on any failure from QUIESCE onward, restore the original
+//	             container's name and lifecycle and report a structured,
+//	             truthfully-verified RollbackResult. The backup is never
+//	             deleted unless rollback is verified successful, and if the
+//	             very first QUIESCE step (the rename) itself fails, nothing
+//	             was ever moved — this is reported directly, without
+//	             attempting (and spuriously failing) a rollback that has
+//	             nothing to restore.
+//
+// If no existing container occupies the spec's name, there is nothing to
+// quiesce or roll back: creation uses the simpler managed-creation path
+// (build, run, verify) instead. Never remove the only working instance
+// before proving the candidate is replayable.
+func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
+	result := &DeploySpecResult{Steps: []PortMutationStepResult{}}
+
 	spec, err := p.GetSpec(name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if errs := ValidateSpec(*spec); len(errs) > 0 {
-		return "", fmt.Errorf("stored spec for %s failed validation, refusing to deploy: %s", name, strings.Join(errs, "; "))
+		result.Steps = append(result.Steps, PortMutationStepResult{
+			Step: "PREFLIGHT", Passed: false,
+			Message: fmt.Sprintf("Stored spec for %q failed validation, refusing to deploy: %s", name, strings.Join(errs, "; ")),
+		})
+		return result, nil
 	}
 
-	// 1. If an existing container with this name is running, stop and remove it
-	containers, _ := p.ListContainers(true)
-	for _, c := range containers {
-		for _, cName := range c.Names {
-			if strings.TrimPrefix(cName, "/") == spec.Name {
-				_ = p.StopContainer(c.Id)
-				_ = p.RemoveContainer(c.Id)
-				break
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect local containers: %w", err)
+	}
+	target := findContainerByName(containers, spec.Name)
+
+	if target == nil {
+		return p.deployFreshFromSpec(*spec, result)
+	}
+
+	return p.redeployReplacingContainer(*spec, target, result)
+}
+
+// deployFreshFromSpec handles DeploySpec when no existing container
+// occupies the spec's name: there is nothing to quiesce or roll back to, so
+// the simpler managed-creation path applies. A container that fails to
+// verify is removed rather than left behind unverified.
+func (p *PodmanService) deployFreshFromSpec(spec ContainerSpec, result *DeploySpecResult) (*DeploySpecResult, error) {
+	if err := p.validateMappingsForMutation(spec.PortMappings, ""); err != nil {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: err.Error()})
+		return result, nil
+	}
+	if _, err := BuildRunArgsFromSpec(spec); err != nil {
+		result.Steps = append(result.Steps, PortMutationStepResult{
+			Step: "PREFLIGHT", Passed: false,
+			Message: fmt.Sprintf("Stored spec is not replayable: %v", err),
+		})
+		return result, nil
+	}
+	result.Steps = append(result.Steps, PortMutationStepResult{
+		Step: "PREFLIGHT", Passed: true,
+		Message: "No existing container occupies this name; deploying fresh from the authoritative spec.",
+	})
+
+	args, err := BuildRunArgsFromSpec(spec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build run arguments from spec: %w", err)
+	}
+	stdout, stderr, err := p.runCommand(args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run container from spec: %v, stderr: %s", err, strings.TrimSpace(stderr))
+	}
+	containerID := strings.TrimSpace(stdout)
+	result.ContainerID = containerID
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "CREATE", Passed: true, Message: "Container created from the authoritative spec."})
+
+	// Prefer removing by the well-known spec name over the raw container
+	// ID: it's the identity the rest of Podder's transactions (rename,
+	// stop, start) already key off of, and it's guaranteed to be the
+	// exact name --name just created the container under.
+	removalIdentity := containerID
+	if spec.Name != "" {
+		removalIdentity = spec.Name
+	}
+
+	newContainer, verified := p.verifyDeployedContainer(containerID, spec, lifecycleRunning)
+	if !verified || newContainer == nil {
+		if rmErr := p.RemoveContainer(removalIdentity); rmErr != nil {
+			result.ManualRecoveryRequired = true
+			result.Steps = append(result.Steps, PortMutationStepResult{
+				Step: "VERIFY", Passed: false,
+				Message: fmt.Sprintf("New container failed to verify after deployment and could not be automatically removed (%v). Manual recovery required for container %s.", rmErr, containerID),
+			})
+			return result, nil
+		}
+		result.Steps = append(result.Steps, PortMutationStepResult{
+			Step: "VERIFY", Passed: false,
+			Message: "New container failed to verify after deployment (identity, lifecycle, ports, or Podder labels did not match the spec); it has been removed.",
+		})
+		return result, nil
+	}
+	result.ConfigurationVerified = true
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "VERIFY", Passed: true, Message: "New container verified: identity, lifecycle, ports, and labels match the spec."})
+
+	result.Success = true
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "COMMITTED", Passed: true, Message: "Deployment committed."})
+	return result, nil
+}
+
+// redeployReplacingContainer handles DeploySpec when an existing container
+// already occupies the spec's name: the full quiesce/create/verify/commit
+// transaction, with rollback on any failure.
+func (p *PodmanService) redeployReplacingContainer(spec ContainerSpec, target *Container, result *DeploySpecResult) (*DeploySpecResult, error) {
+	containerName := strings.TrimSpace(spec.Name)
+	if containerName == "" {
+		containerName = "unnamed"
+		if len(target.Names) > 0 {
+			containerName = strings.TrimPrefix(target.Names[0], "/")
+		}
+	}
+	result.OldContainerID = target.Id
+
+	originalLifecycle, lifecycleSupported := classifyLifecycle(target.State)
+	if !lifecycleSupported {
+		result.Steps = append(result.Steps, PortMutationStepResult{
+			Step: "PREFLIGHT", Passed: false,
+			Message: fmt.Sprintf("Existing container lifecycle state %q cannot be safely reproduced by Podder. Deployment refused.", target.State),
+		})
+		return result, nil
+	}
+
+	if err := p.validateMappingsForMutation(spec.PortMappings, target.Id); err != nil {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: err.Error()})
+		return result, nil
+	}
+	if _, err := BuildRunArgsFromSpec(spec); err != nil {
+		result.Steps = append(result.Steps, PortMutationStepResult{
+			Step: "PREFLIGHT", Passed: false,
+			Message: fmt.Sprintf("Stored spec is not replayable: %v", err),
+		})
+		return result, nil
+	}
+
+	result.Steps = append(result.Steps, PortMutationStepResult{
+		Step: "PREFLIGHT", Passed: true,
+		Message: "Preflight verified: spec validated and replayable, no port collisions, safe existing lifecycle.",
+	})
+
+	backupName := newBackupName(containerName)
+	result.BackupContainerName = backupName
+	result.Steps = append(result.Steps, PortMutationStepResult{
+		Step: "SNAPSHOT", Passed: true,
+		Message: fmt.Sprintf("Backup identity reserved as %s.", backupName),
+	})
+
+	// quiesced tracks whether the existing container was actually renamed
+	// out of the way yet. If that rename itself fails, nothing was ever
+	// moved — there is no backup to roll back from, and attempting one
+	// anyway would rename a nonexistent backup name back (which fails)
+	// and spuriously report manual recovery for a workload that was never
+	// touched.
+	quiesced := false
+
+	fail := func(step, message string, candidateWasCreated bool) (*DeploySpecResult, error) {
+		if !quiesced {
+			result.RollbackReason = message
+			result.Steps = append(result.Steps, PortMutationStepResult{Step: step, Passed: false, Message: message})
+			return result, nil
+		}
+		rb := p.executeRollback(backupName, containerName, containerName, originalLifecycle, candidateWasCreated)
+		result.Rollback = rb
+		result.RollbackReason = message
+		if rb.Verified {
+			result.RolledBack = true
+			result.Steps = append(result.Steps, PortMutationStepResult{Step: "ROLLED_BACK", Passed: true, Message: message})
+		} else {
+			result.ManualRecoveryRequired = true
+			result.Steps = append(result.Steps, PortMutationStepResult{
+				Step: "ROLLBACK_FAILED", Passed: false,
+				Message: fmt.Sprintf("ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: %s (backup=%s, candidate-name=%s, errors: %s)", message, backupName, containerName, strings.Join(rb.Errors, "; ")),
+			})
+		}
+		return result, nil
+	}
+
+	// QUIESCE
+	if _, _, err := p.runCommand("rename", containerName, backupName); err != nil {
+		return fail("QUIESCE", fmt.Sprintf("Failed to rename existing container to backup: %v", err), false)
+	}
+	quiesced = true
+
+	if originalLifecycle == lifecycleRunning {
+		if err := p.StopContainer(backupName); err != nil {
+			return fail("QUIESCE", fmt.Sprintf("Failed to stop original container before recreation: %v", err), false)
+		}
+		stopped := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			cs, err := p.ListContainers(true)
+			if err != nil {
+				return false
+			}
+			c := findContainerByName(cs, backupName)
+			if c == nil {
+				return false
+			}
+			kind, _ := classifyLifecycle(c.State)
+			return kind == lifecycleStopped
+		})
+		if !stopped {
+			return fail("QUIESCE", "Timed out waiting for original container to stop before recreation.", false)
+		}
+	}
+	result.Steps = append(result.Steps, PortMutationStepResult{
+		Step: "QUIESCE", Passed: true,
+		Message: fmt.Sprintf("Existing container renamed to %s and quiesced.", backupName),
+	})
+
+	// CREATE
+	var createArgs []string
+	var buildErr error
+	if originalLifecycle == lifecycleRunning {
+		createArgs, buildErr = BuildRunArgsFromSpec(spec)
+	} else {
+		createArgs, buildErr = BuildCreateArgsFromSpec(spec)
+	}
+	if buildErr != nil {
+		return fail("CREATE", fmt.Sprintf("Failed to construct run arguments: %v", buildErr), false)
+	}
+	stdout, stderr, err := p.runCommand(createArgs...)
+	if err != nil {
+		return fail("CREATE", fmt.Sprintf("Failed to create replacement container: %v (stderr: %s)", err, strings.TrimSpace(stderr)), false)
+	}
+	newContainerID := strings.TrimSpace(stdout)
+	result.ContainerID = newContainerID
+	result.Replaced = true
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "CREATE", Passed: true, Message: "Replacement container created from the authoritative spec."})
+
+	// VERIFY: identity, lifecycle, exact port mappings, and (if Managed)
+	// Podder labels.
+	newContainer, verified := p.verifyDeployedContainer(newContainerID, spec, originalLifecycle)
+	if !verified || newContainer == nil {
+		return fail("VERIFY", "New container failed to verify: identity, lifecycle, ports, or Podder labels did not match the spec.", true)
+	}
+	result.ConfigurationVerified = true
+
+	if originalLifecycle == lifecycleRunning {
+		allObserved := true
+		for _, m := range spec.PortMappings {
+			if m.HostPort == 0 {
+				continue
+			}
+			observed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+				return p.observeListenerForMapping(m)
+			})
+			if !observed {
+				allObserved = false
+			}
+		}
+		result.ListenerObserved = allObserved
+
+		if _, hasHealthcheck := p.containerHealthStatus(newContainer.Id); hasHealthcheck {
+			// Read the FINAL health state after polling, not whatever
+			// snapshot was observed before/during the wait — a container
+			// that starts "starting" and later transitions to
+			// "unhealthy" must be caught, not waved through because its
+			// initial status looked harmless.
+			var finalStatus string
+			_ = pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+				s, ok := p.containerHealthStatus(newContainer.Id)
+				if ok {
+					finalStatus = s
+				}
+				return ok && s == "healthy"
+			})
+			switch finalStatus {
+			case "healthy":
+				result.HealthVerified = true
+			case "unhealthy":
+				return fail("VERIFY", "Replacement container reports an unhealthy Podman healthcheck status.", true)
+			default:
+				// still "starting" (or unknown) after the bounded wait:
+				// recorded as not (yet) verified, but not fatal — some
+				// services are legitimately slow to become healthy.
 			}
 		}
 	}
 
-	// 2. Build run command arguments from the complete spec
-	args, err := BuildRunArgsFromSpec(*spec)
-	if err != nil {
-		return "", fmt.Errorf("failed to build run arguments from spec: %w", err)
+	verifyMsg := "Replacement container verified: identity, lifecycle, ports, and labels match the spec."
+	if result.ListenerObserved {
+		verifyMsg += " Host listeners observed for all published ports."
+	}
+	if result.HealthVerified {
+		verifyMsg += " Podman healthcheck reports healthy."
+	}
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "VERIFY", Passed: true, Message: verifyMsg})
+
+	// COMMIT: remove the backup. A cleanup failure here is reported as a
+	// distinct warning — it never contradicts the already-successful
+	// COMMITTED step, since the deployment itself is done and verified.
+	result.Success = true
+	if err := p.RemoveContainer(backupName); err != nil {
+		result.CleanupWarning = fmt.Sprintf("Backup container %s could not be removed automatically: %v. Manual cleanup recommended.", backupName, err)
+	}
+	result.Steps = append(result.Steps, PortMutationStepResult{Step: "COMMITTED", Passed: true, Message: "Deployment committed: container recreated from the authoritative spec."})
+	if result.CleanupWarning != "" {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "CLEANUP_WARNING", Passed: false, Message: result.CleanupWarning})
 	}
 
-	// 3. Execute container run
-	stdout, stderr, err := p.runCommand(args...)
-	if err != nil {
-		return "", fmt.Errorf("failed to run container from spec: %v, stderr: %s", err, strings.TrimSpace(stderr))
-	}
+	return result, nil
+}
 
-	containerID := strings.TrimSpace(stdout)
-	return containerID, nil
+// verifyDeployedContainer bounded-polls for a container matching
+// containerID (or spec.Name) to appear with the expected lifecycle, exact
+// port mappings, and — if the spec is Managed — the expected Podder
+// labels/provenance. Shared by DeploySpec's two paths.
+func (p *PodmanService) verifyDeployedContainer(containerID string, spec ContainerSpec, expectedLifecycle string) (*Container, bool) {
+	var found *Container
+	ok := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+		cs, err := p.ListContainers(true)
+		if err != nil {
+			return false
+		}
+		c := findContainerByIdentity(cs, containerID)
+		if c == nil && spec.Name != "" {
+			c = findContainerByName(cs, spec.Name)
+		}
+		if c == nil {
+			return false
+		}
+		kind, supported := classifyLifecycle(c.State)
+		if !supported || kind != expectedLifecycle {
+			return false
+		}
+		if eq, _, _ := portMappingSetEqual(spec.PortMappings, c.PortMappings); !eq {
+			return false
+		}
+		if spec.Managed && (c.Provenance.Type != "podder" || c.Provenance.Service != spec.Name) {
+			return false
+		}
+		found = c
+		return true
+	})
+	return found, ok
 }

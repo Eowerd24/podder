@@ -518,30 +518,37 @@
                 <input type="hidden" id="edit-ports-service-name" />
                 <input type="hidden" id="edit-ports-unit-name" />
 
-                <!-- Orchestrator Mode Switcher (if Compose or Quadlet) -->
-                <div id="edit-ports-mode-bar" style="display: none; margin-bottom: 15px;">
-                    <div class="filter-btn-group" style="width: 100%;">
-                        <button type="button" class="filter-btn active" id="btn-mode-inplace" style="flex: 1; text-align: center;" onclick="setEditPortsMode('inplace')">In-Place File Edit & Reload</button>
-                        <button type="button" class="filter-btn" id="btn-mode-manual" style="flex: 1; text-align: center;" onclick="setEditPortsMode('manual')">Manual Snippet</button>
-                    </div>
+                <!-- Fail-closed load error: shown instead of any editable
+                     state when fresh backend inspection could not be
+                     confirmed. Never present a possibly-stale or blank
+                     editor when this is showing. -->
+                <div id="edit-ports-load-error" style="display: none; margin-bottom: 15px;">
+                    <div class="exposure-warning-banner" id="edit-ports-load-error-text"></div>
                 </div>
 
-                <!-- External Orchestrator Guidance (Compose / Quadlet / Pod) -->
+                <!-- External Orchestrator Guidance (Compose / Quadlet / Pod /
+                     not-safely-reproducible). For Compose/Quadlet this is
+                     INSPECTION + GUIDANCE ONLY -- Podder never mutates or
+                     restarts these workloads automatically; see the backend
+                     MutateComposePorts/MutateQuadletPorts read-only guards. -->
                 <div id="edit-ports-guidance-box" style="display: none; margin-bottom: 15px;">
                     <div class="exposure-warning-banner" id="edit-ports-guidance-text"></div>
+                    <div id="edit-ports-file-info" style="display: none; font-size: 11px; color: var(--text-muted); margin: 8px 0; font-family: var(--font-mono);"></div>
                     <div id="edit-ports-snippet-wrapper" style="margin-top: 10px; display: none;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <span class="field-mini-label">Suggested Configuration Snippet:</span>
+                            <span class="field-mini-label">Configuration Snippet:</span>
                             <button type="button" class="btn btn-secondary btn-xs" onclick="copyEditPortsSnippet()">Copy Snippet</button>
                         </div>
                         <pre id="edit-ports-snippet-text" class="logs-output" style="max-height: 140px; font-family: var(--font-mono); color: #93c5fd;"></pre>
                     </div>
                 </div>
 
-                <!-- Direct Port Editing Area -->
+                <!-- Direct Port Editing Area. For a Podder-managed
+                     workload this is the real mutation editor. For
+                     Compose/Quadlet this is ONLY used to specify the
+                     desired ports so a snippet can be generated -- it never
+                     submits a mutation. -->
                 <div id="edit-ports-interactive-area">
-                    <div id="edit-ports-file-info" style="display: none; font-size: 11px; color: var(--text-muted); margin-bottom: 10px; font-family: var(--font-mono);"></div>
-
                     <div class="form-group">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                             <label class="form-label" style="margin-bottom: 0;">Published Ports</label>

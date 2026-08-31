@@ -63,6 +63,76 @@ export function jsonToSafeAttr(value) {
     return escapeHtml(JSON.stringify(value));
 }
 
+// --- Bind-address terminology & port-range display helpers ---
+//
+// Podder must never claim Internet-public exposure merely because a mapping
+// binds a wildcard address -- reachability from the wider Internet depends
+// on routing/NAT/firewall rules Podder cannot see. It also must not display
+// an omitted host address as though it literally said "0.0.0.0": those are
+// distinct declarations (see DeclaredEndpointsEquivalent in endpoint.go).
+// Kept here (DOM-free, pure) alongside the escaping helpers so both can be
+// unit tested with a plain Node test runner -- see trust.test.js.
+
+// describeBindAddress classifies a raw bind address string for display,
+// distinguishing an omitted/default bind from an explicit IPv4/IPv6
+// wildcard and from IPv4/IPv6 loopback: DEFAULT / IPv4 ANY / IPv6 ANY /
+// LOOPBACK / IPv6 LOOPBACK / SPECIFIC.
+export function describeBindAddress(raw) {
+    const bind = (raw === undefined || raw === null) ? '' : String(raw).trim();
+    if (bind === '') {
+        return {
+            category: 'default',
+            display: 'DEFAULT',
+            detail: 'Host address not explicitly set; Podman applies its own default bind for this mapping.'
+        };
+    }
+    if (bind === '0.0.0.0' || bind === '*') {
+        return {
+            category: 'wildcard4',
+            display: bind === '*' ? '0.0.0.0' : bind,
+            detail: 'IPv4 ANY (0.0.0.0): all local IPv4 interfaces -- network reachable subject to routing and firewall rules, not necessarily Internet-public.'
+        };
+    }
+    if (bind === '::') {
+        return {
+            category: 'wildcard6',
+            display: '::',
+            detail: 'IPv6 ANY (::): all local IPv6 interfaces -- network reachable subject to routing and firewall rules, not necessarily Internet-public.'
+        };
+    }
+    if (bind === '127.0.0.1') {
+        return { category: 'loopback4', display: bind, detail: 'LOOPBACK: this host only.' };
+    }
+    if (bind === '::1') {
+        return { category: 'loopback6', display: bind, detail: 'IPv6 LOOPBACK: this host only.' };
+    }
+    if (bind.toLowerCase() === 'localhost') {
+        return { category: 'loopback4', display: bind, detail: 'LOOPBACK: this host only.' };
+    }
+    return {
+        category: 'specific',
+        display: bind,
+        detail: 'SPECIFIC: a single named interface -- network reachable subject to routing and firewall rules.'
+    };
+}
+
+// formatPortRangeSuffix renders a single port, or (when rangeSize > 1) an
+// inclusive "start-end" range string, for DISPLAY only -- never for a
+// Compose/Quadlet configuration snippet, which must always go through the
+// backend's canonical FormatPublishSpec (see PreviewComposeSnippet /
+// PreviewQuadletSnippet in main.js). A range must always show its full
+// span; showing only the first port would silently hide the rest of the
+// range from the operator.
+export function formatPortRangeSuffix(start, rangeSize) {
+    const s = parseInt(start, 10);
+    const n = parseInt(rangeSize, 10);
+    if (isNaN(s)) return String(start != null ? start : '');
+    if (n && n > 1) {
+        return `${s}-${s + n - 1}`;
+    }
+    return String(s);
+}
+
 // Case-insensitive fragments of environment variable / spec field names
 // treated as sensitive. Matching values are masked by default wherever a
 // spec or adoption preview is rendered, since a stored spec's Env map can

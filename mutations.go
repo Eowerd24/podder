@@ -123,6 +123,29 @@ func GenerateQuadletSnippet(ports []PortMapping) string {
 	return sb.String()
 }
 
+// PreviewComposeSnippet is the bound method the frontend must call to
+// render a Compose ports: snippet for display/copy — including live preview
+// while an operator is still adjusting the desired port rows before
+// generating the final snippet. This exists specifically so the frontend
+// NEVER hand-formats a Podman/Compose port publish spec itself: the same
+// canonical formatter (FormatPublishSpec, via GenerateComposeSnippet) used
+// for actual mutation guidance is used here, so omitted-bind handling,
+// IPv6 bracketing, port ranges, and protocol formatting can never drift
+// between a "live preview" string built in JavaScript and the real one.
+func (p *PodmanService) PreviewComposeSnippet(serviceName string, ports []PortMapping) (string, error) {
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" {
+		return "", fmt.Errorf("compose service name cannot be empty")
+	}
+	return GenerateComposeSnippet(serviceName, ports), nil
+}
+
+// PreviewQuadletSnippet is the PreviewComposeSnippet counterpart for a
+// systemd Quadlet .container unit's PublishPort= lines.
+func (p *PodmanService) PreviewQuadletSnippet(ports []PortMapping) (string, error) {
+	return GenerateQuadletSnippet(ports), nil
+}
+
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := crand.Read(b); err != nil {
@@ -155,6 +178,61 @@ func findContainerByIdentity(containers []Container, identity string) *Container
 		}
 	}
 	return nil
+}
+
+// ContainerPortEditState is the single authoritative source a port editor
+// (container-card path or Ports-tab path — there is deliberately only ONE
+// way to open it now) must populate itself from before allowing an edit.
+// Caller-supplied cached data (e.g. from a list rendered a few seconds ago)
+// must never be trusted as the editable state: it can be stale, or — as the
+// Ports-tab path used to do — simply empty, which would make a workload
+// with real published ports look like it has none and let an operator
+// submit a replacement configuration without ever seeing what they were
+// about to remove.
+type ContainerPortEditState struct {
+	ContainerID   string             `json:"containerId"`
+	ContainerName string             `json:"containerName"`
+	Provenance    WorkloadProvenance `json:"provenance"`
+	PortMappings  []PortMapping      `json:"portMappings"`
+}
+
+// GetContainerPortEditState resolves a container by exact ID (or unambiguous
+// ID prefix — see findContainerByIdentity) and returns its CURRENT
+// backend-observed provenance and port mappings. This is the one method the
+// port editor must call before presenting anything editable; a caller that
+// cannot resolve the container gets an explicit error rather than a
+// same-shaped-but-empty result that could be silently treated as "no ports
+// configured".
+func (p *PodmanService) GetContainerPortEditState(containerID string) (*ContainerPortEditState, error) {
+	containerID = strings.TrimSpace(containerID)
+	if containerID == "" {
+		return nil, fmt.Errorf("container id cannot be empty")
+	}
+
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect local containers: %w", err)
+	}
+
+	target := findContainerByIdentity(containers, containerID)
+	if target == nil {
+		return nil, fmt.Errorf("container %s not found", containerID)
+	}
+
+	name := "unnamed"
+	if len(target.Names) > 0 {
+		name = strings.TrimPrefix(target.Names[0], "/")
+	}
+
+	mappings := make([]PortMapping, len(target.PortMappings))
+	copy(mappings, target.PortMappings)
+
+	return &ContainerPortEditState{
+		ContainerID:   target.Id,
+		ContainerName: name,
+		Provenance:    target.Provenance,
+		PortMappings:  mappings,
+	}, nil
 }
 
 // findContainerByName locates a container by exact name.
@@ -625,17 +703,23 @@ func pollUntil(attempts int, interval time.Duration, check func() bool) bool {
 	return false
 }
 
-// portMappingSetEqual compares two port mapping sets for exact equality
-// (as sets, ignoring order), so a mutation can prove that the removed
-// mappings are actually gone and the new ones are actually configured —
-// not merely that the container reports "running".
+// portMappingSetEqual compares two port mapping sets for exact DECLARED
+// equality (as sets, ignoring order), so a mutation can prove that the
+// removed mappings are actually gone and the new ones are actually
+// configured exactly as declared — not merely that the container reports
+// "running", and not merely that the new bind would avoid a socket
+// conflict with the old one. This is a declared-endpoint comparison
+// (CanonicalDeclaredBind), never a conflict/allocation-safety comparison
+// (AddressesConflict/NormalizeAddress/EndpointsConflict) — those answer a
+// different question ("could these collide"), not "is this the exact
+// configuration that was declared".
 func portMappingSetEqual(want, got []PortMapping) (ok bool, missing, unexpected []PortMapping) {
 	key := func(m PortMapping) string {
 		rangeSize := m.RangeSize
 		if rangeSize <= 1 {
 			rangeSize = 1
 		}
-		return fmt.Sprintf("%s|%d|%d|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, m.ContainerPort, rangeSize, NormalizeProtocol(m.Protocol))
+		return fmt.Sprintf("%s|%d|%d|%d|%s", CanonicalDeclaredBind(m.HostIP), m.HostPort, m.ContainerPort, rangeSize, NormalizeProtocol(m.Protocol))
 	}
 	wantSet := make(map[string]PortMapping, len(want))
 	for _, m := range want {

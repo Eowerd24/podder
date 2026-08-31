@@ -60,3 +60,23 @@ graph TD
   - Users can mount host content without copying filesystem paths manually.
   - The bind-mount flow remains local and secure because Podder validates and passes paths directly to `podman` without shell interpolation.
   - Filtered dashboard navigation behaves more like a focused drill-down than a blind tab switch.
+
+### ADR 6: Declared-Endpoint Equality Is Separate From Conflict Detection (v1.4)
+* **Context**: Two different questions were being answered by the same normalization function. "Can these two bind addresses collide if both try to listen" (conflict/allocation safety) legitimately treats an omitted host bind, `0.0.0.0`, and `*` as interchangeable "wildcard" — but "are these two declarations/configurations exactly the same" (mutation verification, `DeploySpec` verification, registry reconciliation) must NOT make that same collapse, or a verification step can silently accept a runtime configuration that doesn't actually match what was declared.
+* **Decision**:
+  - `AddressesConflict`/`EndpointsConflict` (via `NormalizeAddress`) remain the conservative, deliberately-loose conflict/allocation-safety comparison. Unchanged.
+  - `CanonicalDeclaredBind`/`DeclaredEndpointsEquivalent` are a new, separate EXACT declared-endpoint comparison that keeps an omitted bind, an explicit IPv4/IPv6 wildcard, IPv4/IPv6 loopback, and any specific address mutually distinct. `portMappingSetEqual` (managed-create verification, port-mutation PREFLIGHT/VERIFY, `DeploySpec` verification) and `EndpointsEquivalentForReconciliation` (registry reconciliation) both key on this, not on `NormalizeAddress`.
+  - Whether Podman's own `inspect`/`ps` JSON actually preserves the omitted-vs-`0.0.0.0` distinction end-to-end is a real-runtime fact this architectural split does not itself prove — that is explicitly deferred to the dedicated rootless-Podman integration campaign.
+* **Consequences & Benefits**:
+  - A mutation/deploy/create verification step can no longer silently treat "the operator declared no host bind" and "the operator declared an explicit wildcard" as the same known-good configuration.
+  - Conflict detection stays conservative (overblocking is preferred to underblocking) without contaminating the stricter equality question, and vice versa.
+
+### ADR 7: Provenance Metadata Is a Discovery Hint, Not Filesystem Authorization (v1.4)
+* **Context**: Compose/Quadlet auto-discovery (working directory, config-file list, systemd unit name) is sourced from container labels — data any container, including a malicious or malformed one, can set. Treating it as an authoritative path to open is a path-traversal / arbitrary-file-read risk (`../../etc/passwd`-style label values).
+* **Decision**:
+  - `resolveWithinRoot` (`pathtrust.go`) is the shared containment check: every candidate path derived from provenance metadata is joined against, and proven to remain within, an allowed root — syntactically (clean + prefix check) and, for a path that exists, physically (symlink-resolved), so an in-tree symlink can't be used to defeat containment.
+  - `validateQuadletUnitIdentifier` rejects any Quadlet unit identifier that isn't a plain, safe basename (no `/`, `\`, `..`, absolute paths, NUL, or characters outside a conservative systemd-unit charset) before any candidate path is even built.
+  - An absolute Compose config-file path that resolves outside the container's reported working directory is treated as unresolved provenance (`ErrComposeFileOutsideWorkingDir`) and never read, rather than trusted because a label claims it is authoritative.
+* **Consequences & Benefits**:
+  - A malicious or malformed container's labels can no longer make Podder read an arbitrary file the process can access.
+  - Normal, well-formed Compose/Quadlet discovery is unaffected — only out-of-root/invalid-identifier cases are refused.

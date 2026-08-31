@@ -3,12 +3,13 @@ import {
     escapeHtml,
     escapeAttr,
     jsStringLiteral,
-    jsonToSafeAttr,
     withMaskedSecrets,
+    describeBindAddress,
+    formatPortRangeSuffix,
 } from "./trust.js";
 
 // Trust-boundary escaping/masking helpers (escapeHtml, escapeAttr,
-// jsStringLiteral, jsonToSafeAttr, withMaskedSecrets, ...) live in
+// jsStringLiteral, withMaskedSecrets, ...) live in
 // ./trust.js -- a DOM-free module kept separate specifically so it can be
 // unit tested with a plain Node test runner (see trust.test.js) without
 // needing a full browser/DOM environment. Podman labels, container/image
@@ -226,14 +227,17 @@ window.loadContainers = async () => {
                 portsHtml = `
                     <div class="card-ports-container">
                         ${mappings.map(m => {
-                            const bind = m.hostIP || '0.0.0.0';
+                            const bindInfo = describeBindAddress(m.hostIP);
                             const proto = (m.protocol || 'tcp').toUpperCase();
-                            const isLoopback = bind.startsWith('127.') || bind === '::1' || bind === 'localhost';
-                            const expClass = isLoopback ? 'exp-loopback' : (bind === '0.0.0.0' || bind === '*' ? 'exp-wildcard' : 'exp-specific');
+                            const isLoopback = bindInfo.category === 'loopback4' || bindInfo.category === 'loopback6';
+                            const isWildcard = bindInfo.category === 'wildcard4' || bindInfo.category === 'wildcard6' || bindInfo.category === 'default';
+                            const expClass = isLoopback ? 'exp-loopback' : (isWildcard ? 'exp-wildcard' : 'exp-specific');
+                            const hostSpan = formatPortRangeSuffix(m.hostPort, m.rangeSize);
+                            const containerSpan = formatPortRangeSuffix(m.containerPort, m.rangeSize);
                             return `
                                 <div class="port-badge-row">
                                     <span class="port-proto-tag ${proto.toLowerCase() === 'udp' ? 'udp' : 'tcp'}">${escapeHtml(proto)}</span>
-                                    <span class="port-mapping-text ${expClass}">${escapeHtml(bind)}:${escapeHtml(m.hostPort)} &rarr; ${escapeHtml(m.containerPort)}</span>
+                                    <span class="port-mapping-text ${expClass}" title="${escapeAttr(bindInfo.detail)}">${escapeHtml(bindInfo.display)}:${escapeHtml(hostSpan)} &rarr; ${escapeHtml(containerSpan)}</span>
                                 </div>
                             `;
                         }).join('')}
@@ -251,11 +255,12 @@ window.loadContainers = async () => {
                 provText = `${prov.displayType}: ${prov.name}`;
             }
 
-            // prov/mappings are untrusted (container labels): encode as a
-            // safe JS object-literal argument, and encode the name/id as
-            // safe single-quoted JS string arguments — see jsStringLiteral.
-            const safeProvJson = jsonToSafeAttr(prov);
-            const safeMappingsJson = jsonToSafeAttr(mappings);
+            // Name/id are untrusted (container labels/user-chosen names):
+            // encode as safe single-quoted JS string arguments — see
+            // jsStringLiteral. The port editor no longer accepts
+            // caller-supplied provenance/mappings at all (it always
+            // refetches fresh state by ID), so nothing here needs
+            // JSON-object encoding any more.
             const idArg = jsStringLiteral(c.Id);
             const nameArg = jsStringLiteral(name);
 
@@ -303,7 +308,7 @@ window.loadContainers = async () => {
                         <button class="btn btn-secondary btn-icon" onclick="viewLogs('${idArg}', '${nameArg}')" title="View Logs">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
                         </button>
-                        <button class="btn btn-secondary btn-icon" onclick="openEditPortsModal('${idArg}', '${nameArg}', ${safeProvJson}, ${safeMappingsJson})" title="Edit Port Mappings">
+                        <button class="btn btn-secondary btn-icon" onclick="openEditPortsModal('${idArg}', '${nameArg}')" title="Edit Port Mappings">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                         </button>
                         ${prov.type === 'adhoc' ? `
@@ -377,6 +382,9 @@ function renderRegistryStatusBar(summary) {
         return;
     }
 
+    const warnings = summary.registryWarnings || [];
+    const hasWarnings = warnings.length > 0;
+
     bar.style.display = 'flex';
     bar.innerHTML = `
         <div class="reg-summary-item">
@@ -400,6 +408,22 @@ function renderRegistryStatusBar(summary) {
             <button class="btn btn-secondary btn-xs" onclick="openSettingsModal()" style="margin-left: 8px;">Config</button>
         </div>
     `;
+
+    // Registry loaded cleanly vs loaded for observation with invalid
+    // entries are two different operator-facing states: the latter still
+    // populates this display (tolerant), but create/mutate/adopt/free-port
+    // selection are BLOCKED until the invalid entries are fixed (see
+    // LoadPortRegistryStrict). This must never look like an ordinary
+    // metric -- it is a safety notice.
+    if (hasWarnings) {
+        const notice = document.createElement('div');
+        notice.className = 'reg-summary-item';
+        notice.style.color = 'var(--color-amber, #f59e0b)';
+        notice.style.width = '100%';
+        notice.title = warnings.join('\n');
+        notice.textContent = `Registry loaded for observation with ${warnings.length} invalid ${warnings.length === 1 ? 'entry' : 'entries'}. Safety-sensitive operations (create/mutate/adopt/free-port selection) are blocked until fixed.`;
+        bar.appendChild(notice);
+    }
 }
 
 function renderPortItems() {
@@ -469,8 +493,9 @@ function renderPortItems() {
                 </thead>
                 <tbody>
                     ${items.map(item => {
-                        const bind = item.bindAddress || '0.0.0.0';
-                        const endpointStr = `${bind}:${item.hostPort}`;
+                        const bindInfo = describeBindAddress(item.bindAddress);
+                        const hostSpan = formatPortRangeSuffix(item.hostPort, item.rangeSize);
+                        const endpointStr = `${bindInfo.display}:${hostSpan}`;
                         const proto = (item.protocol || 'TCP').toUpperCase();
                         
                         let sourceBadge = `<span class="source-badge podman">PODMAN</span>`;
@@ -548,12 +573,12 @@ function renderPortItems() {
                             provBadge = `<span class="prov-mini-badge ${escapeAttr(item.provenance.type)}" title="${escapeAttr(item.provenance.guidance || '')}">${escapeHtml(item.provenance.displayType)}</span>`;
                         }
 
-                        const targetStr = item.isContainer && item.containerPort ? `${item.containerPort}/${proto}` : '&mdash;';
-                        const isHttpCandidate = proto === 'TCP' && (scopeVal === 'loopback' || scopeVal === 'specific-ip' || scopeVal === 'wildcard' || scopeVal === 'lan');
-                        const urlHost = (bind === '0.0.0.0' || bind === '*' || bind === '') ? 'localhost' : bind;
+                        const targetSpan = formatPortRangeSuffix(item.containerPort, item.rangeSize);
+                        const targetStr = item.isContainer && item.containerPort ? `${targetSpan}/${proto}` : '&mdash;';
+                        const isHttpCandidate = proto === 'TCP' && (scopeVal === 'loopback' || scopeVal === 'specific-ip' || scopeVal === 'wildcard' || scopeVal === 'lan') && (!item.rangeSize || item.rangeSize <= 1);
+                        const urlHost = (bindInfo.category === 'wildcard4' || bindInfo.category === 'wildcard6' || bindInfo.category === 'default') ? 'localhost' : bindInfo.display;
                         const candidateUrl = `http://${urlHost}:${item.hostPort}`;
 
-                        const safeProvJson = jsonToSafeAttr(item.provenance || {});
                         const ownerArg = jsStringLiteral(item.owner);
                         const containerIdArg = jsStringLiteral(item.containerId);
                         const endpointArg = jsStringLiteral(endpointStr);
@@ -587,7 +612,7 @@ function renderPortItems() {
                                 <td style="text-align: right;">
                                     <div style="display: inline-flex; gap: 6px;">
                                         ${item.isContainer && item.containerId ? `
-                                            <button class="btn btn-secondary btn-xs" onclick="openEditPortsModal('${containerIdArg}', '${ownerArg}', ${safeProvJson}, [])" title="Edit Container Ports">
+                                            <button class="btn btn-secondary btn-xs" onclick="openEditPortsModal('${containerIdArg}', '${ownerArg}')" title="Edit Container Ports">
                                                 Edit Ports
                                             </button>
                                         ` : ''}
@@ -943,7 +968,7 @@ window.removeImage = async (id) => {
 
 // --- Structured Run Container Modal & Port Management ---
 
-window.addRunPortRow = (hostIP = '127.0.0.1', hostPort = '', containerPort = '', protocol = 'tcp') => {
+window.addRunPortRow = (hostIP = '', hostPort = '', containerPort = '', protocol = 'tcp', rangeSize = 1) => {
     const rowId = nextPortRowId++;
     runPortRows.push({
         id: rowId,
@@ -951,6 +976,7 @@ window.addRunPortRow = (hostIP = '127.0.0.1', hostPort = '', containerPort = '',
         hostPort: hostPort,
         containerPort: containerPort,
         protocol: protocol,
+        rangeSize: rangeSize,
         statusText: '',
         statusLevel: 'ok'
     });
@@ -972,13 +998,15 @@ window.updateRunPortField = async (id, field, value) => {
     // Live validation if hostPort and containerPort are set
     const hPort = parseInt(row.hostPort, 10);
     const cPort = parseInt(row.containerPort, 10);
+    const rSize = parseInt(row.rangeSize, 10) || 1;
     if (hPort > 0 && cPort > 0) {
         try {
             const validation = await Podman.ValidatePortMapping({
                 hostIP: row.hostIP,
                 hostPort: hPort,
                 containerPort: cPort,
-                protocol: row.protocol
+                protocol: row.protocol,
+                rangeSize: rSize > 1 ? rSize : 0
             });
             if (validation && !validation.valid) {
                 const errCheck = validation.checks.find(c => !c.passed);
@@ -1033,11 +1061,13 @@ function renderRunPortRows() {
     }
 
     container.innerHTML = runPortRows.map(row => {
+        const rangeSize = parseInt(row.rangeSize, 10) || 1;
+        const rangePreview = rangeSize > 1 ? `<div class="row-validation-msg ok" style="margin-top: 2px;">Range: ${escapeHtml(formatPortRangeSuffix(row.hostPort || 0, rangeSize))} &rarr; ${escapeHtml(formatPortRangeSuffix(row.containerPort || 0, rangeSize))}</div>` : '';
         return `
             <div class="port-input-row" id="port-row-${row.id}">
                 <div class="port-field-group" style="flex: 1.5;">
                     <span class="field-mini-label">Bind IP</span>
-                    <input type="text" class="form-input" value="${escapeAttr(row.hostIP)}" placeholder="127.0.0.1" onchange="updateRunPortField(${row.id}, 'hostIP', this.value)"/>
+                    <input type="text" class="form-input" value="${escapeAttr(row.hostIP)}" placeholder="blank = default" onchange="updateRunPortField(${row.id}, 'hostIP', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Host Port</span>
@@ -1046,6 +1076,10 @@ function renderRunPortRows() {
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Target Port</span>
                     <input type="number" class="form-input" value="${escapeAttr(row.containerPort)}" placeholder="80" min="1" max="65535" oninput="updateRunPortField(${row.id}, 'containerPort', this.value)"/>
+                </div>
+                <div class="port-field-group" style="flex: 0.7;">
+                    <span class="field-mini-label" title="Number of consecutive ports in this mapping, starting at Host/Target Port">Count / Range Size</span>
+                    <input type="number" class="form-input" value="${escapeAttr(rangeSize)}" min="1" max="65535" oninput="updateRunPortField(${row.id}, 'rangeSize', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 0.8;">
                     <span class="field-mini-label">Proto</span>
@@ -1063,6 +1097,7 @@ function renderRunPortRows() {
                     </button>
                 </div>
             </div>
+            ${rangePreview}
             <div class="row-validation-msg ${escapeAttr(row.statusLevel)}" id="port-status-${row.id}"${row.statusText ? '' : ' style="display:none;"'}>${escapeHtml(row.statusText)}</div>
         `;
     }).join('');
@@ -1098,8 +1133,8 @@ function updateRunExposureWarning() {
     if (!warningBox) return;
 
     const hasWildcard = runPortRows.some(r => {
-        const bind = (r.hostIP || '').trim();
-        return bind === '0.0.0.0' || bind === '::' || bind === '*' || bind === '';
+        const cat = describeBindAddress(r.hostIP).category;
+        return cat === 'wildcard4' || cat === 'wildcard6' || cat === 'default';
     });
 
     if (hasWildcard) {
@@ -1107,9 +1142,9 @@ function updateRunExposureWarning() {
         warningBox.innerHTML = `
             <div class="warning-title">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                Wildcard / External Network Exposure
+                Wildcard / All Local Interfaces
             </div>
-            <div>One or more mappings use <code>0.0.0.0</code> (all interfaces). This allows external network connections according to your host firewall rules. Use <code>127.0.0.1</code> if you only need local access.</div>
+            <div>One or more mappings bind all local interfaces (an omitted address, <code>0.0.0.0</code>, or <code>::</code>) — reachable from any host that can route to this machine, subject to firewall rules. This is not necessarily Internet-public. Use <code>127.0.0.1</code> if you only need local access.</div>
         `;
     } else {
         warningBox.style.display = 'none';
@@ -1151,12 +1186,14 @@ window.submitRunContainer = async () => {
     for (const row of runPortRows) {
         const hPort = parseInt(row.hostPort, 10);
         const cPort = parseInt(row.containerPort, 10);
+        const rSize = parseInt(row.rangeSize, 10);
         if (cPort > 0) {
             structuredPortMappings.push({
                 hostIP: row.hostIP.trim(),
                 hostPort: isNaN(hPort) ? 0 : hPort,
                 containerPort: cPort,
-                protocol: (row.protocol || 'tcp').toLowerCase()
+                protocol: (row.protocol || 'tcp').toLowerCase(),
+                rangeSize: (!isNaN(rSize) && rSize > 1) ? rSize : 0
             });
         }
     }
@@ -1204,75 +1241,184 @@ window.submitRunContainer = async () => {
 };
 
 // --- Edit Ports / Port Mutation Modal ---
+//
+// There is deliberately only ONE way to populate this modal's editable
+// state: a fresh Podman.GetContainerPortEditState(containerId) call, made
+// here every time the modal opens. Earlier revisions accepted cached
+// provenance/portMappings from the caller (the container-card action always
+// passed the full list; the Ports-tab action passed an empty array), which
+// meant the SAME container could show either its real published ports or an
+// empty, silently-misleading editor depending on which button was clicked.
+// Caller-supplied data is no longer accepted at all for this purpose — see
+// ContainerPortEditState in mutations.go.
 
-window.setEditPortsMode = (mode) => {
-    const btnInplace = document.getElementById('btn-mode-inplace');
-    const btnManual = document.getElementById('btn-mode-manual');
-    const interactiveArea = document.getElementById('edit-ports-interactive-area');
-    const guidanceBox = document.getElementById('edit-ports-guidance-box');
-    const submitBtn = document.getElementById('btn-submit-port-mutation');
+// renderReadOnlyGuidance renders the Compose/Quadlet "inspection + guidance
+// only" panel. Podder never mutates or restarts these workloads
+// automatically (see MutateComposePorts/MutateQuadletPorts, which remain
+// defensive read-only guards) -- this panel must never look like a
+// mutation control. Unit names/file paths are untrusted (container-label
+// derived), so every value is set via textContent, never interpolated into
+// markup.
+function renderReadOnlyGuidance(kind, details) {
+    const guidanceText = document.getElementById('edit-ports-guidance-text');
+    const fileInfo = document.getElementById('edit-ports-file-info');
 
-    if (mode === 'inplace') {
-        if (btnInplace) btnInplace.classList.add('active');
-        if (btnManual) btnManual.classList.remove('active');
-        if (interactiveArea) interactiveArea.style.display = 'block';
-        if (guidanceBox) guidanceBox.style.display = 'none';
-        if (submitBtn) submitBtn.style.display = 'inline-block';
+    guidanceText.textContent = '';
+    const title = document.createElement('div');
+    title.style.fontWeight = '650';
+    title.style.marginBottom = '6px';
+    title.textContent = kind === 'quadlet' ? 'Quadlet-managed workload' : 'Compose-managed workload';
+    guidanceText.appendChild(title);
+
+    const note = document.createElement('div');
+    note.textContent = details.note;
+    guidanceText.appendChild(note);
+
+    fileInfo.textContent = '';
+    fileInfo.style.display = 'block';
+    if (kind === 'quadlet') {
+        appendGuidanceLine(fileInfo, 'Unit:', details.unitValue);
+        if (details.filePath) appendGuidanceLine(fileInfo, 'Unit File:', details.filePath);
     } else {
-        if (btnInplace) btnInplace.classList.remove('active');
-        if (btnManual) btnManual.classList.add('active');
-        if (interactiveArea) interactiveArea.style.display = 'none';
-        if (guidanceBox) guidanceBox.style.display = 'block';
-        if (submitBtn) submitBtn.style.display = 'none';
+        appendGuidanceLine(fileInfo, 'Authoritative configuration:', details.filePath || '(could not be safely resolved -- see notice above)');
+        appendGuidanceLine(fileInfo, 'Service:', details.service);
     }
-};
+}
 
-window.openEditPortsModal = async (containerId, containerName, provenance = {}, portMappings = []) => {
-    currentEditProvenance = provenance || { type: 'adhoc' };
+function appendGuidanceLine(container, label, value) {
+    const row = document.createElement('div');
+    row.style.marginTop = '4px';
+    const strong = document.createElement('strong');
+    strong.textContent = label + ' ';
+    const code = document.createElement('code');
+    code.textContent = value || '';
+    row.appendChild(strong);
+    row.appendChild(code);
+    container.appendChild(row);
+}
+
+// regenerateEditSnippetFromRows produces the Compose/Quadlet configuration
+// snippet for the ports currently shown in the row editor. This ALWAYS goes
+// through the backend's canonical Go port-formatting machinery
+// (PreviewComposeSnippet/PreviewQuadletSnippet, which call the same
+// FormatPublishSpec used by real mutation guidance) -- the frontend must
+// never independently reimplement Podman/Compose/Quadlet port syntax, which
+// is how omitted-bind handling, IPv6 bracketing, port ranges, and protocol
+// formatting drift between a hand-built "preview" string and the real one.
+async function regenerateEditSnippetFromRows() {
+    const isQuadlet = currentEditProvenance && currentEditProvenance.type === 'quadlet';
+    const isCompose = currentEditProvenance && currentEditProvenance.type === 'compose';
+    if (!isQuadlet && !isCompose) return;
+
+    const snippetWrapper = document.getElementById('edit-ports-snippet-wrapper');
+    const snippetText = document.getElementById('edit-ports-snippet-text');
+
+    const mappings = editPortRows
+        .filter(r => parseInt(r.containerPort, 10) > 0)
+        .map(r => {
+            const rSize = parseInt(r.rangeSize, 10);
+            return {
+                hostIP: (r.hostIP || '').trim(),
+                hostPort: parseInt(r.hostPort, 10) || 0,
+                containerPort: parseInt(r.containerPort, 10),
+                protocol: (r.protocol || 'tcp').toLowerCase(),
+                rangeSize: (!isNaN(rSize) && rSize > 1) ? rSize : 0
+            };
+        });
+
+    try {
+        if (isQuadlet) {
+            currentEditSnippet = await Podman.PreviewQuadletSnippet(mappings);
+        } else {
+            const serviceName = (currentEditProvenance.service || document.getElementById('edit-ports-service-name').value || '').trim();
+            if (!serviceName) {
+                snippetWrapper.style.display = 'none';
+                return;
+            }
+            currentEditSnippet = await Podman.PreviewComposeSnippet(serviceName, mappings);
+        }
+        snippetWrapper.style.display = 'block';
+        snippetText.textContent = currentEditSnippet;
+    } catch (e) {
+        console.error("Could not generate configuration snippet:", e);
+    }
+}
+
+window.openEditPortsModal = async (containerId, containerNameHint) => {
+    currentEditProvenance = { type: 'adhoc' };
     currentEditSnippet = '';
-    
+    editPortRows = [];
+    nextEditPortRowId = 1;
+
+    const loadErrorBox = document.getElementById('edit-ports-load-error');
+    const loadErrorText = document.getElementById('edit-ports-load-error-text');
+    const guidanceBox = document.getElementById('edit-ports-guidance-box');
+    const guidanceText = document.getElementById('edit-ports-guidance-text');
+    const snippetWrapper = document.getElementById('edit-ports-snippet-wrapper');
+    const interactiveArea = document.getElementById('edit-ports-interactive-area');
+    const fileInfo = document.getElementById('edit-ports-file-info');
+    const stepsBox = document.getElementById('edit-ports-steps-box');
+    const submitBtn = document.getElementById('btn-submit-port-mutation');
+    const provPillHost = document.getElementById('edit-ports-provenance');
+    const rowsContainer = document.getElementById('edit-ports-rows-container');
+
     document.getElementById('edit-ports-container-id').value = containerId;
-    document.getElementById('edit-ports-service-name').value = containerName || '';
+    document.getElementById('edit-ports-title').textContent = `Edit Ports: ${containerNameHint || (containerId || '').substring(0, 12)}`;
+    provPillHost.textContent = '';
+
+    // Reset to a fail-closed loading state FIRST: nothing here is editable
+    // until fresh backend state is confirmed. A caller must never be able
+    // to make a real workload look like "no ports configured" simply by
+    // this call racing ahead of the fetch below.
+    loadErrorBox.style.display = 'none';
+    guidanceBox.style.display = 'none';
+    snippetWrapper.style.display = 'none';
+    fileInfo.style.display = 'none';
+    fileInfo.textContent = '';
+    stepsBox.style.display = 'none';
+    document.getElementById('edit-ports-steps-list').innerHTML = '';
+    interactiveArea.style.display = 'none';
+    submitBtn.style.display = 'none';
+    submitBtn.disabled = true;
+    rowsContainer.innerHTML = `<div class="empty-port-hint">Loading current configuration&hellip;</div>`;
+
+    openModal('edit-ports-modal');
+
+    let state = null;
+    let loadError = null;
+    try {
+        state = await Podman.GetContainerPortEditState(containerId);
+    } catch (e) {
+        loadError = e;
+    }
+
+    if (loadError || !state) {
+        loadErrorBox.style.display = 'block';
+        loadErrorText.textContent = `Could not load this container's current configuration, so mutation is disabled rather than showing a possibly-misleading blank editor. (${loadError || 'no data returned'})`;
+        rowsContainer.innerHTML = '';
+        return;
+    }
+
+    const containerName = state.containerName || containerNameHint || '';
+    currentEditProvenance = state.provenance || { type: 'adhoc' };
+    let portMappings = state.portMappings || [];
+
+    document.getElementById('edit-ports-service-name').value = containerName;
     document.getElementById('edit-ports-unit-name').value = currentEditProvenance.unitName || currentEditProvenance.name || '';
     document.getElementById('edit-ports-title').textContent = `Edit Ports: ${containerName || (containerId || '').substring(0, 12)}`;
 
     // Render provenance pill in modal header (label/type/guidance are
     // untrusted — sourced from container labels — so build it via
     // textContent/dataset rather than innerHTML string interpolation).
-    const provPillHost = document.getElementById('edit-ports-provenance');
-    provPillHost.textContent = '';
     const provPill = document.createElement('span');
     provPill.className = `prov-badge ${currentEditProvenance.type || 'adhoc'}`;
     provPill.textContent = currentEditProvenance.displayType || 'Ad-Hoc';
     provPillHost.appendChild(provPill);
 
-    const modeBar = document.getElementById('edit-ports-mode-bar');
-    const guidanceBox = document.getElementById('edit-ports-guidance-box');
-    const guidanceText = document.getElementById('edit-ports-guidance-text');
-    const snippetWrapper = document.getElementById('edit-ports-snippet-wrapper');
-    const snippetText = document.getElementById('edit-ports-snippet-text');
-    const interactiveArea = document.getElementById('edit-ports-interactive-area');
-    const fileInfo = document.getElementById('edit-ports-file-info');
-    const stepsBox = document.getElementById('edit-ports-steps-box');
-    const submitBtn = document.getElementById('btn-submit-port-mutation');
-
-    stepsBox.style.display = 'none';
-    document.getElementById('edit-ports-steps-list').innerHTML = '';
-    modeBar.style.display = 'none';
-    fileInfo.style.display = 'none';
-    fileInfo.textContent = '';
-
-    // Initialize rows from current mappings
-    editPortRows = [];
-    nextEditPortRowId = 1;
-
     if (currentEditProvenance.type === 'pod') {
         guidanceBox.style.display = 'block';
         guidanceText.textContent = `This container is part of Pod '${currentEditProvenance.podName || 'pod'}'. Ports in Podman belong to the Pod itself and cannot be edited on member containers.`;
-        snippetWrapper.style.display = 'none';
-        interactiveArea.style.display = 'none';
-        submitBtn.style.display = 'none';
-        openModal('edit-ports-modal');
+        rowsContainer.innerHTML = '';
         return;
     }
 
@@ -1284,63 +1430,68 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
     if (currentEditProvenance.type === 'adhoc' || currentEditProvenance.type === 'ambiguous' || !currentEditProvenance.type) {
         guidanceBox.style.display = 'block';
         guidanceText.textContent = 'This container is not safely reproducible by Podder. Adopt it into Podder before editing its deployment configuration.';
-        snippetWrapper.style.display = 'none';
-        interactiveArea.style.display = 'none';
-        submitBtn.style.display = 'none';
-        openModal('edit-ports-modal');
+        rowsContainer.innerHTML = '';
         return;
     }
 
     if (currentEditProvenance.type === 'quadlet') {
-        modeBar.style.display = 'block';
-        setEditPortsMode('inplace');
+        guidanceBox.style.display = 'block';
+        interactiveArea.style.display = 'block';
         submitBtn.style.display = 'inline-block';
-        submitBtn.textContent = 'Apply to .container & Restart Unit';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Generate PublishPort Snippet';
 
+        let unitPath = '';
         try {
             const quadletDetails = await Podman.InspectQuadlet(currentEditProvenance.unitName || currentEditProvenance.name);
             if (quadletDetails && quadletDetails.exists) {
-                fileInfo.style.display = 'block';
-                setFileInfoLine(fileInfo, 'Unit File:', quadletDetails.filePath);
+                unitPath = quadletDetails.filePath;
                 if (quadletDetails.portMappings && quadletDetails.portMappings.length > 0) {
                     portMappings = quadletDetails.portMappings;
                 }
             }
         } catch (e) {
-            console.warn("Could not inspect quadlet file directly:", e);
+            // Fresh runtime state (from GetContainerPortEditState above) is
+            // already loaded into portMappings; a failed unit-file inspect
+            // just means we fall back to that instead of the file's own
+            // (possibly more precise) view -- never to a blank/cached list.
+            console.warn("Could not inspect quadlet file directly; using last known runtime configuration:", e);
         }
 
-        // Prepare manual snippet
-        currentEditSnippet = `[Container]\n${portMappings.map(m => `PublishPort=${m.hostIP || '127.0.0.1'}:${m.hostPort}:${m.containerPort}/${m.protocol || 'tcp'}`).join('\n')}`;
-        snippetWrapper.style.display = 'block';
-        snippetText.textContent = currentEditSnippet;
-        guidanceText.textContent = `Update the PublishPort lines in your .container file and reload systemd ('systemctl --user daemon-reload && systemctl --user restart ${currentEditProvenance.unitName || 'service'}').`;
+        renderReadOnlyGuidance('quadlet', {
+            unitValue: currentEditProvenance.unitName || currentEditProvenance.name || '(unknown)',
+            filePath: unitPath,
+            note: 'Podder will not modify or restart this unit automatically.'
+        });
     } else if (currentEditProvenance.type === 'compose') {
-        modeBar.style.display = 'block';
-        setEditPortsMode('inplace');
+        guidanceBox.style.display = 'block';
+        interactiveArea.style.display = 'block';
         submitBtn.style.display = 'inline-block';
-        submitBtn.textContent = 'Apply to compose.yml & Compose Up';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Generate Updated Ports Snippet';
 
+        let composeFile = '';
         try {
             const composeDetails = await Podman.InspectCompose(containerId);
             if (composeDetails && composeDetails.composeFile) {
-                fileInfo.style.display = 'block';
-                setFileInfoLine(fileInfo, 'Compose File:', composeDetails.composeFile, `service: ${composeDetails.service}`);
+                composeFile = composeDetails.composeFile;
                 if (composeDetails.portMappings && composeDetails.portMappings.length > 0) {
                     portMappings = composeDetails.portMappings;
                 }
             }
         } catch (e) {
-            console.warn("Could not inspect compose file directly:", e);
+            console.warn("Could not inspect compose file directly; using last known runtime configuration:", e);
         }
 
-        // Prepare manual snippet
-        currentEditSnippet = `services:\n  ${currentEditProvenance.service || 'app'}:\n    ports:\n${portMappings.map(m => `      - "${m.hostIP || '127.0.0.1'}:${m.hostPort}:${m.containerPort}/${m.protocol || 'tcp'}"`).join('\n')}`;
-        snippetWrapper.style.display = 'block';
-        snippetText.textContent = currentEditSnippet;
-        guidanceText.textContent = `Update the ports definition in your compose file and re-run 'pod up'.`;
+        renderReadOnlyGuidance('compose', {
+            filePath: composeFile,
+            service: currentEditProvenance.service || '(unknown)',
+            note: 'Podder will not modify this Compose project automatically.'
+        });
     } else {
+        interactiveArea.style.display = 'block';
         submitBtn.style.display = 'inline-block';
+        submitBtn.disabled = false;
         submitBtn.textContent = 'Mutate Ports (Atomic Transaction)';
     }
 
@@ -1348,10 +1499,17 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
         portMappings.forEach(m => {
             editPortRows.push({
                 id: nextEditPortRowId++,
-                hostIP: m.hostIP || '127.0.0.1',
+                // The exact backend-observed HostIP is preserved as-is,
+                // including "" (omitted/default) -- defaulting it to
+                // '127.0.0.1' here would silently show a loopback bind for
+                // a mapping that may actually be wildcard/omitted, exactly
+                // the kind of declared-vs-displayed discrepancy this
+                // hardening pass closes.
+                hostIP: m.hostIP || '',
                 hostPort: m.hostPort || '',
                 containerPort: m.containerPort || '',
                 protocol: (m.protocol || 'tcp').toLowerCase(),
+                rangeSize: (m.rangeSize && m.rangeSize > 1) ? m.rangeSize : 1,
                 statusText: '',
                 statusLevel: 'ok'
             });
@@ -1361,11 +1519,10 @@ window.openEditPortsModal = async (containerId, containerName, provenance = {}, 
     }
     renderEditPortRows();
     updateEditExposureWarning();
-
-    openModal('edit-ports-modal');
+    await regenerateEditSnippetFromRows();
 };
 
-window.addEditPortRow = (hostIP = '127.0.0.1', hostPort = '', containerPort = '', protocol = 'tcp') => {
+window.addEditPortRow = (hostIP = '', hostPort = '', containerPort = '', protocol = 'tcp', rangeSize = 1) => {
     const rowId = nextEditPortRowId++;
     editPortRows.push({
         id: rowId,
@@ -1373,17 +1530,20 @@ window.addEditPortRow = (hostIP = '127.0.0.1', hostPort = '', containerPort = ''
         hostPort: hostPort,
         containerPort: containerPort,
         protocol: protocol,
+        rangeSize: rangeSize,
         statusText: '',
         statusLevel: 'ok'
     });
     renderEditPortRows();
     updateEditExposureWarning();
+    regenerateEditSnippetFromRows();
 };
 
 window.removeEditPortRow = (id) => {
     editPortRows = editPortRows.filter(r => r.id !== id);
     renderEditPortRows();
     updateEditExposureWarning();
+    regenerateEditSnippetFromRows();
 };
 
 window.updateEditPortField = async (id, field, value) => {
@@ -1394,6 +1554,7 @@ window.updateEditPortField = async (id, field, value) => {
     const containerId = document.getElementById('edit-ports-container-id').value;
     const hPort = parseInt(row.hostPort, 10);
     const cPort = parseInt(row.containerPort, 10);
+    const rSize = parseInt(row.rangeSize, 10) || 1;
     if (hPort > 0 && cPort > 0) {
         try {
             const validation = await Podman.ValidatePortMapping({
@@ -1401,6 +1562,7 @@ window.updateEditPortField = async (id, field, value) => {
                 hostPort: hPort,
                 containerPort: cPort,
                 protocol: row.protocol,
+                rangeSize: rSize > 1 ? rSize : 0,
                 containerId: containerId
             });
             if (validation && !validation.valid) {
@@ -1421,6 +1583,7 @@ window.updateEditPortField = async (id, field, value) => {
 
     updateEditPortRowStatus(id);
     updateEditExposureWarning();
+    regenerateEditSnippetFromRows();
 };
 
 window.findFreePortForEditRow = async (id) => {
@@ -1436,6 +1599,7 @@ window.findFreePortForEditRow = async (id) => {
             showNotification(`Found free port ${freePort}/${row.protocol.toUpperCase()}`, false, true);
             renderEditPortRows();
             updateEditExposureWarning();
+            regenerateEditSnippetFromRows();
         }
     } catch (err) {
         showNotification(`Could not find free port: ${err}`, true);
@@ -1456,11 +1620,13 @@ function renderEditPortRows() {
     }
 
     container.innerHTML = editPortRows.map(row => {
+        const rangeSize = parseInt(row.rangeSize, 10) || 1;
+        const rangePreview = rangeSize > 1 ? `<div class="row-validation-msg ok" style="margin-top: 2px;">Range: ${escapeHtml(formatPortRangeSuffix(row.hostPort || 0, rangeSize))} &rarr; ${escapeHtml(formatPortRangeSuffix(row.containerPort || 0, rangeSize))}</div>` : '';
         return `
             <div class="port-input-row" id="edit-port-row-${row.id}">
                 <div class="port-field-group" style="flex: 1.5;">
                     <span class="field-mini-label">Bind IP</span>
-                    <input type="text" class="form-input" value="${escapeAttr(row.hostIP)}" placeholder="127.0.0.1" onchange="updateEditPortField(${row.id}, 'hostIP', this.value)"/>
+                    <input type="text" class="form-input" value="${escapeAttr(row.hostIP)}" placeholder="blank = default" onchange="updateEditPortField(${row.id}, 'hostIP', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Host Port</span>
@@ -1469,6 +1635,10 @@ function renderEditPortRows() {
                 <div class="port-field-group" style="flex: 1;">
                     <span class="field-mini-label">Target Port</span>
                     <input type="number" class="form-input" value="${escapeAttr(row.containerPort)}" placeholder="80" min="1" max="65535" oninput="updateEditPortField(${row.id}, 'containerPort', this.value)"/>
+                </div>
+                <div class="port-field-group" style="flex: 0.7;">
+                    <span class="field-mini-label" title="Number of consecutive ports in this mapping, starting at Host/Target Port">Count / Range Size</span>
+                    <input type="number" class="form-input" value="${escapeAttr(rangeSize)}" min="1" max="65535" oninput="updateEditPortField(${row.id}, 'rangeSize', this.value)"/>
                 </div>
                 <div class="port-field-group" style="flex: 0.8;">
                     <span class="field-mini-label">Proto</span>
@@ -1486,6 +1656,7 @@ function renderEditPortRows() {
                     </button>
                 </div>
             </div>
+            ${rangePreview}
             <div class="row-validation-msg ${escapeAttr(row.statusLevel)}" id="edit-port-status-${row.id}"${row.statusText ? '' : ' style="display:none;"'}>${escapeHtml(row.statusText)}</div>
         `;
     }).join('');
@@ -1510,8 +1681,8 @@ function updateEditExposureWarning() {
     if (!warningBox) return;
 
     const hasWildcard = editPortRows.some(r => {
-        const bind = (r.hostIP || '').trim();
-        return bind === '0.0.0.0' || bind === '::' || bind === '*' || bind === '';
+        const cat = describeBindAddress(r.hostIP).category;
+        return cat === 'wildcard4' || cat === 'wildcard6' || cat === 'default';
     });
 
     if (hasWildcard) {
@@ -1519,29 +1690,13 @@ function updateEditExposureWarning() {
         warningBox.innerHTML = `
             <div class="warning-title">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                Wildcard / External Network Exposure
+                Wildcard / All Local Interfaces
             </div>
-            <div>One or more mappings use <code>0.0.0.0</code> (all interfaces). Use <code>127.0.0.1</code> for local host access.</div>
+            <div>One or more mappings bind all local interfaces (an omitted address, <code>0.0.0.0</code>, or <code>::</code>) — reachable from any host that can route to this machine, subject to firewall rules. This is not necessarily Internet-public. Use <code>127.0.0.1</code> for local-host-only access.</div>
         `;
     } else {
         warningBox.style.display = 'none';
         warningBox.innerHTML = '';
-    }
-}
-
-// Renders "<label> <code>path</code> (extra)" via safe DOM construction —
-// path is a filesystem path derived from container/Compose labels and must
-// never be interpolated into innerHTML.
-function setFileInfoLine(el, label, path, extra) {
-    el.textContent = '';
-    const strong = document.createElement('strong');
-    strong.textContent = label + ' ';
-    const code = document.createElement('code');
-    code.textContent = path || '';
-    el.appendChild(strong);
-    el.appendChild(code);
-    if (extra) {
-        el.appendChild(document.createTextNode(' (' + extra + ')'));
     }
 }
 
@@ -1554,7 +1709,6 @@ window.copyEditPortsSnippet = () => {
 window.submitPortMutation = async () => {
     const containerId = document.getElementById('edit-ports-container-id').value;
     const serviceName = document.getElementById('edit-ports-service-name').value;
-    const unitName = document.getElementById('edit-ports-unit-name').value;
     const isQuadlet = currentEditProvenance && currentEditProvenance.type === 'quadlet';
     const isCompose = currentEditProvenance && currentEditProvenance.type === 'compose';
 
@@ -1562,12 +1716,14 @@ window.submitPortMutation = async () => {
     for (const row of editPortRows) {
         const hPort = parseInt(row.hostPort, 10);
         const cPort = parseInt(row.containerPort, 10);
+        const rSize = parseInt(row.rangeSize, 10);
         if (cPort > 0) {
             structuredPorts.push({
                 hostIP: row.hostIP.trim(),
                 hostPort: isNaN(hPort) ? 0 : hPort,
                 containerPort: cPort,
-                protocol: (row.protocol || 'tcp').toLowerCase()
+                protocol: (row.protocol || 'tcp').toLowerCase(),
+                rangeSize: (!isNaN(rSize) && rSize > 1) ? rSize : 0
             });
         }
     }
@@ -1582,6 +1738,24 @@ window.submitPortMutation = async () => {
     }
 
     const submitBtn = document.getElementById('btn-submit-port-mutation');
+
+    // Compose/Quadlet are INSPECTION + GUIDANCE ONLY: Podder never mutates
+    // or restarts these workloads automatically. This regenerates the
+    // paste-ready snippet for the ports currently shown in the editor --
+    // it never calls a mutation transaction and never claims one ran.
+    if (isQuadlet || isCompose) {
+        try {
+            submitBtn.disabled = true;
+            await regenerateEditSnippetFromRows();
+            showNotification("Snippet regenerated below for the ports shown above. Podder has not modified the unit/compose file.", false, true);
+        } catch (err) {
+            showNotification(`Could not generate snippet: ${err}`, true);
+        } finally {
+            submitBtn.disabled = false;
+        }
+        return;
+    }
+
     const originalText = submitBtn.innerHTML;
 
     try {
@@ -1596,19 +1770,11 @@ window.submitPortMutation = async () => {
         stepsBox.style.display = 'block';
         stepsList.innerHTML = `<div style="color: var(--text-muted);">Starting mutation transaction...</div>`;
 
-        let res = null;
-
-        if (isQuadlet) {
-            res = await Podman.MutateQuadletPorts(unitName || serviceName, structuredPorts);
-        } else if (isCompose) {
-            res = await Podman.MutateComposePorts(containerId, structuredPorts);
-        } else {
-            res = await Podman.MutateContainerPorts({
-                containerId: containerId,
-                serviceName: serviceName,
-                newPorts: structuredPorts
-            });
-        }
+        const res = await Podman.MutateContainerPorts({
+            containerId: containerId,
+            serviceName: serviceName,
+            newPorts: structuredPorts
+        });
 
         if (!res) {
             showNotification("Mutation failed: Empty response from engine", true);
@@ -1626,21 +1792,13 @@ window.submitPortMutation = async () => {
             }).join('');
         }
 
+        // Defensive fallback: the frontend routes Compose/Quadlet workloads
+        // to the snippet-only path above before ever reaching this branch,
+        // but if the backend orchestrator guard still reports
+        // requiresExternal for some other provenance, surface its guidance
+        // rather than silently reporting a generic failure.
         if (res.requiresExternal) {
-            const guidanceBox = document.getElementById('edit-ports-guidance-box');
-            const guidanceText = document.getElementById('edit-ports-guidance-text');
-            const snippetWrapper = document.getElementById('edit-ports-snippet-wrapper');
-            const snippetText = document.getElementById('edit-ports-snippet-text');
-
-            guidanceBox.style.display = 'block';
-            guidanceText.textContent = res.guidance || 'External orchestrator action required.';
-            
-            if (res.composeSnippet || res.quadletSnippet) {
-                currentEditSnippet = res.composeSnippet || res.quadletSnippet;
-                snippetWrapper.style.display = 'block';
-                snippetText.textContent = currentEditSnippet;
-            }
-            showNotification("Orchestrator action required (see guidance above)", false, true);
+            showNotification(res.guidance || "This workload requires an external orchestrator action; automatic mutation is not available.", true);
             return;
         }
 

@@ -29,8 +29,26 @@ type ComposeFileDetails struct {
 // back to manual guidance rather than guess which file to touch.
 var ErrMultipleComposeFiles = errors.New("compose project is defined by multiple configuration files; automatic mutation is not safe")
 
-// FindComposeFile locates the compose file from project metadata or directory scan.
+// ErrComposeFileOutsideWorkingDir is returned when a container's Compose
+// provenance metadata (com.docker.compose.project.config_files or
+// equivalent) names a file that does not resolve within the container's
+// reported working directory. Provenance labels are discovery hints, not
+// filesystem authorization — a container (malicious or merely malformed)
+// must never be able to make Podder open an arbitrary accessible file
+// simply by claiming it is "the" compose file. Such a declaration is
+// treated as unresolved provenance: Podder will not guess at reading it.
+var ErrComposeFileOutsideWorkingDir = errors.New("declared compose config file is outside the container's reported working directory; treating as unresolved provenance rather than reading it")
+
+// FindComposeFile locates the compose file from project metadata or
+// directory scan. Both workingDir and projectConfigFiles are external
+// provenance metadata sourced from container labels — not filesystem
+// authorization — so every candidate is proven contained within workingDir
+// (resolveWithinRoot, symlink-safe canonicalization) before it is stat'd or
+// returned. An absolute config-file path pointing outside workingDir is
+// never read; see ErrComposeFileOutsideWorkingDir.
 func FindComposeFile(workingDir, projectConfigFiles string) (string, error) {
+	workingDir = strings.TrimSpace(workingDir)
+
 	if projectConfigFiles != "" {
 		var files []string
 		for _, f := range strings.Split(projectConfigFiles, ",") {
@@ -46,15 +64,15 @@ func FindComposeFile(workingDir, projectConfigFiles string) (string, error) {
 
 		if len(files) == 1 {
 			f := files[0]
-			if filepath.IsAbs(f) {
-				if _, err := os.Stat(f); err == nil {
-					return f, nil
-				}
-			} else if workingDir != "" {
-				p := filepath.Join(workingDir, f)
-				if _, err := os.Stat(p); err == nil {
-					return p, nil
-				}
+			if workingDir == "" {
+				return "", fmt.Errorf("%w: %q (no working directory reported to validate it against)", ErrComposeFileOutsideWorkingDir, f)
+			}
+			resolved, resolveErr := resolveWithinRoot(workingDir, f)
+			if resolveErr != nil {
+				return "", fmt.Errorf("%w: %q", ErrComposeFileOutsideWorkingDir, f)
+			}
+			if _, err := os.Stat(resolved); err == nil {
+				return resolved, nil
 			}
 		}
 	}
@@ -69,7 +87,10 @@ func FindComposeFile(workingDir, projectConfigFiles string) (string, error) {
 			"podman-compose.yml",
 		}
 		for _, cand := range candidates {
-			p := filepath.Join(workingDir, cand)
+			p, resolveErr := resolveWithinRoot(workingDir, cand)
+			if resolveErr != nil {
+				continue
+			}
 			if _, err := os.Stat(p); err == nil {
 				return p, nil
 			}

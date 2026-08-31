@@ -302,3 +302,91 @@ func TestIPv4AndIPv6WildcardStayDistinct(t *testing.T) {
 		t.Errorf("expected IPv4 and IPv6 wildcards to still conflict at the socket layer (fail-closed)")
 	}
 }
+
+// --- v1.4 hardening: CanonicalDeclaredBind / DeclaredEndpointsEquivalent ---
+//
+// These lock in the P1 requirement that declared-endpoint EQUALITY never
+// reuses the conflict-oriented normalization (NormalizeAddress/
+// AddressesConflict/EndpointsConflict), which deliberately folds an omitted
+// bind, "0.0.0.0", and "*" together for allocation-safety purposes. An
+// omitted host address, an explicit IPv4/IPv6 wildcard, an IPv4/IPv6
+// loopback, and a specific address must never be silently treated as the
+// same DECLARATION.
+
+func TestCanonicalDeclaredBind_DistinctCategoriesStayDistinct(t *testing.T) {
+	forms := map[string]string{
+		"omitted":       "",
+		"ipv4-wildcard": "0.0.0.0",
+		"ipv6-wildcard": "::",
+		"ipv4-loopback": "127.0.0.1",
+		"ipv6-loopback": "::1",
+		"specific-ipv4": "192.168.1.50",
+		"specific-ipv6": "2001:db8::1",
+	}
+	seen := make(map[string]string)
+	for name, addr := range forms {
+		canon := CanonicalDeclaredBind(addr)
+		if existing, ok := seen[canon]; ok {
+			t.Errorf("expected %q (%q) and %q (%q) to canonicalize distinctly, both got %q", name, addr, existing, forms[existing], canon)
+		}
+		seen[canon] = name
+	}
+}
+
+func TestCanonicalDeclaredBind_SynonymsFold(t *testing.T) {
+	// "*" is an internal host-listener shorthand for the IPv4 wildcard, and
+	// "localhost" is a textual synonym for 127.0.0.1 -- these ARE the same
+	// declaration, just spelled differently, and must canonicalize together.
+	if CanonicalDeclaredBind("*") != CanonicalDeclaredBind("0.0.0.0") {
+		t.Errorf("expected '*' and '0.0.0.0' to canonicalize to the same declared bind")
+	}
+	if CanonicalDeclaredBind("localhost") != CanonicalDeclaredBind("127.0.0.1") {
+		t.Errorf("expected 'localhost' and '127.0.0.1' to canonicalize to the same declared bind")
+	}
+	if CanonicalDeclaredBind("[::1]") != CanonicalDeclaredBind("::1") {
+		t.Errorf("expected bracketed and unbracketed IPv6 loopback to canonicalize to the same declared bind")
+	}
+}
+
+func TestDeclaredEndpointsEquivalent_OmittedIsNotWildcard(t *testing.T) {
+	// This is the exact discrepancy the v1.4 hardening pass closes: an
+	// omitted host bind ("") and an explicit "0.0.0.0" are NOT the same
+	// declaration, even though EndpointsConflict/AddressesConflict
+	// (conflict/allocation-safety semantics) treat both as wildcard.
+	if DeclaredEndpointsEquivalent("", "0.0.0.0") {
+		t.Errorf("expected omitted bind and explicit 0.0.0.0 to NOT be declared-equivalent")
+	}
+	if !EndpointsConflict("", "0.0.0.0") {
+		t.Errorf("expected omitted bind and explicit 0.0.0.0 to still conflict at the socket layer")
+	}
+	if DeclaredEndpointsEquivalent("", "::") {
+		t.Errorf("expected omitted bind and explicit :: to NOT be declared-equivalent")
+	}
+	if DeclaredEndpointsEquivalent("127.0.0.1", "::1") {
+		t.Errorf("expected IPv4 and IPv6 loopback to NOT be declared-equivalent")
+	}
+	if !DeclaredEndpointsEquivalent("127.0.0.1", "127.0.0.1") {
+		t.Errorf("expected identical declared binds to be equivalent")
+	}
+	if !DeclaredEndpointsEquivalent("*", "0.0.0.0") {
+		t.Errorf("expected the '*' shorthand and '0.0.0.0' to be declared-equivalent")
+	}
+}
+
+func TestEndpointsEquivalentForReconciliation_DelegatesToDeclaredEquivalence(t *testing.T) {
+	// EndpointsEquivalentForReconciliation must be a thin wrapper over
+	// DeclaredEndpointsEquivalent, not its own independent implementation
+	// that could silently drift back toward NormalizeAddress semantics.
+	cases := [][2]string{
+		{"", "0.0.0.0"},
+		{"0.0.0.0", "::"},
+		{"127.0.0.1", "::1"},
+		{"127.0.0.1", "127.0.0.1"},
+		{"*", "0.0.0.0"},
+	}
+	for _, c := range cases {
+		if EndpointsEquivalentForReconciliation(c[0], c[1]) != DeclaredEndpointsEquivalent(c[0], c[1]) {
+			t.Errorf("EndpointsEquivalentForReconciliation(%q, %q) diverged from DeclaredEndpointsEquivalent", c[0], c[1])
+		}
+	}
+}

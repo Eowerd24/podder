@@ -61,13 +61,19 @@ type PortClaim struct {
 
 // PortOverviewItem represents an entry in the aggregate Ports view.
 type PortOverviewItem struct {
-	ID                   string             `json:"id"`
-	Source               string             `json:"source"` // "podman", "host-listener", "registry-declared"
-	Owner                string             `json:"owner"`
-	ContainerID          string             `json:"containerId,omitempty"`
-	BindAddress          string             `json:"bindAddress"`
-	HostPort             uint16             `json:"hostPort"`
-	ContainerPort        uint16             `json:"containerPort,omitempty"`
+	ID            string `json:"id"`
+	Source        string `json:"source"` // "podman", "host-listener", "registry-declared"
+	Owner         string `json:"owner"`
+	ContainerID   string `json:"containerId,omitempty"`
+	BindAddress   string `json:"bindAddress"`
+	HostPort      uint16 `json:"hostPort"`
+	ContainerPort uint16 `json:"containerPort,omitempty"`
+	// RangeSize, when > 1, means this item actually represents a published
+	// port RANGE of that many ports starting at HostPort (and, when
+	// ContainerPort is set, ContainerPort) rather than a single port. The
+	// UI must render this as an inclusive range (e.g. "8000-8005"), never
+	// only the first port.
+	RangeSize            int                `json:"rangeSize,omitempty"`
 	Protocol             string             `json:"protocol"`
 	Exposure             string             `json:"exposure"` // "loopback", "specific-ip", "wildcard", "lan", "public", etc.
 	Status               string             `json:"status"`   // "ACTIVE", "STOPPED_CONFIGURED", "CONFLICT", "RESERVED", "MISSING", "PLANNED"
@@ -100,6 +106,16 @@ type PortOverviewSummary struct {
 	RegistryRemote   int    `json:"registryRemote"`
 	RegistryUnscoped int    `json:"registryUnscoped"`
 	LocalNode        string `json:"localNode,omitempty"`
+	// RegistryWarnings lists entries the TOLERANT display loader dropped
+	// (malformed/duplicate/unsupported — see validateAndFilterRegistryPorts).
+	// Display always proceeds despite these (see RegistryLoaded, still
+	// true) — but their presence means safety-critical operations
+	// (create/mutate/adopt/free-port selection) are BLOCKED until they're
+	// fixed, because the registry can no longer be safely enforced; see
+	// LoadPortRegistryStrict / CollectBlockingClaimsStrict. The operator
+	// must be able to tell "registry loaded cleanly" apart from "registry
+	// loaded for observation with N invalid entries" at a glance.
+	RegistryWarnings []string `json:"registryWarnings,omitempty"`
 }
 
 // PortOverview is the aggregate model returned to the frontend.
@@ -642,12 +658,12 @@ func (p *PodmanService) CollectBlockingClaimsStrict() ([]PortClaim, error) {
 		return nil, fmt.Errorf("cannot reliably determine port availability: failed to read settings: %w", err)
 	}
 	if settings.PortRegistry.Enabled && strings.TrimSpace(settings.PortRegistry.Path) != "" {
-		regResult, err := p.LoadPortRegistry(settings.PortRegistry.Path)
+		// SAFETY/BLOCKING mode: unlike display/observation, a registry
+		// enabled for enforcement must never let a malformed/dropped entry
+		// be silently treated as irrelevant — see LoadPortRegistryStrict.
+		regResult, err := p.LoadPortRegistryStrict(settings.PortRegistry.Path)
 		if err != nil {
-			return nil, fmt.Errorf("cannot reliably determine port availability: port registry is enabled but failed to load: %w", err)
-		}
-		if !regResult.Loaded {
-			return nil, fmt.Errorf("cannot reliably determine port availability: port registry is enabled but failed to load: %s", regResult.Error)
+			return nil, fmt.Errorf("cannot reliably determine port availability: %w", err)
 		}
 		localNode := resolveLocalNode(settings)
 		for _, rp := range regResult.Ports {
@@ -750,6 +766,12 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		return nil
 	}
 
+	// findRegistryBindMismatch is scoped to lifecycle states that actually
+	// assert a live "this should be running with exactly this bind"
+	// expectation (see registryStateExpectsBindMatch) — a reservation or a
+	// planned/retired record makes no such runtime assertion, so a
+	// different observed bind at the same port/protocol/service is not a
+	// "mismatch" for those states.
 	findRegistryBindMismatch := func(bind string, port uint16, protocol string, rangeSize int, serviceName string) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded || serviceName == "" {
 			return nil
@@ -757,6 +779,9 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		for i := range registryResult.Ports {
 			rp := &registryResult.Ports[i]
 			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
+				continue
+			}
+			if !registryStateExpectsBindMatch(rp.State) {
 				continue
 			}
 			if rp.Listener.Port == port && NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) && normalizedRangeSize(rp.RangeSize) == normalizedRangeSize(rangeSize) && strings.EqualFold(rp.Service, serviceName) && !EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
@@ -807,9 +832,14 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			var regID, regState, scope, appProto, purpose string
 			scope = exposure
 			if regMatch := findRegistryMatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName); regMatch != nil {
-				reconcileStatus = "MATCH"
+				lifecycleStatus, countsAsMatch := classifyRegistryMatch(regMatch.State)
+				reconcileStatus = lifecycleStatus
 				matchedRegistryIDs[regMatch.ID] = true
-				registryMatchCount++
+				if countsAsMatch {
+					registryMatchCount++
+				} else if strings.EqualFold(regMatch.State, "reserved") {
+					registryReservedCount++
+				}
 				regID = regMatch.ID
 				regState = regMatch.State
 				scope = regMatch.Scope
@@ -838,6 +868,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				HostPort:             m.HostPort,
 				ContainerPort:        m.ContainerPort,
 				Protocol:             strings.ToUpper(m.Protocol),
+				RangeSize:            m.RangeSize,
 				Exposure:             exposure,
 				Status:               status,
 				ConflictNote:         conflictNote,
@@ -897,9 +928,14 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			var regID, regState, scope, appProto, purpose string
 			scope = exposure
 			if regMatch := findRegistryMatch(l.Address, l.Port, l.Protocol, 1, owner); regMatch != nil {
-				reconcileStatus = "MATCH"
+				lifecycleStatus, countsAsMatch := classifyRegistryMatch(regMatch.State)
+				reconcileStatus = lifecycleStatus
 				matchedRegistryIDs[regMatch.ID] = true
-				registryMatchCount++
+				if countsAsMatch {
+					registryMatchCount++
+				} else if strings.EqualFold(regMatch.State, "reserved") {
+					registryReservedCount++
+				}
 				regID = regMatch.ID
 				regState = regMatch.State
 				scope = regMatch.Scope
@@ -971,6 +1007,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 					HostPort:             rp.Listener.Port,
 					ContainerPort:        rp.Container.Port,
 					Protocol:             strings.ToUpper(rp.Protocol),
+					RangeSize:            rp.RangeSize,
 					Exposure:             exposure,
 					Status:               status,
 					IsContainer:          false,
@@ -1004,13 +1041,19 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 					status = "RESERVED_FREE"
 					reconcileStatus = "RESERVED_FREE"
 				}
-			} else if rp.State == "planned" {
-				status = "PLANNED"
-				reconcileStatus = "PLANNED"
 			} else {
-				registryMissingCount++
-				status = "DECLARED_MISSING"
-				reconcileStatus = "DECLARED_MISSING"
+				// planned/temporary/deprecated/retired/active: explicit
+				// per-lifecycle semantics (see classifyRegistryMissing) —
+				// only "active" (and any unrecognized state, defaulting to
+				// active semantics) is an operational fault when missing.
+				// A temporary/deprecated/retired endpoint simply not being
+				// observed right now is expected, not a fault.
+				lifecycleStatus, isFault := classifyRegistryMissing(rp.State)
+				status = lifecycleStatus
+				reconcileStatus = lifecycleStatus
+				if isFault {
+					registryMissingCount++
+				}
 			}
 
 			exposure := CategorizeExposure(rp.Listener.Address)
@@ -1031,6 +1074,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				HostPort:             rp.Listener.Port,
 				ContainerPort:        rp.Container.Port,
 				Protocol:             strings.ToUpper(rp.Protocol),
+				RangeSize:            rp.RangeSize,
 				Exposure:             exposure,
 				Status:               status,
 				IsContainer:          rp.Container.Port > 0,
@@ -1061,6 +1105,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			RegistryRemote:         registryRemoteCount,
 			RegistryUnscoped:       registryUnscopedCount,
 			LocalNode:              localNode,
+			RegistryWarnings:       registryWarnings(registryResult),
 		},
 	}
 

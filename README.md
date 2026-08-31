@@ -27,7 +27,7 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 
 The easiest way to install Podder is to download the pre-compiled executable directly from the GitHub Releases. You do **not** need to install Go or Node.js.
 
-Current release target: `1.2.0`
+Current release target: `1.3.0`
 
 ### Option A: 1-Line Installation (Recommended)
 You can download the latest binary directly into your path and make it executable with a single command:
@@ -83,7 +83,7 @@ git clone https://github.com/Eowerd24/podder.git
 cd podder
 wails3 dev
 ```
-To compile a native release binary, run `wails3 build`. The packaging metadata in this branch is aligned to release `1.2.0`.
+To compile a native release binary, run `wails3 build`. The packaging metadata in this branch is aligned to release `1.3.0`.
 
 3. **Explore Wails3 Documentation**:
    Visit [v3.wails.io](https://v3.wails.io/) for Wails v3 guides, API references, and templates.

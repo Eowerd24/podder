@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-08-31
+
+### Added
+- Transaction-safe, schema-versioned Podder workload replay with complete bind, environment, entrypoint, command-argument, lifecycle, and port-range preservation.
+- Default-deny workload adoption checks that block conversion when the source container uses settings Podder cannot reproduce safely.
+- Exact post-change verification and structured rollback reporting for managed containers, Compose services, and user-scoped Quadlet units.
+- Node-scoped external port-registry reconciliation and explicit handling of ambiguous workload provenance.
+- Extensive deterministic tests backed by injectable command runners instead of the host's live Podman state.
+
+### Changed
+- Port discovery now fails closed during safety-critical validation, while the overview remains tolerant of partial discovery failures.
+- Compose mutations are service-scoped, support safe single-file projects, preserve file permissions, and restore both configuration and runtime state on rollback.
+- Quadlet editing is limited to user-scoped units, validates generated systemd units before restart, and preserves the unit's prior active state.
+- Network creation validates names, CIDRs, gateways, address families, and subnet overlap; ordinary network removal refuses to detach connected containers forcibly.
+- CI now runs vet, unit tests, race tests, a pinned Wails build, and publishes only the artifact that passed those checks.
+- Release identity, package metadata, module path, and license information now consistently identify Podder.
+
+### Security
+- Escaped untrusted backend data at the HTML, attribute, and inline-JavaScript boundaries; masked secret-like environment values in previews.
+- WebKit sandbox disabling is now opt-in, and direct mutation of ad-hoc or ambiguously owned containers is blocked.
+
+### Fixed
+- Full published-port ranges and IPv6 addresses now round-trip through validation, mutation, Compose, Quadlet, registry, and verification paths.
+- Legacy managed specs retain their ownership label when upgraded and replayed.
+
 ## [1.2.0] - 2026-08-30
 
 ### Added

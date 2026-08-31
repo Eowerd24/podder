@@ -547,6 +547,77 @@ func TestMutateContainerPorts_UnchangedPortDoesNotConflictWithItself(t *testing.
 	}
 }
 
+// TestMutateContainerPorts_RenameFailureLeavesOriginalUntouched covers item
+// 23: if the very first QUIESCE step (the rename) fails, the original
+// container was never moved — this must be reported directly, without
+// attempting (and spuriously failing) a rollback that has no backup to
+// restore from.
+func TestMutateContainerPorts_RenameFailureLeavesOriginalUntouched(t *testing.T) {
+	sim := newMutationSim()
+	oldPorts := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	svc := setupManagedContainer(t, sim, "cache", "alpine", "running", oldPorts)
+	sim.failStep = "rename"
+
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "cache", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 8081, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("expected mutation to fail when the initial rename fails")
+	}
+	if result.RolledBack {
+		t.Errorf("expected RolledBack=false: nothing was moved, so there is nothing to roll back")
+	}
+	if result.ManualRecoveryRequired {
+		t.Errorf("expected ManualRecoveryRequired=false: the original container was never touched")
+	}
+	if result.Rollback != nil {
+		t.Errorf("expected no rollback to have been attempted at all, got: %+v", result.Rollback)
+	}
+
+	c := sim.containers["cache"]
+	if c == nil {
+		t.Fatalf("expected the original container to still exist under its original name")
+	}
+	if c.state != "running" || len(c.ports) != 1 || c.ports[0].HostPort != 8080 {
+		t.Errorf("expected the original container completely untouched, got: %+v", c)
+	}
+}
+
+// TestMutateContainerPorts_StopFailureDuringQuiesceStillRestoresOriginal
+// covers item 23's second half: a QUIESCE-stage error that happens AFTER
+// the rename (so the original genuinely was moved) must still trigger a
+// real, verified rollback — the final observed state is what decides the
+// outcome, not merely that some intermediate command returned an error.
+func TestMutateContainerPorts_StopFailureDuringQuiesceStillRestoresOriginal(t *testing.T) {
+	sim := newMutationSim()
+	oldPorts := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	svc := setupManagedContainer(t, sim, "queue", "alpine", "running", oldPorts)
+	sim.failStep = "stop"
+
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "queue", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 8082, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("expected mutation to fail when stop fails during quiesce")
+	}
+	if !result.RolledBack {
+		t.Fatalf("expected a verified rollback when stop fails after a successful rename, result: %+v", result)
+	}
+	if result.ManualRecoveryRequired {
+		t.Errorf("expected no manual recovery when the original is confirmed restored")
+	}
+
+	c := sim.containers["queue"]
+	if c == nil {
+		t.Fatalf("expected the original container to still exist — state must not be destroyed")
+	}
+	if c.state != "running" || len(c.ports) != 1 || c.ports[0].HostPort != 8080 {
+		t.Errorf("expected the original container's state intact after rollback, got: %+v", c)
+	}
+}
+
 func TestNewBackupNameIsUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 50; i++ {

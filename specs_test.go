@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,7 +14,9 @@ func TestSpecsCRUD(t *testing.T) {
 	os.Setenv("HOME", tempDir)
 	setTestConfigHome(t, tempDir)
 
-	service := &PodmanService{}
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) { return "[]", "", nil })
+	service := &PodmanService{runner: runner}
 
 	// 1. Initial list should be empty
 	specs, err := service.ListSpecs()
@@ -110,7 +113,11 @@ func TestLegacySpecWithoutSchemaVersionMigratesToManaged(t *testing.T) {
 	if err := os.MkdirAll(servicesDir, 0o700); err != nil {
 		t.Fatalf("failed to create services dir: %v", err)
 	}
-	if err := os.WriteFile(getSpecFilePath("legacy-app"), []byte(legacyJSON), 0o600); err != nil {
+	legacyPath, err := getSpecFilePath("legacy-app")
+	if err != nil {
+		t.Fatalf("unexpected error computing spec path: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(legacyJSON), 0o600); err != nil {
 		t.Fatalf("failed to write legacy fixture: %v", err)
 	}
 
@@ -151,6 +158,88 @@ func TestLegacySpecWithoutSchemaVersionMigratesToManaged(t *testing.T) {
 	}
 }
 
+// --- Spec filename identity: distinct logical service names must never
+// collide on disk, and a validated name is used as the filename stem
+// directly rather than through any lossy transformation. ---
+
+func TestValidateServiceNameGrammar(t *testing.T) {
+	valid := []string{"my-app", "my_app", "my.app", "app2", "A", "app-v2.1"}
+	for _, name := range valid {
+		if err := validateServiceName(name); err != nil {
+			t.Errorf("expected %q to be a valid service name, got: %v", name, err)
+		}
+	}
+
+	invalid := []string{"", "my app", "my/app", "../etc/passwd", "-leading-dash", ".leading-dot", "app!", "app$(rm)"}
+	for _, name := range invalid {
+		if err := validateServiceName(name); err == nil {
+			t.Errorf("expected %q to be rejected by the service name grammar", name)
+		}
+	}
+}
+
+// TestSpecNamesCannotCollideOnDisk is the exact regression this fix
+// targets: under the old lossy sanitizeSpecName ('/' -> '-', ".." stripped),
+// distinct logical names like "a/b" and "a-b" both became the same
+// "a-b.json" file. Under the canonical grammar, "a/b" is simply rejected
+// outright (it's not a valid service name) rather than silently colliding
+// with a different name that IS valid.
+func TestSpecNamesCannotCollideOnDisk(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	svc := &PodmanService{}
+	if err := svc.SaveSpec(ContainerSpec{Name: "a-b", Image: "alpine"}); err != nil {
+		t.Fatalf("failed to save spec 'a-b': %v", err)
+	}
+
+	// A distinct logical name that would have collided with "a-b" under the
+	// old lossy transform must be rejected outright, not silently folded
+	// into the existing "a-b" spec.
+	if err := svc.SaveSpec(ContainerSpec{Name: "a/b", Image: "alpine"}); err == nil {
+		t.Fatalf("expected 'a/b' to be rejected by the canonical service-name grammar")
+	}
+
+	// The original "a-b" spec must be completely unaffected by the rejected
+	// attempt.
+	loaded, err := svc.GetSpec("a-b")
+	if err != nil {
+		t.Fatalf("expected 'a-b' spec to still exist and be unaffected: %v", err)
+	}
+	if loaded.Name != "a-b" {
+		t.Errorf("expected untouched spec name 'a-b', got %q", loaded.Name)
+	}
+
+	specs, err := svc.ListSpecs()
+	if err != nil {
+		t.Fatalf("unexpected error listing specs: %v", err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("expected exactly 1 spec on disk (the rejected write must not have created a second file under any name), got %d: %+v", len(specs), specs)
+	}
+}
+
+// TestPathTraversalServiceNameRejected proves a service name cannot be used
+// to escape the services directory.
+func TestPathTraversalServiceNameRejected(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	svc := &PodmanService{}
+	if err := svc.SaveSpec(ContainerSpec{Name: "../../etc/passwd", Image: "alpine"}); err == nil {
+		t.Fatalf("expected a path-traversal service name to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "..", "..", "etc", "passwd")); err == nil {
+		t.Fatalf("a file must not have been created outside the services directory")
+	}
+}
+
 func TestSpecFilePermissionsAreRestrictive(t *testing.T) {
 	tempDir := t.TempDir()
 	origHome := os.Getenv("HOME")
@@ -173,7 +262,11 @@ func TestSpecFilePermissionsAreRestrictive(t *testing.T) {
 		t.Errorf("expected services dir mode 0700, got %o", perm)
 	}
 
-	fileInfo, err := os.Stat(getSpecFilePath("secret-app"))
+	secretPath, err := getSpecFilePath("secret-app")
+	if err != nil {
+		t.Fatalf("unexpected error computing spec path: %v", err)
+	}
+	fileInfo, err := os.Stat(secretPath)
 	if err != nil {
 		t.Fatalf("failed to stat spec file: %v", err)
 	}
@@ -350,6 +443,101 @@ func TestDeploySpecBackupCleanupWarningIsSuccessful(t *testing.T) {
 	}
 	if sim.containers["deploy-cache"] == nil || sim.containers[result.BackupContainerName] == nil {
 		t.Fatalf("expected verified replacement and recoverable backup to remain")
+	}
+}
+
+// --- DeleteSpec must not orphan a live Podder-managed container ---
+
+func TestDeleteSpec_AllowedWhenNoRuntimeWorkloadExists(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	sim := newMutationSim() // no containers at all
+	svc := &PodmanService{runner: sim}
+	if err := svc.SaveSpec(ContainerSpec{Name: "orphan-app", Image: "alpine:latest"}); err != nil {
+		t.Fatalf("failed to save spec: %v", err)
+	}
+
+	if err := svc.DeleteSpec("orphan-app"); err != nil {
+		t.Fatalf("expected spec deletion to succeed when no runtime workload exists, got: %v", err)
+	}
+	if _, err := svc.GetSpec("orphan-app"); err == nil {
+		t.Fatalf("expected the spec to actually be deleted")
+	}
+}
+
+func TestDeleteSpec_BlockedWhenMatchingManagedWorkloadExists(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	sim := newMutationSim()
+	// A running container that carries THIS service's Podder ownership labels.
+	sim.addContainer("live-app", "alpine:latest", "running", nil, true, "live-app")
+	svc := &PodmanService{runner: sim}
+	if err := svc.SaveSpec(ContainerSpec{Name: "live-app", Image: "alpine:latest"}); err != nil {
+		t.Fatalf("failed to save spec: %v", err)
+	}
+
+	err := svc.DeleteSpec("live-app")
+	if err == nil {
+		t.Fatalf("expected spec deletion to be blocked while a matching managed workload exists")
+	}
+	if _, getErr := svc.GetSpec("live-app"); getErr != nil {
+		t.Fatalf("expected the spec to remain on disk after a blocked deletion, got: %v", getErr)
+	}
+}
+
+func TestDeleteSpec_UnrelatedWorkloadDoesNotBlock(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	sim := newMutationSim()
+	// A managed container for a DIFFERENT service must not block deleting
+	// this one's spec.
+	sim.addContainer("other-app", "alpine:latest", "running", nil, true, "other-app")
+	svc := &PodmanService{runner: sim}
+	if err := svc.SaveSpec(ContainerSpec{Name: "target-app", Image: "alpine:latest"}); err != nil {
+		t.Fatalf("failed to save spec: %v", err)
+	}
+
+	if err := svc.DeleteSpec("target-app"); err != nil {
+		t.Fatalf("expected an unrelated managed workload to not block deletion, got: %v", err)
+	}
+	if _, err := svc.GetSpec("target-app"); err == nil {
+		t.Fatalf("expected the spec to actually be deleted")
+	}
+}
+
+func TestDeleteSpec_FailsClosedWhenContainersCannotBeInspected(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return errOut("podman: connection refused")
+	})
+	svc := &PodmanService{runner: runner}
+	if err := svc.SaveSpec(ContainerSpec{Name: "unknown-app", Image: "alpine:latest"}); err != nil {
+		t.Fatalf("failed to save spec: %v", err)
+	}
+
+	if err := svc.DeleteSpec("unknown-app"); err == nil {
+		t.Fatalf("expected spec deletion to fail closed when local containers cannot be inspected")
+	}
+	if _, err := svc.GetSpec("unknown-app"); err != nil {
+		t.Fatalf("expected the spec to remain on disk when deletion fails closed, got: %v", err)
 	}
 }
 

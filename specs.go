@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -74,6 +75,16 @@ func ValidateSpec(spec ContainerSpec) []string {
 	}
 	if spec.Managed && strings.TrimSpace(spec.Name) == "" {
 		errs = append(errs, "a managed spec must have a non-empty name")
+	}
+	if spec.Managed && strings.TrimSpace(spec.Name) != "" {
+		// A managed spec's Name becomes its on-disk filename stem
+		// (getSpecFilePath) with no lossy transformation, so it must match
+		// the canonical service-name grammar up front — before any file is
+		// ever written — rather than being silently reduced to something
+		// that could collide with a different logical name.
+		if err := validateServiceName(strings.TrimSpace(spec.Name)); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	if spec.Managed {
 		if spec.SchemaVersion < CurrentSpecSchemaVersion || !spec.ReplayComplete {
@@ -180,16 +191,37 @@ func getServicesDir() string {
 	return filepath.Join(getConfigDir(), "services")
 }
 
-func sanitizeSpecName(name string) string {
-	name = strings.TrimSpace(name)
-	name = strings.ReplaceAll(name, "/", "-")
-	name = strings.ReplaceAll(name, "..", "")
-	return name
+// serviceNamePattern is the canonical service-name grammar: it must start
+// with a letter or digit and contain only letters, digits, '_', '.', or
+// '-'. Notably it excludes '/' entirely, so a validated name can never
+// escape the services directory or collide with another name via path
+// separators.
+var serviceNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+// validateServiceName enforces the canonical service-name grammar. A
+// validated name is used AS THE FILENAME STEM DIRECTLY (see
+// getSpecFilePath) rather than through any lossy transformation — the
+// previous sanitizeSpecName approach (replacing '/' with '-', stripping
+// "..") let distinct logical names collide on disk (e.g. "a/b" and "a-b"
+// both became "a-b.json"), which is unacceptable for a service's
+// authoritative on-disk identity.
+func validateServiceName(name string) error {
+	if !serviceNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid service name %q: must start with a letter or digit and contain only letters, digits, '_', '.', or '-'", name)
+	}
+	return nil
 }
 
-func getSpecFilePath(name string) string {
-	safeName := sanitizeSpecName(name)
-	return filepath.Join(getServicesDir(), safeName+".json")
+// getSpecFilePath is the single source of truth for a service name's
+// on-disk spec path, used identically by save/get/delete and by candidate
+// prepare/commit (create and adopt). It refuses any name that does not
+// match the canonical grammar rather than silently transforming it.
+func getSpecFilePath(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if err := validateServiceName(name); err != nil {
+		return "", err
+	}
+	return filepath.Join(getServicesDir(), name+".json"), nil
 }
 
 // isCandidateSpecFile reports whether a services-dir entry is a not-yet-committed
@@ -217,6 +249,9 @@ func saveSpec(spec ContainerSpec) error {
 	if spec.Name == "" {
 		return fmt.Errorf("service name cannot be empty")
 	}
+	if err := validateServiceName(spec.Name); err != nil {
+		return err
+	}
 	spec.Image = strings.TrimSpace(spec.Image)
 	if spec.Image == "" {
 		return fmt.Errorf("image name cannot be empty")
@@ -241,7 +276,11 @@ func saveSpec(spec ContainerSpec) error {
 		return fmt.Errorf("failed to serialize container spec: %w", err)
 	}
 
-	return writePrivateFileAtomic(getSpecFilePath(spec.Name), data)
+	filePath, err := getSpecFilePath(spec.Name)
+	if err != nil {
+		return err
+	}
+	return writePrivateFileAtomic(filePath, data)
 }
 
 // writeCandidateSpec persists a not-yet-authoritative draft of spec to the
@@ -255,6 +294,9 @@ func writeCandidateSpec(spec ContainerSpec) (string, error) {
 	spec.Name = strings.TrimSpace(spec.Name)
 	if spec.Name == "" {
 		return "", fmt.Errorf("service name cannot be empty")
+	}
+	if err := validateServiceName(spec.Name); err != nil {
+		return "", err
 	}
 	spec.SchemaVersion = CurrentSpecSchemaVersion
 
@@ -274,8 +316,7 @@ func writeCandidateSpec(spec ContainerSpec) (string, error) {
 		return "", fmt.Errorf("failed to serialize candidate spec: %w", err)
 	}
 
-	safeName := sanitizeSpecName(spec.Name)
-	f, err := os.CreateTemp(servicesDir, safeName+".candidate-*.json")
+	f, err := os.CreateTemp(servicesDir, spec.Name+".candidate-*.json")
 	if err != nil {
 		return "", fmt.Errorf("failed to create candidate spec file: %w", err)
 	}
@@ -312,7 +353,10 @@ func commitCandidateSpec(candidatePath string, spec ContainerSpec) error {
 	if candidatePath == "" {
 		return fmt.Errorf("no candidate spec to commit")
 	}
-	finalPath := getSpecFilePath(spec.Name)
+	finalPath, err := getSpecFilePath(spec.Name)
+	if err != nil {
+		return err
+	}
 	if err := os.Rename(candidatePath, finalPath); err != nil {
 		return fmt.Errorf("failed to commit candidate spec: %w", err)
 	}
@@ -330,7 +374,10 @@ func discardCandidateSpec(candidatePath string) {
 
 // GetSpec loads a declarative container specification by service name.
 func (p *PodmanService) GetSpec(name string) (*ContainerSpec, error) {
-	filePath := getSpecFilePath(name)
+	filePath, err := getSpecFilePath(name)
+	if err != nil {
+		return nil, fmt.Errorf("spec not found for service %s: %w", name, err)
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("spec not found for service %s: %w", name, err)
@@ -405,8 +452,35 @@ func (p *PodmanService) ListSpecs() ([]ContainerSpec, error) {
 }
 
 // DeleteSpec removes a declarative container specification from storage.
+// This refuses while a live Podder-managed container still carries this
+// service's ownership labels (io.podder.managed=true,
+// io.podder.service=<name>): deleting the spec out from under a running
+// managed workload would orphan it — a container claiming Podder ownership
+// with no authoritative spec on disk to recreate/verify it from, violating
+// the core managed-workload invariant. A deliberate "detach from Podder"
+// feature, if added, must be its own explicit workflow that updates
+// ownership labels safely; it must never happen implicitly via spec
+// deletion.
 func (p *PodmanService) DeleteSpec(name string) error {
-	filePath := getSpecFilePath(name)
+	name = strings.TrimSpace(name)
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return fmt.Errorf("refusing to delete spec for %s: local containers could not be inspected, and deleting the spec without checking risks orphaning a live managed workload: %w", name, err)
+	}
+	for _, c := range containers {
+		if c.Provenance.Type == "podder" && strings.EqualFold(c.Provenance.Service, name) {
+			cName := c.Id
+			if len(c.Names) > 0 {
+				cName = strings.TrimPrefix(c.Names[0], "/")
+			}
+			return fmt.Errorf("refusing to delete spec for %s: a running Podder-managed container (%s) still carries this service's ownership labels; stop and remove that container (or migrate it to a different spec) before deleting its spec, so no managed workload is ever left without an authoritative spec", name, cName)
+		}
+	}
+
+	filePath, err := getSpecFilePath(name)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete spec for %s: %w", name, err)
 	}
@@ -472,7 +546,7 @@ func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
 			candidate := findContainerByIdentity(current, result.NewContainerID)
 			if result.NewContainerID != "" && candidate != nil {
 				p.StopContainer(result.NewContainerID)
-				removeErr := p.RemoveContainer(result.NewContainerID)
+				removeErr := p.forceRemoveContainer(result.NewContainerID)
 				removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool { return p.containerAbsent(result.NewContainerID, "") })
 				if !removed {
 					result.ManualRecoveryRequired = true
@@ -504,7 +578,7 @@ func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
 		})
 		if !verified {
 			p.StopContainer(spec.Name)
-			removeErr := p.RemoveContainer(spec.Name)
+			removeErr := p.forceRemoveContainer(spec.Name)
 			removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool { return p.containerAbsent(result.NewContainerID, spec.Name) })
 			if !removed {
 				result.ManualRecoveryRequired = true
@@ -603,7 +677,7 @@ func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
 		return rollback("Deployment failed: replacement identity, lifecycle, image, labels, or ports did not verify.", true)
 	}
 
-	removeErr := p.RemoveContainer(backupName)
+	removeErr := p.forceRemoveContainer(backupName)
 	removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool { return p.containerAbsent(target.Id, backupName) })
 	result.Success = true
 	if !removed {

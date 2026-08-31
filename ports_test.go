@@ -308,18 +308,39 @@ func TestBuildRunArgsFromSpecMultipleBindsAndEnv(t *testing.T) {
 func TestValidatePortMapping(t *testing.T) {
 	service := &PodmanService{}
 
-	// 1. Invalid host port
+	// 1. HostPort==0 policy: a Podder-managed workload must name an
+	// explicit host port (no unpredictable auto-assigned endpoint for a
+	// declarative managed service), so HostPort==0 is invalid when Managed.
 	res1, err := service.ValidatePortMapping(PortMappingRequest{
 		HostIP:        "127.0.0.1",
 		HostPort:      0,
 		ContainerPort: 80,
 		Protocol:      "tcp",
+		Managed:       true,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if res1.Valid {
-		t.Errorf("expected port 0 to be invalid")
+		t.Errorf("expected port 0 to be invalid for a managed mapping")
+	}
+
+	// 1b. Unmanaged/ad-hoc creation may leave HostPort==0 to let Podman
+	// auto-assign a host port — the frontend already interprets a blank
+	// Host Port field this way, and backend validation must not
+	// contradict that for a mapping that is explicitly not managed.
+	res1b, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP:        "127.0.0.1",
+		HostPort:      0,
+		ContainerPort: 80,
+		Protocol:      "tcp",
+		Managed:       false,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res1b.Valid {
+		t.Errorf("expected port 0 to be valid for an unmanaged mapping (Podman auto-assign), checks: %+v", res1b.Checks)
 	}
 
 	// 2. Invalid container port
@@ -613,5 +634,111 @@ func TestFindConflictWithIgnoreContainer(t *testing.T) {
 	conflict2 := FindConflict(claims, candidate2, "")
 	if conflict2 == nil || conflict2.OwnerName != "n8n" {
 		t.Errorf("expected conflict with n8n, got %+v", conflict2)
+	}
+}
+
+// --- Ranged Podman claims must be recognized as covering every host
+// listener within their range during ss deduplication, not just their
+// starting port — otherwise a container publishing 8000-8005 gets its own
+// ss observations for 8001-8005 reintroduced as independent, un-owned
+// host-listener claims that a same-container mutation cannot ignore. ---
+
+// ssListenersForRange builds "ss -H -lnt"-style output with one LISTEN line
+// per port in [start, start+count), all bound to the given address.
+func ssListenersForRange(address string, start uint16, count int) string {
+	var sb strings.Builder
+	for i := 0; i < count; i++ {
+		fmt.Fprintf(&sb, "LISTEN   0        4096                     %s:%d      0.0.0.0:*   \n", address, int(start)+i)
+	}
+	return sb.String()
+}
+
+func TestClaimCoversListenerRangeAware(t *testing.T) {
+	rangeClaim := PortClaim{Address: "0.0.0.0", Port: 8000, Protocol: "tcp", RangeSize: 6, Source: "podman"}
+
+	for port := uint16(8000); port <= 8005; port++ {
+		l := HostListener{Address: "0.0.0.0", Port: port, Protocol: "tcp"}
+		if !claimCoversListener(rangeClaim, l) {
+			t.Errorf("expected ranged claim 8000-8005 to cover listener on port %d", port)
+		}
+	}
+
+	outside := HostListener{Address: "0.0.0.0", Port: 8006, Protocol: "tcp"}
+	if claimCoversListener(rangeClaim, outside) {
+		t.Errorf("expected ranged claim 8000-8005 to NOT cover listener on port 8006")
+	}
+
+	wrongProto := HostListener{Address: "0.0.0.0", Port: 8003, Protocol: "udp"}
+	if claimCoversListener(rangeClaim, wrongProto) {
+		t.Errorf("expected a TCP range claim to not cover a UDP listener solely on port number")
+	}
+}
+
+func TestCollectPortClaimsForDisplayRangeDedupesAllListeners(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return `[{"Id":"abc123container","Names":["ranged-app"],"State":"running","Ports":[{"host_ip":"0.0.0.0","container_port":9000,"host_port":8000,"range":6,"protocol":"tcp"}]}]`, "", nil
+	})
+	runner.On("ss", func(n string, args []string) (string, string, error) {
+		if len(args) > 0 && strings.Contains(args[len(args)-1], "u") {
+			return "", "", nil
+		}
+		return ssListenersForRange("0.0.0.0", 8000, 6), "", nil
+	})
+	service := &PodmanService{runner: runner}
+
+	claims, err := service.CollectPortClaimsForDisplay()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var podmanClaims, hostListenerClaims int
+	for _, c := range claims {
+		switch c.Source {
+		case "podman":
+			podmanClaims++
+		case "host-listener":
+			hostListenerClaims++
+			t.Errorf("did not expect an independent host-listener claim for a port already covered by the container's own ranged mapping, got: %+v", c)
+		}
+	}
+	if podmanClaims != 1 {
+		t.Fatalf("expected exactly one podman range claim, got %d: %+v", podmanClaims, claims)
+	}
+	if hostListenerClaims != 0 {
+		t.Fatalf("expected 0 independent host-listener claims for ports covered by the range, got %d", hostListenerClaims)
+	}
+}
+
+// TestRangedMutationIgnoresOwnSSObservations is the exact regression from
+// the finding: a Podman mapping of 8000-8005 must not have its own ss
+// observations for 8001-8005 reintroduced as independent claims that a
+// same-container mutation (which correctly ignores its own ContainerID)
+// cannot ignore, since a host-listener claim never carries a ContainerID.
+func TestRangedMutationIgnoresOwnSSObservations(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return `[{"Id":"abc123container","Names":["ranged-app"],"State":"running","Ports":[{"host_ip":"0.0.0.0","container_port":9000,"host_port":8000,"range":6,"protocol":"tcp"}]}]`, "", nil
+	})
+	runner.On("ss", func(n string, args []string) (string, string, error) {
+		if len(args) > 0 && strings.Contains(args[len(args)-1], "u") {
+			return "", "", nil
+		}
+		return ssListenersForRange("0.0.0.0", 8000, 6), "", nil
+	})
+	service := &PodmanService{runner: runner}
+
+	// Re-validating the SAME container's own range, ignoring its own
+	// ContainerID, must not conflict with its own duplicated ss
+	// observations for ports 8001-8005.
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp",
+		RangeSize: 6, ContainerID: "abc123container",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !validation.Valid {
+		t.Fatalf("expected a same-container ranged mutation to not conflict with its own ss observations, checks: %+v", validation.Checks)
 	}
 }

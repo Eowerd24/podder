@@ -57,6 +57,10 @@ jobs:
       working-directory: ./frontend
       run: npm ci
 
+    - name: Frontend Unit Tests (trust-boundary escaping)
+      working-directory: ./frontend
+      run: npm test
+
     - name: Generate Wails bindings
       run: |
         export PATH="$PATH:$(go env GOPATH)/bin"

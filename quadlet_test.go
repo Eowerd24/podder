@@ -287,8 +287,11 @@ Restart=always
 		t.Fatalf("expected 3 port mappings, got %d", len(ports))
 	}
 
+	// "PublishPort=80:80" names no host address at all, so it must parse to
+	// HostIP=="" (unspecified/default Podman bind) rather than being
+	// defaulted to "0.0.0.0", which is a distinct, explicit declaration.
 	p1 := ports[0]
-	if p1.HostPort != 80 || p1.ContainerPort != 80 || p1.HostIP != "0.0.0.0" || p1.Protocol != "tcp" {
+	if p1.HostPort != 80 || p1.ContainerPort != 80 || p1.HostIP != "" || p1.Protocol != "tcp" {
 		t.Errorf("unexpected port 1: %+v", p1)
 	}
 

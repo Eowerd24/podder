@@ -401,7 +401,28 @@ func (p *PodmanService) MutateComposePorts(containerID string, newPorts []PortMa
 	result := &PortMutationResult{Success: false, Steps: []PortMutationStepResult{}}
 	result.RequiresExternal = true
 	result.Guidance = "Automatic in-place Compose mutation is disabled in this hardening build. Podder cannot yet prove complete effective-project identity, preserve every YAML construct, preserve stopped lifecycle, and verify apply and rollback across provider implementations. Use the generated snippet and authoritative Compose workflow manually."
-	result.ComposeSnippet = GenerateComposeSnippet("service", newPorts)
+
+	// The generated guidance must name the container's ACTUAL Compose
+	// service — using a generic placeholder key like "service" would
+	// produce a snippet the operator could paste under the wrong service
+	// entirely. If the real identity can't be confidently determined (the
+	// container wasn't found, or isn't actually Compose-managed), no
+	// snippet is generated rather than inventing a name.
+	serviceName := ""
+	if id := strings.TrimSpace(containerID); id != "" {
+		if containers, err := p.ListContainers(true); err == nil {
+			if target := findContainerByIdentity(containers, id); target != nil && target.Provenance.Type == "compose" {
+				serviceName = strings.TrimSpace(target.Provenance.Service)
+			}
+		}
+	}
+
+	if serviceName != "" {
+		result.ComposeSnippet = GenerateComposeSnippet(serviceName, newPorts)
+	} else {
+		result.Guidance += " The Compose service identity for this container could not be safely determined, so no snippet was generated; update your compose file's ports: for the correct service manually."
+	}
+
 	result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})
 	return result, nil
 }

@@ -12,7 +12,11 @@ func TestFormatPublishSpec(t *testing.T) {
 		want string
 	}{
 		{"ipv4-specific", PortMapping{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, "127.0.0.1:8080:80/tcp"},
-		{"wildcard-omitted", PortMapping{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, "8080:80/tcp"},
+		// An explicit "0.0.0.0" must NOT be canonicalized into omission: it
+		// is a distinct declaration from an unspecified host bind, even
+		// though both are wildcard exposure for conflict/exposure purposes.
+		{"wildcard-explicit", PortMapping{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, "0.0.0.0:8080:80/tcp"},
+		{"unspecified-omitted", PortMapping{HostIP: "", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, "8080:80/tcp"},
 		{"star-omitted", PortMapping{HostIP: "*", HostPort: 53, ContainerPort: 53, Protocol: "udp"}, "53:53/udp"},
 		{"no-host-port", PortMapping{ContainerPort: 80, Protocol: "tcp"}, "80/tcp"},
 		{"ipv6-loopback", PortMapping{HostIP: "::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, "[::1]:8080:80/tcp"},
@@ -36,9 +40,14 @@ func TestParsePublishSpec(t *testing.T) {
 		want    *PortMapping
 		wantErr bool
 	}{
-		{"container-only", "80", &PortMapping{HostIP: "0.0.0.0", ContainerPort: 80, Protocol: "tcp"}, false},
-		{"host-container", "8080:80", &PortMapping{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, false},
-		{"host-container-proto", "8080:80/udp", &PortMapping{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "udp"}, false},
+		// An omitted host address must parse to HostIP=="" (unspecified —
+		// Podman's own default bind), NOT be defaulted to "0.0.0.0": those
+		// are distinct declarations and must remain distinguishable from an
+		// explicit "0.0.0.0:..." spec (see TestParsePublishSpecPreservesExplicitWildcard).
+		{"container-only", "80", &PortMapping{HostIP: "", ContainerPort: 80, Protocol: "tcp"}, false},
+		{"host-container", "8080:80", &PortMapping{HostIP: "", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, false},
+		{"host-container-proto", "8080:80/udp", &PortMapping{HostIP: "", HostPort: 8080, ContainerPort: 80, Protocol: "udp"}, false},
+		{"ipv4-explicit-wildcard", "0.0.0.0:8080:80/tcp", &PortMapping{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, false},
 		{"ipv4-full", "127.0.0.1:8080:80/tcp", &PortMapping{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, false},
 		{"ipv6-loopback", "[::1]:8080:80/tcp", &PortMapping{HostIP: "::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, false},
 		{"ipv6-wildcard", "[::]:8080:80/tcp", &PortMapping{HostIP: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}, false},
@@ -70,7 +79,14 @@ func TestParsePublishSpec(t *testing.T) {
 }
 
 func TestParsePublishSpecFormatPublishSpecRoundTrip(t *testing.T) {
-	inputs := []string{"8080:80/tcp", "127.0.0.1:8080:80/tcp", "[::1]:8080:80/tcp", "[::]:8080:80/udp"}
+	inputs := []string{
+		"8080:80/tcp",
+		"0.0.0.0:8080:80/tcp",
+		"[::]:8080:80/tcp",
+		"127.0.0.1:8080:80/tcp",
+		"[::1]:8080:80/tcp",
+		"[::]:8080:80/udp",
+	}
 	for _, in := range inputs {
 		m, err := ParsePublishSpec(in)
 		if err != nil {
@@ -83,12 +99,79 @@ func TestParsePublishSpecFormatPublishSpecRoundTrip(t *testing.T) {
 	}
 }
 
+// TestUnspecifiedAndExplicitWildcardRemainDistinguishable is the exact
+// regression this fix targets: an omitted host bind ("8080:80/tcp") and an
+// explicit IPv4 wildcard ("0.0.0.0:8080:80/tcp") must not collapse into the
+// same internal representation or the same formatted output — collapsing
+// them would silently discard an operator's explicit choice.
+func TestUnspecifiedAndExplicitWildcardRemainDistinguishable(t *testing.T) {
+	unspecified, err := ParsePublishSpec("8080:80/tcp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	explicit, err := ParsePublishSpec("0.0.0.0:8080:80/tcp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if unspecified.HostIP == explicit.HostIP {
+		t.Fatalf("expected distinct internal HostIP representations, got both %q", unspecified.HostIP)
+	}
+	if unspecified.HostIP != "" {
+		t.Errorf("expected an omitted host bind to parse to HostIP==\"\", got %q", unspecified.HostIP)
+	}
+	if explicit.HostIP != "0.0.0.0" {
+		t.Errorf("expected an explicit wildcard to parse to HostIP==\"0.0.0.0\", got %q", explicit.HostIP)
+	}
+
+	gotUnspecified := FormatPublishSpec(*unspecified)
+	gotExplicit := FormatPublishSpec(*explicit)
+	if gotUnspecified == gotExplicit {
+		t.Fatalf("expected distinct formatted output, both formatted as %q", gotUnspecified)
+	}
+	if gotUnspecified != "8080:80/tcp" {
+		t.Errorf("expected unspecified bind to format without a host component, got %q", gotUnspecified)
+	}
+	if gotExplicit != "0.0.0.0:8080:80/tcp" {
+		t.Errorf("expected explicit wildcard to format with the explicit address preserved, got %q", gotExplicit)
+	}
+}
+
+// TestFormatPublishSpecAutoAssignedPortPreservesHostAddress proves that an
+// explicit host address combined with HostPort==0 (auto-assign, valid for
+// unmanaged/ad-hoc mappings) is not silently dropped — losing it would
+// widen exposure from the requested interface to all interfaces.
+func TestFormatPublishSpecAutoAssignedPortPreservesHostAddress(t *testing.T) {
+	m := PortMapping{HostIP: "127.0.0.1", HostPort: 0, ContainerPort: 80, Protocol: "tcp"}
+	got := FormatPublishSpec(m)
+	want := "127.0.0.1::80/tcp"
+	if got != want {
+		t.Fatalf("FormatPublishSpec(auto-assigned with explicit host) = %q, want %q", got, want)
+	}
+
+	parsed, err := ParsePublishSpec(got)
+	if err != nil {
+		t.Fatalf("ParsePublishSpec(%q) failed: %v", got, err)
+	}
+	if parsed.HostIP != "127.0.0.1" || parsed.HostPort != 0 || parsed.ContainerPort != 80 {
+		t.Fatalf("round trip mismatch: %+v", parsed)
+	}
+}
+
 func TestFormatPublishSpecRange(t *testing.T) {
-	m := PortMapping{HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}
+	m := PortMapping{HostIP: "", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}
 	got := FormatPublishSpec(m)
 	want := "8000-8005:9000-9005/tcp"
 	if got != want {
 		t.Fatalf("FormatPublishSpec(range) = %q, want %q", got, want)
+	}
+
+	// An explicit wildcard range must preserve the explicit address too.
+	mExplicit := PortMapping{HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}
+	gotExplicit := FormatPublishSpec(mExplicit)
+	wantExplicit := "0.0.0.0:8000-8005:9000-9005/tcp"
+	if gotExplicit != wantExplicit {
+		t.Fatalf("FormatPublishSpec(explicit wildcard range) = %q, want %q", gotExplicit, wantExplicit)
 	}
 
 	// A bound host address plus a range must bracket/prefix correctly.
@@ -195,5 +278,27 @@ func TestEndpointsEquivalentForReconciliation(t *testing.T) {
 	}
 	if !EndpointsEquivalentForReconciliation("0.0.0.0", "*") {
 		t.Errorf("expected wildcard synonyms to be equivalent to each other")
+	}
+}
+
+// TestIPv4AndIPv6WildcardStayDistinct locks in that an IPv4 wildcard
+// (0.0.0.0) and an IPv6 wildcard (::) are never treated as the same
+// abstract endpoint for registry reconciliation, even though — per the
+// accepted, unchanged conflict model — both remain wildcard binds that
+// conflict with any other candidate at the socket layer (the conservative,
+// fail-closed default). Allocation-conflict semantics and
+// registry-equivalence semantics are deliberately different questions.
+func TestIPv4AndIPv6WildcardStayDistinct(t *testing.T) {
+	if EndpointsEquivalentForReconciliation("0.0.0.0", "::") {
+		t.Errorf("expected IPv4 wildcard and IPv6 wildcard to be distinct declared endpoints for reconciliation")
+	}
+	if NormalizeAddress("0.0.0.0") == NormalizeAddress("::") {
+		t.Errorf("expected NormalizeAddress to keep IPv4 and IPv6 wildcards distinct")
+	}
+	// Conflict detection stays conservative: both are still wildcards that
+	// block any other candidate bind on the same port, which is the
+	// accepted allocation-conflict behavior this fix does not change.
+	if !EndpointsConflict("0.0.0.0", "::") {
+		t.Errorf("expected IPv4 and IPv6 wildcards to still conflict at the socket layer (fail-closed)")
 	}
 }

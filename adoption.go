@@ -85,6 +85,7 @@ type inspectContainer struct {
 		Devices     []struct {
 			PathOnHost string `json:"PathOnHost"`
 		} `json:"Devices"`
+		AutoRemove bool `json:"AutoRemove"`
 		Memory     int64  `json:"Memory"`
 		NanoCpus   int64  `json:"NanoCpus"`
 		CpusetCpus string `json:"CpusetCpus"`
@@ -122,6 +123,10 @@ func assessRepresentability(raw inspectContainer) []string {
 	var blockers []string
 	add := func(format string, args ...interface{}) {
 		blockers = append(blockers, fmt.Sprintf(format, args...))
+	}
+
+	if raw.HostConfig.AutoRemove {
+		add("Container uses automatic removal (--rm / AutoRemove), so stopping it may destroy the rollback source. Adoption is blocked.")
 	}
 
 	if raw.HostConfig.Privileged {
@@ -620,22 +625,20 @@ func (p *PodmanService) AdoptContainer(containerID string, serviceName string) (
 		return adoptionRollbackResult(rb, fmt.Sprintf("Adoption failed: could not commit spec: %v.", err)), nil
 	}
 
-	if err := p.RemoveContainer(backupName); err != nil {
-		return &AdoptionResult{
-			Success:               true,
-			ServiceName:           serviceName,
-			Spec:                  candidateSpec,
-			BackupCleanupRequired: true,
-			BackupContainerName:   backupName,
-			Message:               fmt.Sprintf("Workload '%s' adopted successfully, but backup container %s could not be removed automatically; manual cleanup recommended.", serviceName, backupName),
-		}, nil
-	}
-
+	// The original container is deliberately NOT deleted here. Even with
+	// exact configuration replay, adoption cannot prove the original
+	// writable layer holds no operator- or application-created state (e.g.
+	// files written inside the container rather than into a mounted
+	// persistent path) — a configuration-equivalent replacement can still
+	// lose that state. The renamed original is left stopped as a backup for
+	// verification/manual cleanup; the caller must delete it explicitly.
 	return &AdoptionResult{
-		Success:     true,
-		ServiceName: serviceName,
-		Spec:        candidateSpec,
-		Message:     fmt.Sprintf("Workload '%s' successfully adopted into Podder.", serviceName),
+		Success:               true,
+		ServiceName:           serviceName,
+		Spec:                  candidateSpec,
+		BackupCleanupRequired: true,
+		BackupContainerName:   backupName,
+		Message:               fmt.Sprintf("Workload '%s' adopted successfully. The previous container was retained, stopped, as '%s' for verification; delete it manually once you've confirmed no state needs to be recovered from it.", serviceName, backupName),
 	}, nil
 }
 

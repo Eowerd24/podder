@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -677,5 +678,221 @@ ports:
 	validation, err := service.ValidatePortMapping(PortMappingRequest{HostIP: "0.0.0.0", HostPort: 4555, ContainerPort: 4555, Protocol: "tcp"})
 	if err != nil || !validation.Valid {
 		t.Fatalf("unscoped record must not block local allocation: result=%+v err=%v", validation, err)
+	}
+}
+
+// --- Registry range_size validation ---
+
+func TestValidateAndFilterRegistryPorts_RangeValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		yaml      string
+		wantValid bool
+		wantWarn  string
+	}{
+		{
+			name: "negative-range-size",
+			yaml: `
+version: 1
+ports:
+  - id: bad-range
+    service: svc
+    protocol: tcp
+    listener:
+      port: 8000
+    range_size: -1
+    state: active
+`,
+			wantValid: false,
+			wantWarn:  "negative range_size",
+		},
+		{
+			name: "listener-range-overflows",
+			yaml: `
+version: 1
+ports:
+  - id: overflow-listener
+    service: svc
+    protocol: tcp
+    listener:
+      port: 65530
+    range_size: 10
+    state: active
+`,
+			wantValid: false,
+			wantWarn:  "listener port range",
+		},
+		{
+			name: "container-range-overflows",
+			yaml: `
+version: 1
+ports:
+  - id: overflow-container
+    service: svc
+    protocol: tcp
+    listener:
+      port: 8000
+    container:
+      port: 65530
+    range_size: 10
+    state: active
+`,
+			wantValid: false,
+			wantWarn:  "container port range",
+		},
+		{
+			name: "valid-range-accepted",
+			yaml: `
+version: 1
+ports:
+  - id: good-range
+    service: svc
+    protocol: tcp
+    listener:
+      address: 0.0.0.0
+      port: 8000
+    container:
+      port: 9000
+    range_size: 6
+    state: active
+`,
+			wantValid: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ParseRegistryYAML([]byte(tc.yaml), "/dummy/ports.yaml")
+			if !result.Loaded {
+				t.Fatalf("expected registry to still load (bad entries are warnings, not fatal): %s", result.Error)
+			}
+			if tc.wantValid {
+				if len(result.Ports) != 1 {
+					t.Fatalf("expected the range entry to be accepted, warnings: %v", result.Warnings)
+				}
+				if result.Ports[0].RangeSize != 6 {
+					t.Errorf("expected RangeSize to round-trip, got %+v", result.Ports[0])
+				}
+			} else {
+				if len(result.Ports) != 0 {
+					t.Fatalf("expected the invalid range entry to be dropped, got: %+v", result.Ports)
+				}
+				found := false
+				for _, w := range result.Warnings {
+					if strings.Contains(w, tc.wantWarn) {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("expected a warning containing %q, got: %v", tc.wantWarn, result.Warnings)
+				}
+			}
+		})
+	}
+}
+
+// --- Registry range reconciliation: effective range/count is part of what
+// "the same declared endpoint" means, not just the start port. ---
+
+const rangeRegistryV1 = `
+version: 1
+ports:
+  - id: ranged-service
+    service: ranged-app
+    node: rig9
+    protocol: tcp
+    listener:
+      address: 0.0.0.0
+      port: 8000
+    container:
+      port: 9000
+    range_size: 6
+    scope: lan
+    state: active
+    purpose: A service published as a port range
+`
+
+func TestRegistryRangeReconciliation_SameRangeIsMatch(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(rangeRegistryV1), 0o644); err != nil {
+		t.Fatalf("failed to write fixture registry: %v", err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"abc123","Names":["ranged-app"],"State":"running","Ports":[{"host_ip":"0.0.0.0","container_port":9000,"host_port":8000,"range":6,"protocol":"tcp"}]}]`, "", nil
+	})
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+		LocalNode:    "rig9",
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("failed to get port overview: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "ranged-service" {
+			found = true
+			if item.ReconciliationStatus != "MATCH" {
+				t.Errorf("expected a runtime range that exactly matches the registry's declared range to be a MATCH, got %q: %+v", item.ReconciliationStatus, item)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected the ranged registry entry to appear reconciled against the runtime mapping, items: %+v", overview.Items)
+	}
+}
+
+func TestRegistryRangeReconciliation_MismatchedRangeIsNotMatch(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(rangeRegistryV1), 0o644); err != nil {
+		t.Fatalf("failed to write fixture registry: %v", err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	// The registry declares a range of 6 (8000-8005), but the runtime
+	// container only actually publishes the single starting port 8000. A
+	// declaration of 8000-8005 must NOT be considered fulfilled by a
+	// runtime endpoint that only covers 8000 — same address, port, and
+	// protocol is not enough; the effective range/count must agree too.
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"abc123","Names":["ranged-app"],"State":"running","Ports":[{"host_ip":"0.0.0.0","container_port":9000,"host_port":8000,"range":1,"protocol":"tcp"}]}]`, "", nil
+	})
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+		LocalNode:    "rig9",
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("failed to get port overview: %v", err)
+	}
+
+	for _, item := range overview.Items {
+		if item.RegistryID == "ranged-service" && item.ReconciliationStatus == "MATCH" {
+			t.Fatalf("did not expect a range-size mismatch to be reported as MATCH: %+v", item)
+		}
+		if item.IsContainer && item.HostPort == 8000 && item.ReconciliationStatus == "MATCH" {
+			t.Fatalf("did not expect the runtime item to be reported as MATCH against a registry entry declaring a different range size: %+v", item)
+		}
 	}
 }

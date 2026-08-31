@@ -242,6 +242,49 @@ func findSubnetOverlap(existing []PodmanNetwork, candidate *net.IPNet) string {
 	return ""
 }
 
+// hostNetworksFunc returns the CIDR prefixes of networks this host is
+// currently, meaningfully connected to. Injectable so CreateNetwork's
+// overlap check is testable without depending on the real machine's network
+// interfaces.
+type hostNetworksFunc func() ([]*net.IPNet, error)
+
+// defaultHostNetworks reports the host's own configured interface
+// addresses — a pure Go stdlib call (net.InterfaceAddrs), not a shell-out —
+// as the set of networks the host is directly, meaningfully connected to.
+// Loopback and link-local addresses are excluded: they are not "connected
+// networks" a custom Podman bridge subnet could meaningfully collide with
+// in the sense this check cares about (the physical LAN or another routed
+// network), and every host trivially has them.
+func defaultHostNetworks() ([]*net.IPNet, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	var nets []*net.IPNet
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipnet.IP.IsLoopback() || ipnet.IP.IsLinkLocalUnicast() || ipnet.IP.IsLinkLocalMulticast() {
+			continue
+		}
+		nets = append(nets, ipnet)
+	}
+	return nets, nil
+}
+
+// findHostNetworkOverlap returns the CIDR string of a host-connected network
+// that overlaps candidate, or "" if none overlap.
+func findHostNetworkOverlap(hostNets []*net.IPNet, candidate *net.IPNet) string {
+	for _, hn := range hostNets {
+		if subnetsOverlap(candidate, hn) {
+			return hn.String()
+		}
+	}
+	return ""
+}
+
 // CreateNetwork creates a new Podman network with specified subnet and
 // options, after validating the name, CIDR syntax, gateway-in-subnet
 // membership, IPv4/IPv6 consistency, and non-overlap with existing Podman
@@ -290,6 +333,20 @@ func (p *PodmanService) CreateNetwork(name string, driver string, subnet string,
 	if subnetNet != nil {
 		if conflict := findSubnetOverlap(existing, subnetNet); conflict != "" {
 			return fmt.Errorf("subnet %s overlaps with existing network %q", subnet, conflict)
+		}
+
+		// A custom Podman bridge subnet must not overlap a network this
+		// host is itself directly connected to (the physical LAN, or
+		// another routed/local network) — that would create ambiguous or
+		// broken routing for the host and everything on that network. This
+		// is fail-closed: if host network interfaces cannot be inspected,
+		// creation is refused rather than silently risking that overlap.
+		hostNets, hostErr := p.hostNetworksFn()()
+		if hostErr != nil {
+			return fmt.Errorf("refusing to create network %q because this host's own network interfaces could not be inspected: %w", name, hostErr)
+		}
+		if conflict := findHostNetworkOverlap(hostNets, subnetNet); conflict != "" {
+			return fmt.Errorf("subnet %s overlaps with a network this host is directly connected to (%s); refusing to create a Podman bridge subnet that could conflict with the physical/local network", subnet, conflict)
 		}
 	}
 

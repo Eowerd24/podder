@@ -455,6 +455,78 @@ func TestCreateContainerRejectsIntraRequestPortConflict(t *testing.T) {
 	}
 }
 
+// TestCreateContainerManagedRejectsAutoAssignedHostPort proves a
+// Podder-managed workload must name an explicit host port: a declarative
+// managed service should not depend on an unpredictable Podman-auto-assigned
+// endpoint.
+func TestCreateContainerManagedRejectsAutoAssignedHostPort(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman image", func(string, []string) (string, string, error) {
+		return `[{"Id":"sha256:test-image"}]`, "", nil
+	})
+	svc := &PodmanService{runner: runner}
+	req := ContainerCreateRequest{
+		Image:   "alpine",
+		Name:    "managed-auto-port",
+		Managed: true,
+		PortMappings: []PortMapping{
+			{HostIP: "127.0.0.1", HostPort: 0, ContainerPort: 80, Protocol: "tcp"},
+		},
+	}
+	if _, err := svc.CreateContainer(req); err == nil {
+		t.Fatalf("expected managed creation with HostPort==0 to be rejected")
+	}
+}
+
+// TestCreateContainerUnmanagedAllowsAutoAssignedHostPort proves unmanaged
+// creation may still leave HostPort==0 to let Podman auto-assign a port,
+// matching the frontend's "blank Host Port means auto-assign" behavior
+// instead of contradicting it.
+func TestCreateContainerUnmanagedAllowsAutoAssignedHostPort(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	var seenRunArgs []string
+	runner.On("podman run", func(_ string, args []string) (string, string, error) {
+		seenRunArgs = args
+		return "deadbeef1234\n", "", nil
+	})
+	svc := &PodmanService{runner: runner}
+	req := ContainerCreateRequest{
+		Image:   "alpine",
+		Name:    "unmanaged-auto-port",
+		Managed: false,
+		PortMappings: []PortMapping{
+			{HostIP: "127.0.0.1", HostPort: 0, ContainerPort: 80, Protocol: "tcp"},
+		},
+	}
+	result, err := svc.CreateContainer(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected unmanaged creation with HostPort==0 to succeed, message: %s", result.Message)
+	}
+	// The requested host address must still be preserved even though no
+	// host port was named — publishing "127.0.0.1::80" (podman's own
+	// auto-assign-on-this-interface syntax), never widening to all
+	// interfaces just because the port was left unset.
+	joined := strings.Join(seenRunArgs, " ")
+	if !strings.Contains(joined, "127.0.0.1::80/tcp") {
+		t.Fatalf("expected run args to preserve the explicit host address with an auto-assigned port (127.0.0.1::80/tcp), got: %v", seenRunArgs)
+	}
+}
+
 func TestValidateSpecRejectsFutureSchemaVersion(t *testing.T) {
 	spec := ContainerSpec{Image: "alpine", SchemaVersion: CurrentSpecSchemaVersion + 1}
 	errs := ValidateSpec(spec)
@@ -609,5 +681,267 @@ func TestCreateContainerManagedAutoPullsUnresolvedImage(t *testing.T) {
 	}
 	if imageInspectCalls < 2 {
 		t.Fatalf("expected resolveImageID to be retried after the pull, got %d inspect call(s)", imageInspectCalls)
+	}
+}
+
+// TestRemoveImageDoesNotForce proves normal image deletion never escalates
+// to podman's --force / -f behavior, which can silently delete containers
+// that depend on the image before deleting the image itself. The GUI
+// presents this as ordinary image removal, so the backend must match that
+// disclosed intent exactly.
+func TestRemoveImageDoesNotForce(t *testing.T) {
+	runner := newFakeCommandRunner()
+	var seenArgs []string
+	runner.On("podman rmi", func(_ string, args []string) (string, string, error) {
+		seenArgs = args
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	if err := svc.RemoveImage("sha256:abc123"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, a := range seenArgs {
+		if a == "-f" || a == "--force" {
+			t.Fatalf("RemoveImage must never pass -f/--force to podman rmi, got args: %v", seenArgs)
+		}
+	}
+	if want := []string{"rmi", "sha256:abc123"}; len(seenArgs) != len(want) || seenArgs[0] != want[0] || seenArgs[1] != want[1] {
+		t.Fatalf("expected podman rmi to be called with exactly [rmi, sha256:abc123], got: %v", seenArgs)
+	}
+}
+
+// TestRemoveImageInUseReturnsRefusalNotEscalation proves that when Podman
+// refuses to remove an image because a container depends on it, RemoveImage
+// surfaces that refusal to the caller instead of silently deleting the
+// dependent container to force the removal through.
+func TestRemoveImageInUseReturnsRefusalNotEscalation(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman rmi", func(_ string, args []string) (string, string, error) {
+		for _, a := range args {
+			if a == "-f" || a == "--force" {
+				t.Fatalf("must not force even when the image is in use, got args: %v", args)
+			}
+		}
+		return errOut("Error: image is in use by a container: image used by 1234 (consider using --force)")
+	})
+	runner.On("podman rm", func(_ string, args []string) (string, string, error) {
+		t.Fatalf("RemoveImage must never remove containers to satisfy an image deletion, got: podman rm %v", args)
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	err := svc.RemoveImage("sha256:abc123")
+	if err == nil {
+		t.Fatalf("expected an error surfacing Podman's refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "image is in use") {
+		t.Fatalf("expected the refusal reason to be surfaced to the caller, got: %v", err)
+	}
+	if calls := runner.CallsMatching("rm"); len(calls) != 1 {
+		t.Fatalf("expected exactly one rm-family call (the refused rmi), got: %v", calls)
+	}
+}
+
+// TestResolveComposeSelectionDirectory proves that selecting a directory
+// leaves composeFile empty, deferring to the provider's own default
+// filename discovery — unchanged from the pre-fix behavior.
+func TestResolveComposeSelectionDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	dir, composeFile, err := resolveComposeSelection(tmp, os.Stat)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dir != tmp {
+		t.Errorf("expected dir %q, got %q", tmp, dir)
+	}
+	if composeFile != "" {
+		t.Errorf("expected no explicit compose file when a directory is selected, got %q", composeFile)
+	}
+}
+
+// TestResolveComposeSelectionExplicitFile proves that selecting a specific
+// file — including a non-default filename like compose-gpu.yml in a
+// directory that also holds compose.yml — preserves that exact file instead
+// of reducing the selection to its parent directory and letting default
+// filename discovery silently pick a different file.
+func TestResolveComposeSelectionExplicitFile(t *testing.T) {
+	tmp := t.TempDir()
+	for _, name := range []string{"compose.yml", "compose-test.yml", "compose-gpu.yml"} {
+		if err := os.WriteFile(filepath.Join(tmp, name), []byte("services: {}\n"), 0o644); err != nil {
+			t.Fatalf("failed to write fixture %s: %v", name, err)
+		}
+	}
+
+	cases := []string{"compose.yml", "compose-test.yml", "compose-gpu.yml"}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			selected := filepath.Join(tmp, name)
+			dir, composeFile, err := resolveComposeSelection(selected, os.Stat)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if dir != tmp {
+				t.Errorf("expected working dir %q, got %q", tmp, dir)
+			}
+			if composeFile != selected {
+				t.Errorf("expected the exact selected file %q preserved, got %q", selected, composeFile)
+			}
+		})
+	}
+}
+
+// TestSelectedComposeFileProducesExplicitProviderArgv is the end-to-end
+// regression: given a selection of a non-default compose filename,
+// resolveComposeSelection + composeProvider.BuildArgs (the single place
+// Compose argv is constructed) must produce a provider invocation that
+// names that exact file, so the provider cannot fall back to its own
+// default filename discovery.
+func TestSelectedComposeFileProducesExplicitProviderArgv(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatalf("failed to write fixture: %v", err)
+	}
+	gpuFile := filepath.Join(tmp, "compose-gpu.yml")
+	if err := os.WriteFile(gpuFile, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatalf("failed to write fixture: %v", err)
+	}
+
+	dir, composeFile, err := resolveComposeSelection(gpuFile, os.Stat)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dir != tmp || composeFile != gpuFile {
+		t.Fatalf("unexpected resolution: dir=%q composeFile=%q", dir, composeFile)
+	}
+
+	provider := &composeProvider{path: "/usr/bin/podman-compose"}
+	args := provider.BuildArgs(composeFile, "up", []string{"-d"}, "")
+	want := []string{"-f", gpuFile, "up", "-d"}
+	if len(args) != len(want) {
+		t.Fatalf("BuildArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("BuildArgs() = %v, want %v", args, want)
+		}
+	}
+	for _, a := range args {
+		if a == "compose.yml" || a == filepath.Join(tmp, "compose.yml") {
+			t.Fatalf("provider argv must not fall back to the default compose.yml when %q was explicitly selected, got: %v", gpuFile, args)
+		}
+	}
+}
+
+// --- Container removal: safe user-facing RemoveContainer vs. graceful
+// StopAndRemoveContainer vs. internal-only forceRemoveContainer. ---
+
+func TestRemoveContainer_RefusesRunningContainer(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"abc123","Names":["web"],"State":"running","Ports":[]}]`, "", nil
+	})
+	runner.On("podman rm", func(_ string, args []string) (string, string, error) {
+		t.Fatalf("RemoveContainer must not attempt removal of a running container, got: podman rm %v", args)
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	err := svc.RemoveContainer("web")
+	if err == nil {
+		t.Fatalf("expected RemoveContainer to refuse a running container")
+	}
+	if !strings.Contains(err.Error(), "running") {
+		t.Errorf("expected the refusal reason to mention the container is running, got: %v", err)
+	}
+}
+
+func TestRemoveContainer_SucceedsWithoutForceForStoppedContainer(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"abc123","Names":["web"],"State":"exited","Ports":[]}]`, "", nil
+	})
+	var seenArgs []string
+	runner.On("podman rm", func(_ string, args []string) (string, string, error) {
+		seenArgs = args
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	if err := svc.RemoveContainer("web"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, a := range seenArgs {
+		if a == "-f" || a == "--force" {
+			t.Fatalf("RemoveContainer must never pass -f/--force, got args: %v", seenArgs)
+		}
+	}
+	if want := []string{"rm", "web"}; len(seenArgs) != len(want) || seenArgs[0] != want[0] || seenArgs[1] != want[1] {
+		t.Fatalf("expected podman rm called with exactly %v, got: %v", want, seenArgs)
+	}
+}
+
+func TestStopAndRemoveContainer_StopsThenRemovesWithoutForce(t *testing.T) {
+	runner := newFakeCommandRunner()
+	var calls []string
+	runner.On("podman stop", func(_ string, args []string) (string, string, error) {
+		calls = append(calls, "stop")
+		return "", "", nil
+	})
+	runner.On("podman rm", func(_ string, args []string) (string, string, error) {
+		calls = append(calls, "rm")
+		for _, a := range args {
+			if a == "-f" || a == "--force" {
+				t.Fatalf("StopAndRemoveContainer must not need -f after a real stop, got args: %v", args)
+			}
+		}
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	if err := svc.StopAndRemoveContainer("web"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls) != 2 || calls[0] != "stop" || calls[1] != "rm" {
+		t.Fatalf("expected stop then rm, got: %v", calls)
+	}
+}
+
+func TestStopAndRemoveContainer_StopFailurePreventsRemoval(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman stop", func(string, []string) (string, string, error) {
+		return errOut("simulated stop failure")
+	})
+	runner.On("podman rm", func(_ string, args []string) (string, string, error) {
+		t.Fatalf("must not attempt removal after a failed stop, got: podman rm %v", args)
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	if err := svc.StopAndRemoveContainer("web"); err == nil {
+		t.Fatalf("expected an error when stop fails")
+	}
+}
+
+// TestForceRemoveContainerStillForces proves internal transaction cleanup
+// (rollback, candidate cleanup, recovery) keeps its unconditional force
+// semantic even though the public RemoveContainer no longer forces —
+// user-facing removal and transaction-internal recovery are deliberately
+// different operations.
+func TestForceRemoveContainerStillForces(t *testing.T) {
+	runner := newFakeCommandRunner()
+	var seenArgs []string
+	runner.On("podman rm", func(_ string, args []string) (string, string, error) {
+		seenArgs = args
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	if err := svc.forceRemoveContainer("candidate-123"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := []string{"rm", "-f", "candidate-123"}; len(seenArgs) != len(want) || seenArgs[0] != want[0] || seenArgs[1] != want[1] || seenArgs[2] != want[2] {
+		t.Fatalf("expected forceRemoveContainer to call exactly %v, got: %v", want, seenArgs)
 	}
 }

@@ -25,6 +25,11 @@ type PodmanService struct {
 	lookPath lookPathFunc
 	// commitSpec is injectable so commit-failure cleanup is testable.
 	commitSpec func(candidatePath string, spec ContainerSpec) error
+	// hostNetworks is injectable so CreateNetwork's host-route/LAN overlap
+	// check (see networks.go) is testable without depending on this
+	// machine's actual network interfaces. The zero value (nil) falls back
+	// to defaultHostNetworks in production.
+	hostNetworks hostNetworksFunc
 }
 
 // cmdRunner returns the configured CommandRunner, falling back to the real
@@ -43,6 +48,16 @@ func (p *PodmanService) lookPathFn() lookPathFunc {
 		return p.lookPath
 	}
 	return exec.LookPath
+}
+
+// hostNetworksFn returns the configured hostNetworksFunc, falling back to
+// defaultHostNetworks (this host's real interface addresses) when none was
+// injected.
+func (p *PodmanService) hostNetworksFn() hostNetworksFunc {
+	if p.hostNetworks != nil {
+		return p.hostNetworks
+	}
+	return defaultHostNetworks
 }
 
 func (p *PodmanService) commitCandidate(candidatePath string, spec ContainerSpec) error {
@@ -358,8 +373,67 @@ func (p *PodmanService) RestartContainer(id string) error {
 	return nil
 }
 
-// RemoveContainer forces the removal of a container by ID or name.
+// RemoveContainer is the safe, ordinary user-facing removal path: it
+// refuses a running container rather than forcibly killing it out from
+// under whatever it's doing. Callers that need to remove a running
+// container should stop it first — see StopAndRemoveContainer for the
+// one-step graceful equivalent. Internal transaction cleanup (rollback,
+// candidate-container cleanup, recovery) that legitimately needs to force
+// through a removal regardless of state uses the unexported
+// forceRemoveContainer instead; that force semantic is deliberately never
+// exposed as the ordinary path.
 func (p *PodmanService) RemoveContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("container id cannot be empty")
+	}
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return fmt.Errorf("refusing to remove container %s: local containers could not be inspected: %w", id, err)
+	}
+	target := findContainerByIdentity(containers, id)
+	if target == nil {
+		target = findContainerByName(containers, id)
+	}
+	if target != nil {
+		if lifecycle, ok := classifyLifecycle(target.State); ok && lifecycle == lifecycleRunning {
+			return fmt.Errorf("container %s is running; stop it first (or use StopAndRemoveContainer) rather than force-removing a running container", id)
+		}
+	}
+	_, stderr, err := p.runCommand("rm", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// StopAndRemoveContainer gracefully stops a container (if running) and then
+// removes it — the one-step, non-forceful equivalent of "remove this
+// container regardless of its current state" for user-facing callers that
+// don't want to make two separate calls.
+func (p *PodmanService) StopAndRemoveContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("container id cannot be empty")
+	}
+	if err := p.StopContainer(id); err != nil {
+		return fmt.Errorf("failed to stop container %s before removal: %w", id, err)
+	}
+	_, stderr, err := p.runCommand("rm", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// forceRemoveContainer is the internal-only force-removal primitive used by
+// rollback, candidate-container cleanup, and recovery machinery, which
+// legitimately need to remove a container regardless of its lifecycle
+// state (e.g. cleaning up a just-created, still-running candidate after a
+// failed managed transaction). It is deliberately unexported: user-facing
+// removal must go through RemoveContainer/StopAndRemoveContainer instead,
+// never this.
+func (p *PodmanService) forceRemoveContainer(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("container id cannot be empty")
@@ -371,13 +445,22 @@ func (p *PodmanService) RemoveContainer(id string) error {
 	return nil
 }
 
-// RemoveImage forces the removal of an image by ID.
+// RemoveImage removes an image by ID without forcing removal of containers
+// that depend on it. This is the ordinary, user-facing image deletion path:
+// the GUI presents it as ordinary image removal, and podman's --force
+// behavior can silently delete containers using the image before deleting
+// the image itself, which would be a destructive mismatch between the
+// disclosed action and what actually happens. If Podman refuses because
+// dependent containers exist, that refusal is surfaced to the caller as-is
+// rather than escalated into container deletion. A separately named,
+// explicitly destructive force-delete path may be added later, but it must
+// never be this method.
 func (p *PodmanService) RemoveImage(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("image id cannot be empty")
 	}
-	_, stderr, err := p.runCommand("rmi", "-f", id)
+	_, stderr, err := p.runCommand("rmi", id)
 	if err != nil {
 		return fmt.Errorf("%s", strings.TrimSpace(stderr))
 	}
@@ -499,7 +582,7 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 		return nil, fmt.Errorf("invalid container spec: %s", strings.Join(errs, "; "))
 	}
 
-	if err := p.validateMappingsForCreate(spec.PortMappings); err != nil {
+	if err := p.validateMappingsForCreate(spec.PortMappings, spec.Managed); err != nil {
 		return nil, err
 	}
 
@@ -518,7 +601,7 @@ func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerC
 
 	result := &ContainerCreateResult{Managed: spec.Managed, ContainerName: spec.Name}
 	cleanupFailedManagedCreate := func(reason string) (*ContainerCreateResult, error) {
-		removeErr := p.RemoveContainer(result.ContainerID)
+		removeErr := p.forceRemoveContainer(result.ContainerID)
 		removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
 			return p.containerAbsent(result.ContainerID, spec.Name)
 		})
@@ -659,7 +742,12 @@ func (p *PodmanService) containerAbsent(containerID, name string) bool {
 // must not conflict with one another within the same request. This cannot
 // be bypassed by calling CreateContainer directly through the Wails bridge —
 // frontend validation is advisory only.
-func (p *PodmanService) validateMappingsForCreate(mappings []PortMapping) error {
+//
+// managed controls HostPort==0 policy: a Podder-managed workload must name
+// an explicit, stable host port (ValidatePortMapping rejects HostPort==0
+// when managed is true); unmanaged/ad-hoc creation may leave it 0 to let
+// Podman auto-assign one.
+func (p *PodmanService) validateMappingsForCreate(mappings []PortMapping, managed bool) error {
 	var seen []PortClaim
 	for _, m := range mappings {
 		req := PortMappingRequest{
@@ -668,6 +756,7 @@ func (p *PodmanService) validateMappingsForCreate(mappings []PortMapping) error 
 			ContainerPort: m.ContainerPort,
 			Protocol:      m.Protocol,
 			RangeSize:     m.RangeSize,
+			Managed:       managed,
 		}
 		valResult, err := p.ValidatePortMapping(req)
 		if err != nil {
@@ -732,6 +821,27 @@ func (p *PodmanService) SelectHostPath(kind string) (string, error) {
 	return path, nil
 }
 
+// resolveComposeSelection determines the working directory and explicit
+// compose file (if any) implied by a user's file-dialog selection. When the
+// user selected a specific file, that exact file must be the one actually
+// executed — reducing the selection to its parent directory and letting the
+// provider fall back to default filename discovery (compose.yml) can
+// silently run a different file than the one the user picked, in a
+// directory holding several compose files (compose.yml, compose-test.yml,
+// compose-gpu.yml, ...). Selecting a directory instead leaves composeFile
+// empty, exactly like today, so the provider's own default discovery
+// applies. Pure and independent of the OS dialog so it can be unit tested.
+func resolveComposeSelection(path string, stat func(string) (os.FileInfo, error)) (dir, composeFile string, err error) {
+	info, err := stat(path)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to stat path: %v", err)
+	}
+	if info.IsDir() {
+		return path, "", nil
+	}
+	return filepath.Dir(path), path, nil
+}
+
 // SelectAndRunCompose triggers a native OS file dialog to select a folder or compose file,
 // and then executes docker/podman compose in that directory.
 func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
@@ -748,15 +858,9 @@ func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
 		return "Cancelled by user.", nil
 	}
 
-	// Determine if path is a file or directory
-	info, err := os.Stat(path)
+	dir, composeFile, err := resolveComposeSelection(path, os.Stat)
 	if err != nil {
-		return "", fmt.Errorf("failed to stat path: %v", err)
-	}
-
-	dir := path
-	if !info.IsDir() {
-		dir = filepath.Dir(path)
+		return "", err
 	}
 
 	// Reuse the exact same provider resolution and readiness preflight as
@@ -775,7 +879,7 @@ func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
 		return "", err
 	}
 
-	composeCmd := exec.Command(provider.path, provider.BuildArgs("", verb, extra, "")...)
+	composeCmd := exec.Command(provider.path, provider.BuildArgs(composeFile, verb, extra, "")...)
 	composeCmd.Dir = dir
 
 	output, err := composeCmd.CombinedOutput()

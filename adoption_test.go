@@ -69,8 +69,8 @@ func TestParseInspectToAssessment_CleanAdHoc(t *testing.T) {
 	if assessment.ProposedSpec.Env["CUSTOM_VAR"] != "hello123" {
 		t.Errorf("expected CUSTOM_VAR in env, got: %+v", assessment.ProposedSpec.Env)
 	}
-	if _, exists := assessment.ProposedSpec.Env["PATH"]; exists {
-		t.Errorf("expected default PATH to be filtered out")
+	if assessment.ProposedSpec.Env["PATH"] == "" {
+		t.Errorf("expected PATH to be preserved exactly; adoption must not guess which environment values are disposable")
 	}
 }
 
@@ -325,7 +325,7 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 	sim.addContainer("legacy-web", "nginx:alpine", "running", []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}, false, "")
 	svc := &PodmanService{runner: &adoptionInspectRouter{sim: sim, image: "nginx:alpine", ports: []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}}}
 
-	result, err := svc.AdoptContainer("legacy-web", "web-svc")
+	result, err := svc.AdoptContainer("legacy-web", "legacy-web")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 		t.Fatalf("expected successful adoption, message: %s", result.Message)
 	}
 
-	spec, err := svc.GetSpec("web-svc")
+	spec, err := svc.GetSpec("legacy-web")
 	if err != nil {
 		t.Fatalf("expected committed spec after successful adoption: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 		t.Errorf("expected committed spec to be Managed")
 	}
 
-	c := sim.containers["web-svc"]
+	c := sim.containers["legacy-web"]
 	if c == nil || !c.managed {
 		t.Fatalf("expected replacement container to exist and carry managed labels, got: %+v", c)
 	}
@@ -402,10 +402,123 @@ func (r *adoptionInspectRouter) Run(name string, args ...string) (string, string
 			portsJSON = fmt.Sprintf(`{"%d/%s": [{"HostIp":"%s","HostPort":"%d"}]}`, p.ContainerPort, p.Protocol, p.HostIP, p.HostPort)
 		}
 		return fmt.Sprintf(`[{"Id":"%s","Name":"/%s","Image":"%s","Config":{"Image":"%s","Cmd":[],"Env":[],"Labels":{}},"HostConfig":{"PortBindings":%s,"Privileged":false,"NetworkMode":"bridge"},"Mounts":[],"Pod":""}]`,
-			c.id, id, r.image, r.image, portsJSON), "", nil
+			c.id, id, c.imageID, r.image, portsJSON), "", nil
 	}
 	if r.failCreate && name == "podman" && len(args) > 0 && (args[0] == "run" || args[0] == "create") {
 		return "", "simulated create failure", fmt.Errorf("simulated create failure")
 	}
 	return r.sim.Run(name, args...)
+}
+
+func TestAdoptionPreservesSignificantEnvironmentOverrides(t *testing.T) {
+	raw := baseInspectJSON("", `,"Env":["PATH=/custom/bin","HOME=/srv/app","TERM=xterm-256color","HOSTNAME=stable-name"]`, "", "", "")
+	assessment, err := ParseInspectToAssessment([]byte(raw))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for key, want := range map[string]string{"PATH": "/custom/bin", "HOME": "/srv/app", "TERM": "xterm-256color", "HOSTNAME": "stable-name"} {
+		if got := assessment.ProposedSpec.Env[key]; got != want {
+			t.Errorf("environment override %s was not preserved: got %q want %q", key, got, want)
+		}
+	}
+}
+
+func TestAdoptionPreservesOrdinaryLabels(t *testing.T) {
+	raw := baseInspectJSON("", `,"Labels":{"traefik.enable":"true","backup.policy":"daily"}`, "", "", "")
+	assessment, err := ParseInspectToAssessment([]byte(raw))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !assessment.CanAdopt {
+		t.Fatalf("ordinary labels should be representable, blockers: %v", assessment.Blockers)
+	}
+	if assessment.ProposedSpec.Labels["traefik.enable"] != "true" || assessment.ProposedSpec.Labels["backup.policy"] != "daily" {
+		t.Fatalf("ordinary labels were not preserved: %+v", assessment.ProposedSpec.Labels)
+	}
+	args, err := BuildRunArgsFromSpec(assessment.ProposedSpec)
+	if err != nil {
+		t.Fatalf("label-preserving spec did not replay: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "traefik.enable=true") || !strings.Contains(joined, "backup.policy=daily") {
+		t.Fatalf("replay argv omitted preserved labels: %v", args)
+	}
+}
+
+func TestAdoptionBlocksAlreadyPodderManagedWorkload(t *testing.T) {
+	raw := baseInspectJSON("", `,"Labels":{"io.podder.managed":"true","io.podder.service":"fixture"}`, "", "", "")
+	assessment, err := ParseInspectToAssessment([]byte(raw))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if assessment.CanAdopt || !strings.Contains(strings.Join(assessment.Blockers, " "), "already carries Podder") {
+		t.Fatalf("already-managed workload must be blocked by backend adoption: %+v", assessment)
+	}
+}
+
+func TestAdoptionBlocksNonDefaultBindSemantics(t *testing.T) {
+	raw := baseInspectJSON("", "", "", `{"Type":"bind","Source":"/srv/data","Destination":"/data","RW":true,"Propagation":"rshared","Options":["rbind","z"]}`, "")
+	assessment, err := ParseInspectToAssessment([]byte(raw))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if assessment.CanAdopt {
+		t.Fatalf("non-default propagation/SELinux bind semantics must block adoption")
+	}
+	blockers := strings.Join(assessment.Blockers, " ")
+	if !strings.Contains(blockers, "propagation") || !strings.Contains(blockers, "option") {
+		t.Fatalf("expected explicit bind fidelity blockers, got %v", assessment.Blockers)
+	}
+}
+
+type delayedAdoptionStopRunner struct {
+	base              *adoptionInspectRouter
+	pendingName       string
+	stopPolls         int
+	createdBeforeStop bool
+}
+
+func (d *delayedAdoptionStopRunner) Run(name string, args ...string) (string, string, error) {
+	if name == "podman" && len(args) > 0 {
+		switch args[0] {
+		case "stop":
+			d.pendingName = args[len(args)-1]
+			return "", "", nil
+		case "ps":
+			if d.pendingName != "" {
+				d.stopPolls++
+				if d.stopPolls >= 2 {
+					d.base.sim.mu.Lock()
+					if c := d.base.sim.containers[d.pendingName]; c != nil {
+						c.state = "exited"
+					}
+					d.base.sim.mu.Unlock()
+				}
+			}
+		case "run", "create":
+			d.base.sim.mu.Lock()
+			if c := d.base.sim.containers[d.pendingName]; c != nil && c.state == "running" {
+				d.createdBeforeStop = true
+			}
+			d.base.sim.mu.Unlock()
+		}
+	}
+	return d.base.Run(name, args...)
+}
+
+func TestAdoptionWaitsForVerifiedStopBeforeCreate(t *testing.T) {
+	withTestHome(t)
+	withFastPolling(t)
+	sim := newMutationSim()
+	ports := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8181, ContainerPort: 80, Protocol: "tcp"}}
+	sim.addContainer("delayed-stop", "nginx:alpine", "running", ports, false, "")
+	base := &adoptionInspectRouter{sim: sim, image: "nginx:alpine", ports: ports}
+	runner := &delayedAdoptionStopRunner{base: base}
+	result, err := (&PodmanService{runner: runner}).AdoptContainer("delayed-stop", "delayed-stop")
+	if err != nil || !result.Success {
+		t.Fatalf("expected adoption after bounded stop polling: result=%+v err=%v", result, err)
+	}
+	if runner.stopPolls < 2 || runner.createdBeforeStop {
+		t.Fatalf("replacement was created before stop was observed: polls=%d early=%v", runner.stopPolls, runner.createdBeforeStop)
+	}
 }

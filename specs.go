@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,7 @@ import (
 // Podder. A spec is only considered safely replayable when its
 // SchemaVersion is <= this value; a spec written by a newer, unknown schema
 // must never be guessed at or partially replayed.
-const CurrentSpecSchemaVersion = 1
+const CurrentSpecSchemaVersion = 2
 
 // BindMountSpec models a host-to-container filesystem mount.
 type BindMountSpec struct {
@@ -30,6 +31,13 @@ type ContainerSpec struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	Name          string `json:"name"`
 	Image         string `json:"image"`
+	// ResolvedImage is the immutable image ID/digest used for replay. Image is
+	// retained as the operator-facing reference. A mutable tag alone is not an
+	// authoritative recreation source because it may point at different bytes.
+	ResolvedImage string `json:"resolvedImage,omitempty"`
+	// ReplayComplete is only written by a complete creation/adoption path.
+	// Prototype specs remain useful for observation but are read-only.
+	ReplayComplete bool `json:"replayComplete"`
 	// Managed marks whether this spec is (or, for a candidate, is intended
 	// to become) the authoritative source of truth for a container carrying
 	// io.podder.managed=true. It is set explicitly by the caller — never
@@ -38,10 +46,14 @@ type ContainerSpec struct {
 	PortMappings []PortMapping     `json:"portMappings"`
 	Binds        []BindMountSpec   `json:"binds,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
-	Entrypoint   []string          `json:"entrypoint,omitempty"`
-	Command      CommandArgv       `json:"command,omitempty"`
-	CreatedAt    string            `json:"createdAt,omitempty"`
-	UpdatedAt    string            `json:"updatedAt,omitempty"`
+	// Labels contains ordinary workload metadata that must survive replay.
+	// Podder ownership labels are generated internally and are never accepted
+	// through this map.
+	Labels     map[string]string `json:"labels,omitempty"`
+	Entrypoint []string          `json:"entrypoint,omitempty"`
+	Command    CommandArgv       `json:"command,omitempty"`
+	CreatedAt  string            `json:"createdAt,omitempty"`
+	UpdatedAt  string            `json:"updatedAt,omitempty"`
 }
 
 // ValidateSpec checks that a ContainerSpec is well-formed and safe to
@@ -54,15 +66,28 @@ func ValidateSpec(spec ContainerSpec) []string {
 
 	if strings.TrimSpace(spec.Image) == "" {
 		errs = append(errs, "image must not be empty")
+	} else if strings.ContainsRune(spec.Image, '\x00') {
+		errs = append(errs, "image must not contain NUL")
+	}
+	if strings.ContainsRune(spec.Name, '\x00') {
+		errs = append(errs, "container name must not contain NUL")
 	}
 	if spec.Managed && strings.TrimSpace(spec.Name) == "" {
 		errs = append(errs, "a managed spec must have a non-empty name")
+	}
+	if spec.Managed {
+		if spec.SchemaVersion < CurrentSpecSchemaVersion || !spec.ReplayComplete {
+			errs = append(errs, "managed spec predates the authoritative replay schema; destructive replay is blocked until the workload is safely re-adopted")
+		}
+		if strings.TrimSpace(spec.ResolvedImage) == "" {
+			errs = append(errs, "managed spec is missing an immutable resolved image ID/digest")
+		}
 	}
 	if spec.SchemaVersion > CurrentSpecSchemaVersion {
 		errs = append(errs, fmt.Sprintf("spec schema version %d is newer than this build of Podder supports (max %d); refusing to guess at its meaning", spec.SchemaVersion, CurrentSpecSchemaVersion))
 	}
 
-	seenPorts := make(map[string]bool)
+	var seenClaims []PortClaim
 	for i, m := range spec.PortMappings {
 		if m.ContainerPort == 0 {
 			errs = append(errs, fmt.Sprintf("port mapping #%d: container port must be between 1 and 65535", i+1))
@@ -70,6 +95,12 @@ func ValidateSpec(spec ContainerSpec) []string {
 		proto := NormalizeProtocol(m.Protocol)
 		if proto != "tcp" && proto != "udp" {
 			errs = append(errs, fmt.Sprintf("port mapping #%d: protocol must be tcp or udp", i+1))
+		}
+		if m.RangeSize < 0 {
+			errs = append(errs, fmt.Sprintf("port mapping #%d: range size cannot be negative", i+1))
+		}
+		if strings.TrimSpace(m.HostIP) != "" && net.ParseIP(strings.TrimSpace(m.HostIP)) == nil {
+			errs = append(errs, fmt.Sprintf("port mapping #%d: invalid host IP %q", i+1, m.HostIP))
 		}
 		if m.RangeSize > 1 {
 			if int(m.ContainerPort)+m.RangeSize-1 > 65535 {
@@ -80,23 +111,54 @@ func ValidateSpec(spec ContainerSpec) []string {
 			}
 		}
 		if m.HostPort != 0 {
-			key := fmt.Sprintf("%s|%d|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, m.RangeSize, proto)
-			if seenPorts[key] {
-				errs = append(errs, fmt.Sprintf("port mapping #%d duplicates another mapping in the same spec (%s)", i+1, m.DisplayString()))
+			claim := PortClaim{Address: m.HostIP, Port: m.HostPort, Protocol: proto, RangeSize: m.RangeSize}
+			if FindConflict(seenClaims, claim, "") != nil {
+				errs = append(errs, fmt.Sprintf("port mapping #%d conflicts with another mapping in the same spec (%s)", i+1, m.DisplayString()))
 			}
-			seenPorts[key] = true
+			seenClaims = append(seenClaims, claim)
 		}
 	}
 
 	for i, b := range spec.Binds {
-		if strings.TrimSpace(b.HostPath) == "" || strings.TrimSpace(b.ContainerPath) == "" {
+		hostPath := strings.TrimSpace(b.HostPath)
+		containerPath := strings.TrimSpace(b.ContainerPath)
+		if hostPath == "" || containerPath == "" {
 			errs = append(errs, fmt.Sprintf("bind mount #%d: both host and container paths are required", i+1))
+			continue
+		}
+		if !filepath.IsAbs(hostPath) || !filepath.IsAbs(containerPath) {
+			errs = append(errs, fmt.Sprintf("bind mount #%d: host and container paths must be absolute", i+1))
+		}
+		if strings.ContainsAny(hostPath, ",\x00") || strings.ContainsAny(containerPath, ",\x00") {
+			errs = append(errs, fmt.Sprintf("bind mount #%d: paths containing commas or NUL cannot be represented safely", i+1))
 		}
 	}
 
-	for _, e := range spec.Entrypoint {
-		if strings.TrimSpace(e) == "" {
-			errs = append(errs, "entrypoint must not contain empty arguments")
+	for key, value := range spec.Env {
+		if key == "" || strings.ContainsAny(key, "=\x00") {
+			errs = append(errs, fmt.Sprintf("environment variable name %q is invalid", key))
+		}
+		if strings.ContainsRune(value, '\x00') {
+			errs = append(errs, fmt.Sprintf("environment variable %q contains NUL", key))
+		}
+	}
+
+	for key, value := range spec.Labels {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" || strings.ContainsAny(key, "=\x00") {
+			errs = append(errs, fmt.Sprintf("label name %q is invalid", key))
+		}
+		if strings.HasPrefix(strings.ToLower(trimmed), "io.podder.") {
+			errs = append(errs, fmt.Sprintf("label %q is reserved for Podder ownership metadata", key))
+		}
+		if strings.ContainsRune(value, '\x00') {
+			errs = append(errs, fmt.Sprintf("label %q contains NUL", key))
+		}
+	}
+
+	for _, arg := range append(append([]string{}, spec.Entrypoint...), []string(spec.Command)...) {
+		if strings.ContainsRune(arg, '\x00') {
+			errs = append(errs, "entrypoint and command arguments must not contain NUL")
 			break
 		}
 	}
@@ -132,6 +194,15 @@ func isCandidateSpecFile(name string) bool {
 // operation appear authoritative should use writeCandidateSpec +
 // commitCandidateSpec instead.
 func (p *PodmanService) SaveSpec(spec ContainerSpec) error {
+	if spec.Managed {
+		return fmt.Errorf("directly saving a managed spec is disabled: managed ownership may only be committed by a verified create or adoption transaction")
+	}
+	return saveSpec(spec)
+}
+
+// saveSpec is intentionally unexported so the Wails bridge cannot fabricate
+// managed authority. Managed transactions use candidate promotion instead.
+func saveSpec(spec ContainerSpec) error {
 	spec.Name = strings.TrimSpace(spec.Name)
 	if spec.Name == "" {
 		return fmt.Errorf("service name cannot be empty")
@@ -145,7 +216,7 @@ func (p *PodmanService) SaveSpec(spec ContainerSpec) error {
 	}
 
 	servicesDir := getServicesDir()
-	if err := os.MkdirAll(servicesDir, 0o700); err != nil {
+	if err := ensurePrivateDir(servicesDir); err != nil {
 		return fmt.Errorf("failed to create services directory %s: %w", servicesDir, err)
 	}
 
@@ -160,19 +231,7 @@ func (p *PodmanService) SaveSpec(spec ContainerSpec) error {
 		return fmt.Errorf("failed to serialize container spec: %w", err)
 	}
 
-	filePath := getSpecFilePath(spec.Name)
-	tmpFile := filePath + ".tmp"
-
-	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
-		return fmt.Errorf("failed to write temporary spec: %w", err)
-	}
-
-	if err := os.Rename(tmpFile, filePath); err != nil {
-		_ = os.Remove(tmpFile)
-		return fmt.Errorf("failed to commit spec file: %w", err)
-	}
-
-	return nil
+	return writePrivateFileAtomic(getSpecFilePath(spec.Name), data)
 }
 
 // writeCandidateSpec persists a not-yet-authoritative draft of spec to the
@@ -196,7 +255,7 @@ func writeCandidateSpec(spec ContainerSpec) (string, error) {
 	spec.UpdatedAt = now
 
 	servicesDir := getServicesDir()
-	if err := os.MkdirAll(servicesDir, 0o700); err != nil {
+	if err := ensurePrivateDir(servicesDir); err != nil {
 		return "", fmt.Errorf("failed to create services directory %s: %w", servicesDir, err)
 	}
 
@@ -212,18 +271,24 @@ func writeCandidateSpec(spec ContainerSpec) (string, error) {
 	}
 	candidatePath := f.Name()
 
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		_ = os.Remove(candidatePath)
+		return "", fmt.Errorf("failed to secure candidate spec file permissions: %w", err)
+	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		_ = os.Remove(candidatePath)
 		return "", fmt.Errorf("failed to write candidate spec: %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(candidatePath)
+		return "", fmt.Errorf("failed to sync candidate spec: %w", err)
+	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(candidatePath)
 		return "", fmt.Errorf("failed to finalize candidate spec: %w", err)
-	}
-	if err := os.Chmod(candidatePath, 0o600); err != nil {
-		_ = os.Remove(candidatePath)
-		return "", fmt.Errorf("failed to secure candidate spec file permissions: %w", err)
 	}
 
 	return candidatePath, nil
@@ -290,7 +355,8 @@ func migrateLegacySpec(spec *ContainerSpec) {
 	if spec.SchemaVersion != 0 {
 		return
 	}
-	spec.SchemaVersion = CurrentSpecSchemaVersion
+	// Preserve schemaVersion=0. Prototype capture was incomplete, so merely
+	// loading a file must not make it eligible for destructive replay.
 	spec.Managed = true
 }
 
@@ -342,40 +408,240 @@ func (p *PodmanService) DeleteSpec(name string) error {
 // builder so replay is exact: every bind, every environment variable, the
 // full command argv, and all published ports are applied — not just the
 // first bind, and not a spec with Env silently ignored.
-func (p *PodmanService) DeploySpec(name string) (string, error) {
-	spec, err := p.GetSpec(name)
+type DeploySpecResult struct {
+	Success                bool            `json:"success"`
+	NewContainerID         string          `json:"newContainerId,omitempty"`
+	OldContainerID         string          `json:"oldContainerId,omitempty"`
+	BackupContainerName    string          `json:"backupContainerName,omitempty"`
+	Rollback               *RollbackResult `json:"rollback,omitempty"`
+	ManualRecoveryRequired bool            `json:"manualRecoveryRequired,omitempty"`
+	BackupCleanupRequired  bool            `json:"backupCleanupRequired,omitempty"`
+	Message                string          `json:"message"`
+}
+
+func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
+	result := &DeploySpecResult{}
+	spec, err := p.GetSpec(strings.TrimSpace(name))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-
 	if errs := ValidateSpec(*spec); len(errs) > 0 {
-		return "", fmt.Errorf("stored spec for %s failed validation, refusing to deploy: %s", name, strings.Join(errs, "; "))
+		return result, fmt.Errorf("stored spec for %q is not authoritative and replayable: %s", name, strings.Join(errs, "; "))
+	}
+	if !spec.Managed {
+		return result, fmt.Errorf("DeploySpec only accepts verified Podder-managed specifications")
 	}
 
-	// 1. If an existing container with this name is running, stop and remove it
-	containers, _ := p.ListContainers(true)
-	for _, c := range containers {
-		for _, cName := range c.Names {
-			if strings.TrimPrefix(cName, "/") == spec.Name {
-				_ = p.StopContainer(c.Id)
-				_ = p.RemoveContainer(c.Id)
-				break
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return result, fmt.Errorf("deploy preflight could not inspect existing containers: %w", err)
+	}
+	target := findContainerByName(containers, spec.Name)
+	ignoreID := ""
+	if target != nil {
+		ignoreID = target.Id
+	}
+	if _, err := p.validateMappingsForMutation(spec.PortMappings, ignoreID); err != nil {
+		return result, fmt.Errorf("deploy preflight port validation failed: %w", err)
+	}
+
+	if target == nil {
+		args, buildErr := BuildRunArgsFromSpec(*spec)
+		if buildErr != nil {
+			return result, fmt.Errorf("stored spec is not replayable: %w", buildErr)
+		}
+		stdout, stderr, runErr := p.runCommand(args...)
+		result.NewContainerID = strings.TrimSpace(stdout)
+		if runErr != nil {
+			current, listErr := p.ListContainers(true)
+			if listErr != nil {
+				result.ManualRecoveryRequired = true
+				result.Message = fmt.Sprintf("Podman reported create failure and Podder could not inspect whether a candidate exists: %v.", runErr)
+				return result, nil
 			}
+			candidate := findContainerByIdentity(current, result.NewContainerID)
+			if result.NewContainerID != "" && candidate != nil {
+				p.StopContainer(result.NewContainerID)
+				removeErr := p.RemoveContainer(result.NewContainerID)
+				removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool { return p.containerAbsent(result.NewContainerID, "") })
+				if !removed {
+					result.ManualRecoveryRequired = true
+					result.Message = fmt.Sprintf("Podman reported create failure and identified candidate cleanup could not be verified (create error: %v, remove error: %v).", runErr, removeErr)
+					return result, nil
+				}
+				result.Message = fmt.Sprintf("Podman reported create failure after an identified candidate appeared; the candidate was verified removed: %v.", runErr)
+				return result, nil
+			}
+			if findContainerByName(current, spec.Name) != nil {
+				result.ManualRecoveryRequired = true
+				result.Message = fmt.Sprintf("Podman reported create failure and a container now occupies %q, but no exact candidate ID was returned; it was retained for manual inspection.", spec.Name)
+				return result, nil
+			}
+			return result, fmt.Errorf("failed to create workload from spec: %v (stderr: %s)", runErr, strings.TrimSpace(stderr))
+		}
+		var created *Container
+		verified := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			current, listErr := p.ListContainers(true)
+			if listErr != nil {
+				return false
+			}
+			created = findContainerByIdentity(current, result.NewContainerID)
+			if created == nil {
+				return false
+			}
+			kind, ok := classifyLifecycle(created.State)
+			return ok && kind == lifecycleRunning && strings.TrimSpace(created.ImageID) == strings.TrimSpace(spec.ResolvedImage) && containerMatchesSpecLabels(created, *spec) && mappingsExactlyEqual(spec.PortMappings, created.PortMappings)
+		})
+		if !verified {
+			p.StopContainer(spec.Name)
+			removeErr := p.RemoveContainer(spec.Name)
+			removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool { return p.containerAbsent(result.NewContainerID, spec.Name) })
+			if !removed {
+				result.ManualRecoveryRequired = true
+				result.Message = fmt.Sprintf("Deployment verification failed and candidate cleanup could not be verified (remove error: %v).", removeErr)
+				return result, nil
+			}
+			result.Message = "Deployment verification failed; the unverified candidate was removed."
+			return result, nil
+		}
+		result.Success = true
+		result.Message = "Workload created from authoritative spec and verified."
+		return result, nil
+	}
+
+	result.OldContainerID = target.Id
+	if target.Provenance.Type != "podder" || target.Provenance.Service != spec.Name || !containerMatchesSpecLabels(target, *spec) {
+		return result, fmt.Errorf("deploy blocked: existing workload %q does not match the stored Podder ownership metadata", spec.Name)
+	}
+	if strings.TrimSpace(target.ImageID) != strings.TrimSpace(spec.ResolvedImage) || !mappingsExactlyEqual(spec.PortMappings, target.PortMappings) {
+		return result, fmt.Errorf("deploy blocked: existing workload %q has drifted from its authoritative image or port configuration", spec.Name)
+	}
+	originalLifecycle, ok := classifyLifecycle(target.State)
+	if !ok {
+		return result, fmt.Errorf("deploy blocked: lifecycle state %q cannot be safely reproduced", target.State)
+	}
+	var createArgs []string
+	if originalLifecycle == lifecycleRunning {
+		createArgs, err = BuildRunArgsFromSpec(*spec)
+	} else {
+		createArgs, err = BuildCreateArgsFromSpec(*spec)
+	}
+	if err != nil {
+		return result, fmt.Errorf("stored spec is not replayable: %w", err)
+	}
+
+	backupName := newBackupName(spec.Name)
+	result.BackupContainerName = backupName
+	if _, _, err := p.runCommand("rename", spec.Name, backupName); err != nil {
+		result.Message = fmt.Sprintf("Deployment stopped before mutation: existing workload could not be renamed: %v", err)
+		return result, nil
+	}
+	rollback := func(reason string, candidateWasCreated bool) (*DeploySpecResult, error) {
+		rb := p.executeRollback(backupName, spec.Name, result.NewContainerID, target.Id, originalLifecycle, candidateWasCreated)
+		result.Rollback = rb
+		if rb.Verified {
+			result.Message = reason + " The original workload was restored and verified."
+		} else {
+			result.ManualRecoveryRequired = true
+			result.Message = reason + " ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: " + strings.Join(rb.Errors, "; ")
+		}
+		return result, nil
+	}
+
+	if originalLifecycle == lifecycleRunning {
+		if err := p.StopContainer(backupName); err != nil {
+			return rollback(fmt.Sprintf("Deployment failed while stopping the original workload: %v.", err), false)
+		}
+		stopped := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			current, listErr := p.ListContainers(true)
+			if listErr != nil {
+				return false
+			}
+			backup := findContainerByName(current, backupName)
+			if backup == nil || backup.Id != target.Id {
+				return false
+			}
+			kind, supported := classifyLifecycle(backup.State)
+			return supported && kind == lifecycleStopped
+		})
+		if !stopped {
+			return rollback("Deployment failed: original workload did not verify stopped.", false)
 		}
 	}
 
-	// 2. Build run command arguments from the complete spec
-	args, err := BuildRunArgsFromSpec(*spec)
-	if err != nil {
-		return "", fmt.Errorf("failed to build run arguments from spec: %w", err)
+	stdout, stderr, runErr := p.runCommand(createArgs...)
+	result.NewContainerID = strings.TrimSpace(stdout)
+	if runErr != nil {
+		current, _ := p.ListContainers(true)
+		candidateWasCreated := result.NewContainerID != "" && findContainerByIdentity(current, result.NewContainerID) != nil
+		return rollback(fmt.Sprintf("Deployment failed to create replacement: %v (stderr: %s).", runErr, strings.TrimSpace(stderr)), candidateWasCreated)
+	}
+	var replacement *Container
+	verified := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+		current, listErr := p.ListContainers(true)
+		if listErr != nil {
+			return false
+		}
+		replacement = findContainerByIdentity(current, result.NewContainerID)
+		if replacement == nil {
+			return false
+		}
+		kind, supported := classifyLifecycle(replacement.State)
+		return supported && kind == originalLifecycle && strings.TrimSpace(replacement.ImageID) == strings.TrimSpace(spec.ResolvedImage) && containerMatchesSpecLabels(replacement, *spec) && mappingsExactlyEqual(spec.PortMappings, replacement.PortMappings)
+	})
+	if !verified {
+		return rollback("Deployment failed: replacement identity, lifecycle, image, labels, or ports did not verify.", true)
 	}
 
-	// 3. Execute container run
-	stdout, stderr, err := p.runCommand(args...)
-	if err != nil {
-		return "", fmt.Errorf("failed to run container from spec: %v, stderr: %s", err, strings.TrimSpace(stderr))
+	removeErr := p.RemoveContainer(backupName)
+	removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool { return p.containerAbsent(target.Id, backupName) })
+	result.Success = true
+	if !removed {
+		result.BackupCleanupRequired = true
+		result.Message = fmt.Sprintf("Replacement committed and verified, but backup %s remains and requires manual cleanup (remove error: %v).", backupName, removeErr)
+		return result, nil
 	}
+	result.Message = "Replacement committed, verified, and backup removed."
+	return result, nil
+}
 
-	containerID := strings.TrimSpace(stdout)
-	return containerID, nil
+func mappingsExactlyEqual(expected, actual []PortMapping) bool {
+	equal, _, _ := portMappingSetEqual(expected, actual)
+	return equal
+}
+
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700)
+}
+
+func writePrivateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := ensurePrivateDir(dir); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".podder-private-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

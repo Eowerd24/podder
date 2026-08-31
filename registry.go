@@ -13,8 +13,9 @@ import (
 
 // PortRegistryConfig holds registry configuration.
 type PortRegistryConfig struct {
-	Enabled bool   `json:"enabled"`
-	Path    string `json:"path"`
+	Enabled              bool   `json:"enabled"`
+	Path                 string `json:"path"`
+	TreatUnscopedAsLocal bool   `json:"treatUnscopedAsLocal,omitempty"`
 }
 
 // AppSettings represents global application configuration.
@@ -86,8 +87,8 @@ type RegistryPort struct {
 	ID      string `yaml:"id" json:"id"`
 	Service string `yaml:"service" json:"service"`
 	// Node identifies which host in a homelab-wide registry this record
-	// belongs to. An empty Node is treated as applicable to every Podder
-	// instance (see nodeApplies); a non-empty Node that does not match the
+	// belongs to. An empty Node follows the explicit TreatUnscopedAsLocal setting; the secure default is not applicable
+	// (see nodeApplies); a non-empty Node that does not match the
 	// local node's identity means this record describes a REMOTE service,
 	// not a locally required one.
 	Node                string            `yaml:"node" json:"node,omitempty"`
@@ -140,16 +141,13 @@ type PortRegistryResult struct {
 
 // nodeApplies reports whether a registry record scoped to recordNode is
 // applicable to a Podder instance whose local node identity is localNode.
-// An unscoped record (empty Node) is treated as applicable everywhere by
-// default — this is the "explicit policy" for unscoped records: most
-// homelab registries are authored per-node already, so defaulting unscoped
-// entries to "local" avoids spurious REMOTE classification for the common
-// case, while a record that DOES name a node is honored precisely (it must
-// never contribute to local MISSING/enforcement state on a different node).
-func nodeApplies(recordNode, localNode string) bool {
+// Unscoped records are NOT local by default. Operators may explicitly opt in
+// with PortRegistryConfig.TreatUnscopedAsLocal; otherwise they remain visible
+// as not-applicable and cannot create local missing/reservation state.
+func nodeApplies(recordNode, localNode string, treatUnscopedAsLocal bool) bool {
 	recordNode = strings.TrimSpace(recordNode)
 	if recordNode == "" {
-		return true
+		return treatUnscopedAsLocal
 	}
 	return strings.EqualFold(recordNode, strings.TrimSpace(localNode))
 }
@@ -199,17 +197,15 @@ func (p *PodmanService) GetSettings() (*AppSettings, error) {
 	filePath := getSettingsFilePath()
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return &AppSettings{
-			PortRegistry: PortRegistryConfig{
-				Enabled: false,
-				Path:    "",
-			},
-		}, nil
+		if os.IsNotExist(err) {
+			return &AppSettings{PortRegistry: PortRegistryConfig{Enabled: false}}, nil
+		}
+		return nil, fmt.Errorf("failed to read settings: %w", err)
 	}
 
 	var settings AppSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return &AppSettings{}, nil
+		return nil, fmt.Errorf("failed to parse settings: %w", err)
 	}
 	return &settings, nil
 }
@@ -220,7 +216,7 @@ func (p *PodmanService) GetSettings() (*AppSettings, error) {
 // contain credentials via environment variables.
 func (p *PodmanService) SaveSettings(settings AppSettings) error {
 	dir := getConfigDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return fmt.Errorf("failed to create config directory %s: %w", dir, err)
 	}
 

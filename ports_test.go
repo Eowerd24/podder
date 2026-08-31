@@ -439,6 +439,7 @@ func TestCollectBlockingClaimsStrict_EnabledRegistryReadFailureBlocksValidation(
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := newFakeCommandRunner()
 	service := &PodmanService{runner: runner}
@@ -473,6 +474,7 @@ func TestCollectBlockingClaimsStrict_MalformedEnabledRegistryBlocksValidation(t 
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	registryPath := filepath.Join(tempDir, "ports.yaml")
 	if err := os.WriteFile(registryPath, []byte(malformedRegistryYAML), 0o644); err != nil {
@@ -482,7 +484,7 @@ func TestCollectBlockingClaimsStrict_MalformedEnabledRegistryBlocksValidation(t 
 	runner := newFakeCommandRunner()
 	service := &PodmanService{runner: runner}
 	if err := service.SaveSettings(AppSettings{
-		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath},
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
 	}); err != nil {
 		t.Fatalf("failed to save settings: %v", err)
 	}
@@ -507,6 +509,7 @@ func TestCollectBlockingClaimsStrict_DisabledRegistryIsNotAnError(t *testing.T) 
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	// The registry is optional: when it's simply not enabled, a missing or
 	// unreadable file at whatever stale path happens to be configured must

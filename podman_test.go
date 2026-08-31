@@ -246,7 +246,12 @@ func TestIsSupportedImageFile(t *testing.T) {
 // `podman run` and reflects the resulting container back out of `podman ps`.
 func fakePsRunner(containerID, name string, running bool) *fakeCommandRunner {
 	f := newFakeCommandRunner()
+	f.On("podman image", func(name_ string, args []string) (string, string, error) {
+		return `[{"Id":"sha256:test-image"}]`, "", nil
+	})
+	created := false
 	f.On("podman run", func(name_ string, args []string) (string, string, error) {
+		created = true
 		return containerID + "\n", "", nil
 	})
 	state := "running"
@@ -254,7 +259,10 @@ func fakePsRunner(containerID, name string, running bool) *fakeCommandRunner {
 		state = "exited"
 	}
 	f.On("podman ps", func(n string, args []string) (string, string, error) {
-		psJSON := `[{"Id":"` + containerID + `","Names":["` + name + `"],"State":"` + state + `","Labels":{"io.podder.managed":"true"}}]`
+		if !created {
+			return "[]", "", nil
+		}
+		psJSON := `[{"Id":"` + containerID + `","Names":["` + name + `"],"Image":"alpine:latest","ImageID":"sha256:test-image","State":"` + state + `","Ports":[{"host_ip":"127.0.0.1","host_port":8080,"container_port":80,"protocol":"tcp","range":1}],"Labels":{"io.podder.managed":"true","io.podder.service":"` + name + `","io.podder.schema-version":"2"}}]`
 		return psJSON, "", nil
 	})
 	return f
@@ -265,6 +273,7 @@ func TestCreateContainerManagedCommitsSpecOnSuccess(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := fakePsRunner("abc123def456", "svc1", true)
 	svc := &PodmanService{runner: runner}
@@ -300,6 +309,7 @@ func TestCreateContainerUnmanagedSavesNoSpec(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := fakePsRunner("abc123", "svc2", true)
 	svc := &PodmanService{runner: runner}
@@ -335,8 +345,10 @@ func TestCreateContainerFailedCreateLeavesNoCandidateSpec(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := newFakeCommandRunner()
+	runner.On("podman image", func(n string, args []string) (string, string, error) { return `[{"Id":"sha256:test-image"}]`, "", nil })
 	runner.On("podman run", func(n string, args []string) (string, string, error) {
 		return "", "some failure", fmt.Errorf("exit status 1")
 	})
@@ -367,8 +379,10 @@ func TestCreateContainerVerifyFailureRemovesContainerAndSpec(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	runner := newFakeCommandRunner()
+	runner.On("podman image", func(n string, args []string) (string, string, error) { return `[{"Id":"sha256:test-image"}]`, "", nil })
 	runner.On("podman run", func(n string, args []string) (string, string, error) {
 		return "deadbeef\n", "", nil
 	})
@@ -390,8 +404,12 @@ func TestCreateContainerVerifyFailureRemovesContainerAndSpec(t *testing.T) {
 		Managed: true,
 	}
 
-	if _, err := svc.CreateContainer(req); err == nil {
-		t.Fatalf("expected error when the created container fails to verify")
+	result, err := svc.CreateContainer(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success || result.ManualRecoveryRequired {
+		t.Fatalf("expected verified cleanup without success or manual recovery, got %+v", result)
 	}
 	if !removeCalled {
 		t.Errorf("expected the unverified container to be removed")
@@ -421,6 +439,7 @@ func TestCreateContainerRejectsIntraRequestPortConflict(t *testing.T) {
 	origHome := os.Getenv("HOME")
 	defer os.Setenv("HOME", origHome)
 	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
 
 	svc := &PodmanService{runner: newFakeCommandRunner()}
 	req := ContainerCreateRequest{
@@ -447,5 +466,44 @@ func TestValidateSpecRejectsFutureSchemaVersion(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a schema-version error, got: %v", errs)
+	}
+}
+
+func TestCreateContainerCleanupFailureReportsManualRecovery(t *testing.T) {
+	withTestHome(t)
+	withFastPolling(t)
+
+	runner := newFakeCommandRunner()
+	created := false
+	runner.On("podman image", func(string, []string) (string, string, error) {
+		return `[{"Id":"sha256:test-image"}]`, "", nil
+	})
+	runner.On("podman run", func(string, []string) (string, string, error) {
+		created = true
+		return "survivor-id", "", nil
+	})
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		if !created {
+			return "[]", "", nil
+		}
+		return `[{"Id":"survivor-id","Names":["survivor"],"Image":"alpine","ImageID":"sha256:test-image","State":"exited","Ports":[],"Labels":{"io.podder.managed":"true","io.podder.service":"survivor","io.podder.schema-version":"2"}}]`, "", nil
+	})
+	runner.On("podman rm", func(string, []string) (string, string, error) {
+		return "", "busy", fmt.Errorf("container is busy")
+	})
+
+	svc := &PodmanService{runner: runner}
+	result, err := svc.CreateContainer(ContainerCreateRequest{Image: "alpine", Name: "survivor", Managed: true})
+	if err != nil {
+		t.Fatalf("expected structured recovery result, got top-level error: %v", err)
+	}
+	if result.Success || !result.ManualRecoveryRequired || result.ContainerID != "survivor-id" || result.ContainerName != "survivor" {
+		t.Fatalf("cleanup failure did not expose surviving identity and recovery state: %+v", result)
+	}
+	if result.CandidateSpecPath == "" {
+		t.Fatalf("valid candidate spec must be retained for manual recovery")
+	}
+	if _, err := os.Stat(result.CandidateSpecPath); err != nil {
+		t.Fatalf("retained candidate spec is not accessible: %v", err)
 	}
 }

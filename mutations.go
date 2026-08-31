@@ -55,6 +55,7 @@ type PortMutationResult struct {
 	// not be verified — the backup and/or candidate container names remain
 	// available (never deleted in this case) for manual recovery.
 	ManualRecoveryRequired bool                     `json:"manualRecoveryRequired,omitempty"`
+	BackupCleanupRequired  bool                     `json:"backupCleanupRequired,omitempty"`
 	BackupContainerName    string                   `json:"backupContainerName,omitempty"`
 	Steps                  []PortMutationStepResult `json:"steps"`
 	Guidance               string                   `json:"guidance,omitempty"`
@@ -64,9 +65,10 @@ type PortMutationResult struct {
 	// The three verification tiers actually performed — see
 	// AnalyzeExposureTransition-style honesty: never claim a check that
 	// wasn't run.
-	ConfigurationVerified bool `json:"configurationVerified,omitempty"`
-	ListenerObserved      bool `json:"listenerObserved,omitempty"`
-	HealthVerified        bool `json:"healthVerified,omitempty"`
+	ConfigurationVerified bool     `json:"configurationVerified,omitempty"`
+	ListenerObserved      bool     `json:"listenerObserved,omitempty"`
+	HealthVerified        bool     `json:"healthVerified,omitempty"`
+	ExposureWarnings      []string `json:"exposureWarnings,omitempty"`
 }
 
 // Bounded-polling parameters for verification steps. Tests override these to
@@ -310,15 +312,19 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		return result, nil
 	}
 
-	// 2b. The container's current runtime identity must correspond to the
-	// spec: if the running image no longer matches what Podder believes it
-	// deployed, the spec is not trustworthy for a destructive recreation.
-	if strings.TrimSpace(target.Image) != "" && strings.TrimSpace(oldSpec.Image) != "" &&
-		strings.TrimSpace(target.Image) != strings.TrimSpace(oldSpec.Image) {
-		result.Steps = append(result.Steps, PortMutationStepResult{
-			Step: "PREFLIGHT", Passed: false,
-			Message: fmt.Sprintf("Podder-managed metadata inconsistent: running image %q does not match stored spec image %q. Mutation blocked.", target.Image, oldSpec.Image),
-		})
+	// 2b. The runtime name, immutable image identity, and configured ports
+	// must correspond to the authoritative spec. The display image string is
+	// deliberately not compared: Podman may render a tag, digest, or image ID.
+	if oldSpec.Name != containerName {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: fmt.Sprintf("Podder-managed metadata inconsistent: runtime name %q does not match stored spec name %q. Mutation blocked.", containerName, oldSpec.Name)})
+		return result, nil
+	}
+	if strings.TrimSpace(target.ImageID) == "" || strings.TrimSpace(target.ImageID) != strings.TrimSpace(oldSpec.ResolvedImage) {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: fmt.Sprintf("Podder-managed metadata inconsistent: runtime image identity %q does not match authoritative image identity %q. Mutation blocked.", target.ImageID, oldSpec.ResolvedImage)})
+		return result, nil
+	}
+	if ok, missing, unexpected := portMappingSetEqual(oldSpec.PortMappings, target.PortMappings); !ok {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: fmt.Sprintf("Podder-managed metadata inconsistent: current runtime ports differ from the known-good spec (missing: %v, unexpected: %v). Mutation blocked.", missing, unexpected)})
 		return result, nil
 	}
 
@@ -347,13 +353,16 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		return result, nil
 	}
 
-	if err := p.validateMappingsForMutation(req.NewPorts, target.Id); err != nil {
+	exposureWarnings, err := p.validateMappingsForMutation(req.NewPorts, target.Id, oldSpec.PortMappings)
+	if err != nil {
 		result.Steps = append(result.Steps, PortMutationStepResult{
 			Step: "PREFLIGHT", Passed: false,
 			Message: err.Error(),
 		})
 		return result, nil
 	}
+
+	result.ExposureWarnings = exposureWarnings
 
 	if _, err := BuildRunArgsFromSpec(candidateSpec); err != nil {
 		result.Steps = append(result.Steps, PortMutationStepResult{
@@ -380,6 +389,7 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 	}
 
 	backupName := newBackupName(containerName)
+	candidateID := ""
 	result.BackupContainerName = backupName
 	result.Steps = append(result.Steps, PortMutationStepResult{
 		Step: "SNAPSHOT", Passed: true,
@@ -388,7 +398,7 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 
 	fail := func(step, message string, candidateWasCreated bool) (*PortMutationResult, error) {
 		discardCandidateSpec(candidatePath)
-		rb := p.executeRollback(backupName, containerName, containerName, originalLifecycle, candidateWasCreated)
+		rb := p.executeRollback(backupName, containerName, candidateID, target.Id, originalLifecycle, candidateWasCreated)
 		result.Rollback = rb
 		result.RollbackReason = message
 		if rb.Verified {
@@ -407,7 +417,9 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 	// 4. QUIESCE: rename the original out of the way, stop it if running,
 	// and verify the stop before doing anything destructive to it further.
 	if _, _, err := p.runCommand("rename", containerName, backupName); err != nil {
-		return fail("QUIESCE", fmt.Sprintf("Failed to rename existing container to backup: %v", err), false)
+		discardCandidateSpec(candidatePath)
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "QUIESCE", Passed: false, Message: fmt.Sprintf("Failed to rename existing container to backup; original workload was not changed: %v", err)})
+		return result, nil
 	}
 
 	if originalLifecycle == lifecycleRunning {
@@ -451,10 +463,24 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 
 	stdout, stderr, err := p.runCommand(createArgs...)
 	if err != nil {
-		return fail("CONTAINER_CREATE", fmt.Sprintf("Failed to create replacement container: %v (stderr: %s)", err, strings.TrimSpace(stderr)), false)
+		// Podman can report a create/run failure (e.g. the OCI runtime
+		// failing to start the container) after the container object was
+		// nonetheless created under containerName. Detect that so
+		// executeRollback actually stops/removes the leftover candidate
+		// instead of assuming there is nothing to clean up and then
+		// colliding with it when renaming the backup back.
+		candidateWasCreated := p.containerExistsByIdentity(strings.TrimSpace(stdout), containerName)
+		if candidateWasCreated {
+			candidateID = containerName
+		}
+		return fail("CONTAINER_CREATE", fmt.Sprintf("Failed to create replacement container: %v (stderr: %s)", err, strings.TrimSpace(stderr)), candidateWasCreated)
 	}
 
 	newContainerID := strings.TrimSpace(stdout)
+	candidateID = newContainerID
+	if newContainerID == "" {
+		return fail("CONTAINER_CREATE", "Replacement creation returned no container identity; ambiguous candidate was retained rather than deleted by name.", false)
+	}
 	result.NewContainerID = newContainerID
 
 	result.Steps = append(result.Steps, PortMutationStepResult{
@@ -473,9 +499,6 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		}
 		c := findContainerByIdentity(cs, newContainerID)
 		if c == nil {
-			c = findContainerByName(cs, containerName)
-		}
-		if c == nil {
 			return false
 		}
 		kind, _ := classifyLifecycle(c.State)
@@ -490,6 +513,12 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		return fail("PORT_VERIFY", "New container failed to verify: it did not appear with the expected lifecycle state.", true)
 	}
 
+	if strings.TrimSpace(newContainer.ImageID) != strings.TrimSpace(candidateSpec.ResolvedImage) {
+		return fail("PORT_VERIFY", fmt.Sprintf("Replacement image identity %q does not match candidate identity %q.", newContainer.ImageID, candidateSpec.ResolvedImage), true)
+	}
+	if !containerMatchesSpecLabels(newContainer, candidateSpec) {
+		return fail("PORT_VERIFY", "Replacement did not carry the exact managed ownership labels from the candidate spec.", true)
+	}
 	if ok, missing, unexpected := portMappingSetEqual(candidateSpec.PortMappings, newContainer.PortMappings); !ok {
 		return fail("PORT_VERIFY", fmt.Sprintf("Configured port mappings do not match the candidate spec (missing: %v, unexpected: %v).", missing, unexpected), true)
 	}
@@ -510,19 +539,27 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		}
 		result.ListenerObserved = allObserved
 
-		if status, hasHealthcheck := p.containerHealthStatus(newContainer.Id); hasHealthcheck {
-			healthy := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+		if _, hasHealthcheck := p.containerHealthStatus(newContainer.Id); hasHealthcheck {
+			var finalStatus string
+			pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
 				s, ok := p.containerHealthStatus(newContainer.Id)
+				if ok {
+					finalStatus = s
+				}
 				return ok && s == "healthy"
 			})
-			if healthy {
+			switch finalStatus {
+			case "healthy":
 				result.HealthVerified = true
-			} else if status == "unhealthy" {
-				return fail("PORT_VERIFY", "Replacement container reports an unhealthy Podman healthcheck status.", true)
+			case "unhealthy":
+				return fail("PORT_VERIFY", fmt.Sprintf("Replacement container healthcheck reports unhealthy (final status: %q).", finalStatus), true)
+			default:
+				// Still "starting" (or unknown) after the bounded wait:
+				// recorded as unverified (HealthVerified stays false), but
+				// not treated as fatal — many real healthchecks have a
+				// start_period far longer than this poll window, and
+				// "not yet verified" is not the same as "unhealthy".
 			}
-			// still "starting" after the bounded wait: recorded as not
-			// (yet) verified, but not treated as fatal — some services are
-			// legitimately slow to become healthy.
 		}
 	}
 
@@ -537,21 +574,24 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 
 	// 7. COMMIT: promote the candidate spec, then remove the backup only
 	// after that commit succeeds.
-	if err := commitCandidateSpec(candidatePath, candidateSpec); err != nil {
+	if err := p.commitCandidate(candidatePath, candidateSpec); err != nil {
 		return fail("PORT_VERIFY", fmt.Sprintf("Failed to commit candidate spec after successful recreation: %v", err), true)
 	}
 
 	if err := p.RemoveContainer(backupName); err != nil {
+		result.Success = true
+		result.BackupCleanupRequired = true
 		result.Steps = append(result.Steps, PortMutationStepResult{
-			Step: "COMMITTED", Passed: false,
-			Message: fmt.Sprintf("Transaction committed, but backup container %s could not be removed automatically: %v. Manual cleanup recommended.", backupName, err),
+			Step: "COMMITTED", Passed: true,
+			Message: fmt.Sprintf("Transaction committed and replacement verified, but recoverable backup %s could not be removed: %v. Manual cleanup required.", backupName, err),
 		})
+		return result, nil
 	}
 
 	result.Success = true
 	result.Steps = append(result.Steps, PortMutationStepResult{
 		Step: "COMMITTED", Passed: true,
-		Message: "Transaction committed: port mappings updated and spec saved.",
+		Message: "Transaction committed: port mappings updated, spec saved, and backup removed.",
 	})
 
 	return result, nil
@@ -626,12 +666,24 @@ func (p *PodmanService) observeListenerForMapping(m PortMapping) bool {
 		return false
 	}
 	proto := NormalizeProtocol(m.Protocol)
-	for _, l := range listeners {
-		if l.Port == m.HostPort && NormalizeProtocol(l.Protocol) == proto {
-			return true
+	rangeSize := m.RangeSize
+	if rangeSize <= 1 {
+		rangeSize = 1
+	}
+	for offset := 0; offset < rangeSize; offset++ {
+		want := uint16(int(m.HostPort) + offset)
+		found := false
+		for _, l := range listeners {
+			if l.Port == want && NormalizeProtocol(l.Protocol) == proto {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // containerHealthStatus returns a container's Podman healthcheck status
@@ -664,11 +716,16 @@ func (p *PodmanService) containerHealthStatus(idOrName string) (string, bool) {
 // validation as container creation (registry/runtime collisions, checked
 // immediately before applying), ignoring the target container's own current
 // claims, plus intra-request conflict detection.
-func (p *PodmanService) validateMappingsForMutation(mappings []PortMapping, ignoreContainerID string) error {
+func (p *PodmanService) validateMappingsForMutation(mappings []PortMapping, ignoreContainerID string, previousMappings ...[]PortMapping) ([]string, error) {
 	var seen []PortClaim
+	var previous []PortMapping
+	if len(previousMappings) > 0 {
+		previous = previousMappings[0]
+	}
+	var exposureWarnings []string
 	for _, m := range mappings {
 		if m.ContainerPort == 0 || m.HostPort == 0 {
-			return fmt.Errorf("invalid port numbers in mapping: %s", m.DisplayString())
+			return nil, fmt.Errorf("invalid port numbers in mapping: %s", m.DisplayString())
 		}
 
 		valReq := PortMappingRequest{
@@ -678,6 +735,7 @@ func (p *PodmanService) validateMappingsForMutation(mappings []PortMapping, igno
 			Protocol:      m.Protocol,
 			ContainerID:   ignoreContainerID,
 			RangeSize:     m.RangeSize,
+			OldHostIP:     previousHostIPForMapping(m, previous),
 		}
 		valResult, err := p.ValidatePortMapping(valReq)
 		if err != nil || (valResult != nil && !valResult.Valid) {
@@ -690,16 +748,41 @@ func (p *PodmanService) validateMappingsForMutation(mappings []PortMapping, igno
 					}
 				}
 			}
-			return fmt.Errorf("%s", errMsg)
+			return nil, fmt.Errorf("%s", errMsg)
+		}
+		if valResult != nil && valResult.ExposureChange {
+			exposureWarnings = append(exposureWarnings, valResult.ExposureNotice)
 		}
 
 		candidate := PortClaim{Address: m.HostIP, Port: m.HostPort, Protocol: m.Protocol, RangeSize: m.RangeSize}
 		if conflict := FindConflict(seen, candidate, ""); conflict != nil {
-			return fmt.Errorf("port mapping %s conflicts with another mapping in this same request", m.DisplayString())
+			return nil, fmt.Errorf("port mapping %s conflicts with another mapping in this same request", m.DisplayString())
 		}
 		seen = append(seen, candidate)
 	}
-	return nil
+	return exposureWarnings, nil
+}
+
+func previousHostIPForMapping(candidate PortMapping, previous []PortMapping) string {
+	var match string
+	count := 0
+	for _, old := range previous {
+		if old.ContainerPort == candidate.ContainerPort && NormalizeProtocol(old.Protocol) == NormalizeProtocol(candidate.Protocol) && normalizedRangeSize(old.RangeSize) == normalizedRangeSize(candidate.RangeSize) {
+			match = old.HostIP
+			count++
+		}
+	}
+	if count == 1 {
+		return match
+	}
+	return ""
+}
+
+func normalizedRangeSize(size int) int {
+	if size <= 1 {
+		return 1
+	}
+	return size
 }
 
 // executeRollback restores the original container's name and lifecycle
@@ -711,15 +794,23 @@ func (p *PodmanService) validateMappingsForMutation(mappings []PortMapping, igno
 // the failed replacement container was created under — for a port mutation
 // this is always the same as originalName, but adoption may create the
 // replacement under a different (user-chosen) service name.
-func (p *PodmanService) executeRollback(backupName, originalName, candidateName, originalLifecycle string, candidateWasCreated bool) *RollbackResult {
+func (p *PodmanService) executeRollback(backupName, originalName, candidateIdentity, originalID, originalLifecycle string, candidateWasCreated bool) *RollbackResult {
 	result := &RollbackResult{Attempted: true}
 
 	if candidateWasCreated {
-		if err := p.StopContainer(candidateName); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("failed to stop failed candidate %q: %v", candidateName, err))
-		}
-		if err := p.RemoveContainer(candidateName); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("failed to remove failed candidate %q: %v", candidateName, err))
+		stopErr := p.StopContainer(candidateIdentity)
+		removeErr := p.RemoveContainer(candidateIdentity)
+		containers, verifyErr := p.ListContainers(true)
+		if verifyErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("failed to verify candidate removal: %v", verifyErr))
+		} else if findContainerByIdentity(containers, candidateIdentity) != nil {
+			if stopErr != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("failed to stop failed candidate %q: %v", candidateIdentity, stopErr))
+			}
+			if removeErr != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("failed to remove failed candidate %q: %v", candidateIdentity, removeErr))
+			}
+			result.Errors = append(result.Errors, fmt.Sprintf("failed candidate %q still exists after removal", candidateIdentity))
 		} else {
 			result.RemovedCandidate = true
 		}
@@ -727,34 +818,63 @@ func (p *PodmanService) executeRollback(backupName, originalName, candidateName,
 		result.RemovedCandidate = true
 	}
 
-	if _, _, err := p.runCommand("rename", backupName, originalName); err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("failed to rename backup %q back to %q: %v — backup retained for manual recovery", backupName, originalName, err))
+	if !result.RemovedCandidate {
+		result.Errors = append(result.Errors, "rollback stopped before restoring the backup because the failed candidate was not verified absent")
+		return result
+	}
+
+	_, _, renameErr := p.runCommand("rename", backupName, originalName)
+	containers, inspectErr := p.ListContainers(true)
+	if inspectErr != nil {
+		if renameErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("failed to rename backup %q back to %q: %v", backupName, originalName, renameErr))
+		}
+		result.Errors = append(result.Errors, fmt.Sprintf("failed to verify restored container: %v", inspectErr))
+		return result
+	}
+	c := findContainerByName(containers, originalName)
+	if c == nil || (originalID != "" && c.Id != originalID) {
+		if renameErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("failed to rename backup %q back to %q: %v", backupName, originalName, renameErr))
+		}
+		if c == nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("original container %q not found after rollback", originalName))
+		} else {
+			result.Errors = append(result.Errors, fmt.Sprintf("container restored under %q has ID %q, expected original ID %q", originalName, c.Id, originalID))
+		}
 		return result
 	}
 	result.RestoredName = true
 
+	var startErr error
 	if originalLifecycle == lifecycleRunning {
-		if err := p.StartContainer(originalName); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("failed to restart original container %q: %v", originalName, err))
+		startErr = p.StartContainer(originalName)
+	}
+	var restored *Container
+	observed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+		current, err := p.ListContainers(true)
+		if err != nil {
+			return false
 		}
-	}
-
-	containers, err := p.ListContainers(true)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("failed to verify restored container: %v", err))
+		candidate := findContainerByName(current, originalName)
+		if candidate == nil || (originalID != "" && candidate.Id != originalID) {
+			return false
+		}
+		kind, ok := classifyLifecycle(candidate.State)
+		if !ok || kind != originalLifecycle {
+			return false
+		}
+		restored = candidate
+		return true
+	})
+	if !observed || restored == nil {
+		if startErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("failed to restart original container %q: %v", originalName, startErr))
+		}
+		result.Errors = append(result.Errors, fmt.Sprintf("original container %q did not verify in lifecycle %q after rollback", originalName, originalLifecycle))
 		return result
 	}
-	c := findContainerByName(containers, originalName)
-	if c == nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("original container %q not found after rollback", originalName))
-		return result
-	}
-	kind, _ := classifyLifecycle(c.State)
-	result.RestoredLifecycle = kind == originalLifecycle
-	if !result.RestoredLifecycle {
-		result.Errors = append(result.Errors, fmt.Sprintf("original container %q lifecycle is %q, expected %q after rollback", originalName, kind, originalLifecycle))
-	}
-
+	result.RestoredLifecycle = true
 	result.Verified = result.RestoredName && result.RestoredLifecycle && result.RemovedCandidate && len(result.Errors) == 0
 	return result
 }

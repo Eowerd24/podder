@@ -252,3 +252,46 @@ func TestParseNetworksInspectJSON(t *testing.T) {
 		t.Errorf("unexpected network 2: %+v", n2)
 	}
 }
+
+func TestCreateNetworkInspectionFailureBlocksMutation(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman network", func(_ string, args []string) (string, string, error) {
+		if len(args) > 1 && (args[1] == "inspect" || args[1] == "ls") {
+			return errOut("network discovery unavailable")
+		}
+		t.Fatalf("network create must not run after discovery failure: %v", args)
+		return "", "", nil
+	})
+	err := (&PodmanService{runner: runner}).CreateNetwork("safe-name", "bridge", "", "", false, true)
+	if err == nil {
+		t.Fatalf("network creation must fail closed when existing networks cannot be inspected")
+	}
+}
+
+func TestNetworkAttachmentInspectionFailureBlocksCreateAndRemove(t *testing.T) {
+	for _, operation := range []string{"create", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			runner := newFakeCommandRunner()
+			runner.On("podman network", func(_ string, args []string) (string, string, error) {
+				if len(args) > 1 && args[1] == "inspect" {
+					return bridgeNetworkJSON, "", nil
+				}
+				t.Fatalf("network mutation must not run after attachment discovery failure: %v", args)
+				return "", "", nil
+			})
+			runner.On("podman ps", func(string, []string) (string, string, error) {
+				return errOut("container discovery unavailable")
+			})
+			svc := &PodmanService{runner: runner}
+			var err error
+			if operation == "create" {
+				err = svc.CreateNetwork("newnet", "bridge", "", "", false, true)
+			} else {
+				err = svc.RemoveNetwork("customnet")
+			}
+			if err == nil {
+				t.Fatalf("%s must fail closed when attachments cannot be inspected", operation)
+			}
+		})
+	}
+}

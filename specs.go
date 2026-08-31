@@ -162,6 +162,16 @@ func ValidateSpec(spec ContainerSpec) []string {
 			break
 		}
 	}
+	for _, e := range spec.Entrypoint {
+		if strings.TrimSpace(e) == "" {
+			// FormatEntrypointArg passes a single-element entrypoint
+			// through verbatim; an empty element there becomes
+			// `--entrypoint ""`, which silently discards the image's
+			// built-in entrypoint instead of surfacing a validation error.
+			errs = append(errs, "entrypoint must not contain empty arguments")
+			break
+		}
+	}
 
 	return errs
 }

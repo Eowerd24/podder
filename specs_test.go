@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -278,6 +279,25 @@ func TestBuildRunArgsFromSpecUnmanagedHasNoLabels(t *testing.T) {
 		if args[i] == "--label" {
 			t.Errorf("expected no Podder labels for an unmanaged spec, got: %v", args)
 		}
+	}
+}
+
+// TestValidateSpecRejectsEmptyEntrypointArgument covers an adversarial-review
+// finding: FormatEntrypointArg passes a single-element entrypoint through
+// verbatim, so Entrypoint: [""] would otherwise silently become
+// `--entrypoint ""` on replay, discarding the image's built-in entrypoint
+// instead of being caught by validation.
+func TestValidateSpecRejectsEmptyEntrypointArgument(t *testing.T) {
+	spec := ContainerSpec{Image: "alpine", Entrypoint: []string{""}}
+	errs := ValidateSpec(spec)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "empty argument") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a validation error for an empty entrypoint argument, got: %v", errs)
 	}
 }
 

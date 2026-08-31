@@ -507,3 +507,107 @@ func TestCreateContainerCleanupFailureReportsManualRecovery(t *testing.T) {
 		t.Fatalf("retained candidate spec is not accessible: %v", err)
 	}
 }
+
+// TestCreateContainerManagedVerificationRetriesBeforeGivingUp covers an
+// adversarial-review finding: verifyCreatedManagedContainer was checked with
+// a single immediate ListContainers snapshot instead of the same pollUntil
+// retry every equivalent post-create check elsewhere in this codebase uses.
+// A container that only settles into `podman ps` output on a later poll
+// must still verify successfully, not be torn down as if it never existed.
+func TestCreateContainerManagedVerificationRetriesBeforeGivingUp(t *testing.T) {
+	withTestHome(t)
+	withFastPolling(t)
+
+	containerID := "abc123def456"
+	name := "svc-race"
+	runner := newFakeCommandRunner()
+	runner.On("podman image", func(string, []string) (string, string, error) {
+		return `[{"Id":"sha256:test-image"}]`, "", nil
+	})
+	created := false
+	runner.On("podman run", func(string, []string) (string, string, error) {
+		created = true
+		return containerID + "\n", "", nil
+	})
+	psCallsAfterCreate := 0
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		if !created {
+			return "[]", "", nil
+		}
+		psCallsAfterCreate++
+		if psCallsAfterCreate < 2 {
+			// Simulate the container not yet settled on the very first
+			// snapshot immediately after `podman run` returns.
+			return "[]", "", nil
+		}
+		return `[{"Id":"` + containerID + `","Names":["` + name + `"],"Image":"alpine","ImageID":"sha256:test-image","State":"running","Ports":[],"Labels":{"io.podder.managed":"true","io.podder.service":"` + name + `","io.podder.schema-version":"2"}}]`, "", nil
+	})
+	runner.On("podman rm", func(string, []string) (string, string, error) {
+		t.Fatalf("a delayed-but-eventually-correct verification must not be treated as a failure and torn down")
+		return "", "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	result, err := svc.CreateContainer(ContainerCreateRequest{Image: "alpine", Name: name, Managed: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected verification to succeed once the container settles on a later poll, got: %+v", result)
+	}
+	if psCallsAfterCreate < 2 {
+		t.Fatalf("expected verification to retry via pollUntil, got only %d podman ps call(s) after create", psCallsAfterCreate)
+	}
+}
+
+// TestCreateContainerManagedAutoPullsUnresolvedImage covers an adversarial-
+// review finding: resolveImageID uses `podman image inspect`, which never
+// pulls, so a managed create from an image not yet present locally used to
+// fail outright even though plain `podman run` would have auto-pulled it.
+func TestCreateContainerManagedAutoPullsUnresolvedImage(t *testing.T) {
+	withTestHome(t)
+	withFastPolling(t)
+
+	containerID := "deadbeef0001"
+	name := "svc-pull"
+	runner := newFakeCommandRunner()
+	imageInspectCalls := 0
+	pulled := false
+	runner.On("podman image", func(string, []string) (string, string, error) {
+		imageInspectCalls++
+		if !pulled {
+			return "", "no such image", fmt.Errorf("no such image")
+		}
+		return `[{"Id":"sha256:test-image"}]`, "", nil
+	})
+	runner.On("podman pull", func(string, []string) (string, string, error) {
+		pulled = true
+		return "", "", nil
+	})
+	created := false
+	runner.On("podman run", func(string, []string) (string, string, error) {
+		created = true
+		return containerID + "\n", "", nil
+	})
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		if !created {
+			return "[]", "", nil
+		}
+		return `[{"Id":"` + containerID + `","Names":["` + name + `"],"Image":"example.com/fresh:latest","ImageID":"sha256:test-image","State":"running","Ports":[],"Labels":{"io.podder.managed":"true","io.podder.service":"` + name + `","io.podder.schema-version":"2"}}]`, "", nil
+	})
+
+	svc := &PodmanService{runner: runner}
+	result, err := svc.CreateContainer(ContainerCreateRequest{Image: "example.com/fresh:latest", Name: name, Managed: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("expected managed creation to succeed by auto-pulling the not-yet-local image, got: %+v", result)
+	}
+	if !pulled {
+		t.Fatalf("expected PullImage to be attempted after the initial inspect failure")
+	}
+	if imageInspectCalls < 2 {
+		t.Fatalf("expected resolveImageID to be retried after the pull, got %d inspect call(s)", imageInspectCalls)
+	}
+}

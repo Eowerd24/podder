@@ -1,5 +1,4 @@
 import * as Podman from "../bindings/github.com/Eowerd24/podder/podmanservice.js";
-import { Call as WailsCall } from "@wailsio/runtime";
 
 // --- Trust boundary: escaping helpers for untrusted data ---
 //
@@ -154,15 +153,12 @@ window.addEventListener('DOMContentLoaded', () => {
     // Initial data load
     refreshAll();
     
-    // Auto-refresh every 5 seconds
+    // Auto-refresh every 5 seconds. Reuses refreshAll()'s own per-tab
+    // dispatch (the same one used on tab switch) instead of a separate,
+    // easily-out-of-sync list of tabs, so every tab that refreshAll()
+    // supports gets live updates here too.
     setInterval(() => {
-        if (currentTab === 'dashboard') {
-            loadSystemInfo();
-        } else if (currentTab === 'containers') {
-            loadContainers();
-        } else if (currentTab === 'ports') {
-            loadPorts();
-        }
+        refreshAll();
     }, 5000);
 });
 
@@ -176,7 +172,7 @@ window.switchTab = (tabId) => {
     });
     
     // Find matching button and add active class
-    const tabIndexMap = { 'dashboard': 0, 'containers': 1, 'images': 2, 'ports': 3 };
+    const tabIndexMap = { 'dashboard': 0, 'containers': 1, 'images': 2, 'ports': 3, 'networks': 4 };
     const targetButton = document.querySelectorAll('.tab-btn')[tabIndexMap[tabId]];
     if (targetButton) {
         targetButton.classList.add('active');
@@ -565,6 +561,10 @@ function renderPortItems() {
                             expBadge = `<span class="exp-badge lan">LAN</span>`;
                         } else if (scopeVal === 'management') {
                             expBadge = `<span class="exp-badge management">MANAGEMENT</span>`;
+                        } else if (scopeVal === 'public') {
+                            expBadge = `<span class="exp-badge wildcard">PUBLIC</span>`;
+                        } else if (scopeVal === 'cluster') {
+                            expBadge = `<span class="exp-badge wildcard">CLUSTER</span>`;
                         }
 
                         let statusBadge = `<span class="status-pill active">ACTIVE</span>`;
@@ -1063,7 +1063,7 @@ window.updateRunPortField = async (id, field, value) => {
         row.statusLevel = 'ok';
     }
 
-    renderRunPortRows();
+    updateRunPortRowStatus(id);
     updateRunExposureWarning();
 };
 
@@ -1130,11 +1130,23 @@ function renderRunPortRows() {
                     </button>
                 </div>
             </div>
-            ${row.statusText ? `
-                <div class="row-validation-msg ${escapeAttr(row.statusLevel)}">${escapeHtml(row.statusText)}</div>
-            ` : ''}
+            <div class="row-validation-msg ${escapeAttr(row.statusLevel)}" id="port-status-${row.id}"${row.statusText ? '' : ' style="display:none;"'}>${escapeHtml(row.statusText)}</div>
         `;
     }).join('');
+}
+
+// updateRunPortRowStatus updates a single row's validation message in place,
+// without touching any <input> element — unlike renderRunPortRows(), which
+// replaces the whole row list's innerHTML and would destroy (and drop focus
+// from) whichever field the user is actively typing in.
+function updateRunPortRowStatus(id) {
+    const row = runPortRows.find(r => r.id === id);
+    if (!row) return;
+    const el = document.getElementById(`port-status-${id}`);
+    if (!el) return;
+    el.className = `row-validation-msg ${row.statusLevel || 'ok'}`;
+    el.textContent = row.statusText || '';
+    el.style.display = row.statusText ? '' : 'none';
 }
 
 function updateRunExposureWarning() {
@@ -1454,7 +1466,7 @@ window.updateEditPortField = async (id, field, value) => {
         row.statusLevel = 'ok';
     }
 
-    renderEditPortRows();
+    updateEditPortRowStatus(id);
     updateEditExposureWarning();
 };
 
@@ -1521,11 +1533,23 @@ function renderEditPortRows() {
                     </button>
                 </div>
             </div>
-            ${row.statusText ? `
-                <div class="row-validation-msg ${escapeAttr(row.statusLevel)}">${escapeHtml(row.statusText)}</div>
-            ` : ''}
+            <div class="row-validation-msg ${escapeAttr(row.statusLevel)}" id="edit-port-status-${row.id}"${row.statusText ? '' : ' style="display:none;"'}>${escapeHtml(row.statusText)}</div>
         `;
     }).join('');
+}
+
+// updateEditPortRowStatus updates a single row's validation message in
+// place, without touching any <input> element — unlike renderEditPortRows(),
+// which replaces the whole row list's innerHTML and would destroy (and drop
+// focus from) whichever field the user is actively typing in.
+function updateEditPortRowStatus(id) {
+    const row = editPortRows.find(r => r.id === id);
+    if (!row) return;
+    const el = document.getElementById(`edit-port-status-${id}`);
+    if (!el) return;
+    el.className = `row-validation-msg ${row.statusLevel || 'ok'}`;
+    el.textContent = row.statusText || '';
+    el.style.display = row.statusText ? '' : 'none';
 }
 
 function updateEditExposureWarning() {
@@ -1585,10 +1609,13 @@ window.submitPortMutation = async () => {
     for (const row of editPortRows) {
         const hPort = parseInt(row.hostPort, 10);
         const cPort = parseInt(row.containerPort, 10);
-        if (hPort > 0 && cPort > 0) {
+        // A blank/zero Host Port means "let Podman auto-assign", exactly as
+        // submitRunContainer already treats it — it must not be silently
+        // dropped from the request just because Host Port is empty.
+        if (cPort > 0) {
             structuredPorts.push({
                 hostIP: row.hostIP.trim(),
-                hostPort: hPort,
+                hostPort: isNaN(hPort) ? 0 : hPort,
                 containerPort: cPort,
                 protocol: (row.protocol || 'tcp').toLowerCase()
             });
@@ -1806,7 +1833,7 @@ window.openRunModal = (imageName = '') => {
 
 window.pickRunHostPath = async (kind) => {
     try {
-        const selectedPath = await WailsCall.ByName("main.PodmanService.SelectHostPath", kind);
+        const selectedPath = await Podman.SelectHostPath(kind);
         if (!selectedPath) {
             return;
         }
@@ -1953,7 +1980,7 @@ window.submitBuildImage = async () => {
 // --- Utilities ---
 
 function formatBytes(bytes) {
-    if (!bytes || bytes === 0) return '0 Bytes';
+    if (!bytes) return '0 Bytes';
     const k = 1024;
     const dm = 2;
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];

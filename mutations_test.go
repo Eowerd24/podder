@@ -31,8 +31,10 @@ func TestGenerateComposeSnippet(t *testing.T) {
 	if !strings.Contains(snippet, `"127.0.0.1:8080:80/tcp"`) {
 		t.Errorf("expected loopback port in snippet, got: %s", snippet)
 	}
-	if !strings.Contains(snippet, `"5353:5353/udp"`) {
-		t.Errorf("expected wildcard port in snippet, got: %s", snippet)
+	// An explicit "0.0.0.0" host bind must be preserved verbatim in
+	// generated guidance, not silently canonicalized into an omitted bind.
+	if !strings.Contains(snippet, `"0.0.0.0:5353:5353/udp"`) {
+		t.Errorf("expected explicit wildcard port preserved in snippet, got: %s", snippet)
 	}
 }
 
@@ -294,6 +296,49 @@ func TestMutateContainerPorts_AdhocBlocked(t *testing.T) {
 	}
 	if !result.RequiresExternal {
 		t.Errorf("expected RequiresExternal for ad-hoc container")
+	}
+}
+
+func TestMutateContainerPorts_ComposeGuidanceUsesRealServiceName(t *testing.T) {
+	withTestHome(t)
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"composeid1","Names":["myproj_web_1"],"State":"running","Ports":[],"Labels":{"com.docker.compose.project":"myproj","com.docker.compose.service":"web"}}]`, "", nil
+	})
+	svc := &PodmanService{runner: runner}
+
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "composeid1", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success || !result.RequiresExternal {
+		t.Fatalf("expected Compose-managed mutation to be externally guided, got: %+v", result)
+	}
+	if !strings.Contains(result.ComposeSnippet, "web:") {
+		t.Errorf("expected the generated snippet to use the real Compose service name 'web', got: %s", result.ComposeSnippet)
+	}
+}
+
+func TestMutateContainerPorts_ComposeGuidanceWithoutServiceLabelInventsNoName(t *testing.T) {
+	withTestHome(t)
+	runner := newFakeCommandRunner()
+	// A container with Compose project evidence but no service label at
+	// all — detectCompose still classifies this as "compose" provenance,
+	// but the real service identity is not actually known.
+	runner.On("podman ps", func(string, []string) (string, string, error) {
+		return `[{"Id":"composeid2","Names":["myproj_unknown_1"],"State":"running","Ports":[],"Labels":{"com.docker.compose.project":"myproj"}}]`, "", nil
+	})
+	svc := &PodmanService{runner: runner}
+
+	result, err := svc.MutateContainerPorts(PortMutationRequest{ContainerID: "composeid2", NewPorts: []PortMapping{{HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.ComposeSnippet != "" {
+		t.Errorf("expected no invented-name snippet when the service identity is unknown, got: %s", result.ComposeSnippet)
+	}
+	if !strings.Contains(result.Guidance, "could not be safely determined") {
+		t.Errorf("expected guidance to state the identity could not be determined, got: %s", result.Guidance)
 	}
 }
 

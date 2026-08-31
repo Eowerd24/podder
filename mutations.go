@@ -99,11 +99,13 @@ func classifyLifecycle(state string) (kind string, supported bool) {
 }
 
 // GenerateComposeSnippet formats the proposed port mappings for a docker-compose.yml file.
+// Callers must pass the container's actual, confidently-identified Compose
+// service name — never a generic placeholder — since a snippet keyed under
+// the wrong service could be pasted into the wrong place in the compose
+// file. If the real service identity can't be determined, callers must
+// state that instead of calling this with an invented name.
 func GenerateComposeSnippet(serviceName string, ports []PortMapping) string {
 	var sb strings.Builder
-	if serviceName == "" {
-		serviceName = "app"
-	}
 	sb.WriteString(fmt.Sprintf("services:\n  %s:\n    ports:\n", serviceName))
 	for _, m := range ports {
 		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", FormatPublishSpec(m)))
@@ -233,8 +235,16 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 	switch prov.Type {
 	case "compose":
 		result.RequiresExternal = true
-		result.ComposeSnippet = GenerateComposeSnippet(prov.Service, req.NewPorts)
 		result.Guidance = "This container is managed by Docker Compose or Podman Compose. Direct recreation from the GUI would orphan the service. Update your compose file with the snippet below and re-run 'pod up'."
+		// The generated snippet must name the container's ACTUAL Compose
+		// service — a generic placeholder key could be pasted under the
+		// wrong service entirely. If the label evidence didn't actually
+		// include a service name, state that plainly instead of guessing.
+		if strings.TrimSpace(prov.Service) != "" {
+			result.ComposeSnippet = GenerateComposeSnippet(prov.Service, req.NewPorts)
+		} else {
+			result.Guidance += " The Compose service identity for this container could not be safely determined, so no snippet was generated; update your compose file's ports: for the correct service manually."
+		}
 		result.Steps = append(result.Steps, PortMutationStepResult{
 			Step: "PREFLIGHT", Passed: false,
 			Message: "Orchestrator guard: Compose-managed workload cannot be modified directly.",
@@ -578,7 +588,7 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		return fail("PORT_VERIFY", fmt.Sprintf("Failed to commit candidate spec after successful recreation: %v", err), true)
 	}
 
-	if err := p.RemoveContainer(backupName); err != nil {
+	if err := p.forceRemoveContainer(backupName); err != nil {
 		result.Success = true
 		result.BackupCleanupRequired = true
 		result.Steps = append(result.Steps, PortMutationStepResult{
@@ -799,7 +809,7 @@ func (p *PodmanService) executeRollback(backupName, originalName, candidateIdent
 
 	if candidateWasCreated {
 		stopErr := p.StopContainer(candidateIdentity)
-		removeErr := p.RemoveContainer(candidateIdentity)
+		removeErr := p.forceRemoveContainer(candidateIdentity)
 		containers, verifyErr := p.ListContainers(true)
 		if verifyErr != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("failed to verify candidate removal: %v", verifyErr))

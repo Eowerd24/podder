@@ -130,6 +130,25 @@ func TestParseInspectToAssessment_PodBlocked(t *testing.T) {
 	}
 }
 
+// TestAdoptionAutoRemoveFalseNotBlocked proves the AutoRemove blocker is not
+// a false positive: a container with AutoRemove explicitly false (or
+// omitted, the default) is not blocked on that basis.
+func TestAdoptionAutoRemoveFalseNotBlocked(t *testing.T) {
+	raw := baseInspectJSON("", "", `,"AutoRemove":false`, "", "")
+	assessment, err := ParseInspectToAssessment([]byte(raw))
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	for _, b := range assessment.Blockers {
+		if strings.Contains(b, "automatic removal") {
+			t.Fatalf("did not expect an AutoRemove blocker when AutoRemove is false, got: %v", assessment.Blockers)
+		}
+	}
+	if !assessment.CanAdopt {
+		t.Fatalf("expected adoption to be allowed for a clean fixture with AutoRemove=false, blockers: %v", assessment.Blockers)
+	}
+}
+
 // baseInspectJSON returns a minimal, otherwise-clean inspect document with a
 // single field patched in via the supplied hostConfigExtra/configExtra/topExtra
 // JSON fragments, to build focused representability-blocker fixtures.
@@ -278,6 +297,11 @@ func TestAdoptionBlockers(t *testing.T) {
 			hostConfigExtra: `,"Init":true`,
 			wantBlockPhrase: "--init",
 		},
+		{
+			name:            "auto-remove",
+			hostConfigExtra: `,"AutoRemove":true`,
+			wantBlockPhrase: "automatic removal",
+		},
 	}
 
 	for _, tc := range cases {
@@ -344,6 +368,23 @@ func TestAdoptContainer_SuccessfulTransaction(t *testing.T) {
 	c := sim.containers["legacy-web"]
 	if c == nil || !c.managed {
 		t.Fatalf("expected replacement container to exist and carry managed labels, got: %+v", c)
+	}
+
+	// The original container must be retained, not automatically deleted:
+	// a configuration-equivalent replacement cannot prove the original
+	// writable layer held no state, so the renamed backup is the safety net.
+	if !result.BackupCleanupRequired {
+		t.Errorf("expected BackupCleanupRequired=true after successful adoption, since the backup is retained by default")
+	}
+	if result.BackupContainerName == "" {
+		t.Errorf("expected BackupContainerName to be set after successful adoption")
+	}
+	backup := sim.containers[result.BackupContainerName]
+	if backup == nil {
+		t.Fatalf("expected the renamed original container %q to still exist as a retained backup, got containers: %v", result.BackupContainerName, sim.containers)
+	}
+	if backup.state != "exited" {
+		t.Errorf("expected retained backup container to be stopped, got state %q", backup.state)
 	}
 }
 

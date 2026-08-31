@@ -127,6 +127,14 @@ type PortMappingRequest struct {
 	// the exposure TRANSITION instead of merely classifying the candidate
 	// in isolation.
 	OldHostIP string `json:"oldHostIP,omitempty"`
+	// Managed indicates this mapping belongs to (or would become) a
+	// Podder-managed workload. Managed workloads require an explicit,
+	// stable HostPort — a declarative managed service should not depend on
+	// an unpredictable Podman-auto-assigned endpoint — so HostPort==0 is
+	// rejected when Managed is true. Unmanaged/ad-hoc creation may still
+	// request HostPort==0 to let Podman auto-assign a host port; that is
+	// only ever valid when Managed is explicitly false.
+	Managed bool `json:"managed,omitempty"`
 }
 
 // ValidationCheck represents a single validation check result.
@@ -423,6 +431,27 @@ func (p *PodmanService) ListHostListeners() ([]HostListener, error) {
 	return allListeners, nil
 }
 
+// claimCoversListener reports whether a Podman port claim already accounts
+// for an observed host listener, expanding the claim's RangeSize into its
+// individual ports first (via expandClaimRange) instead of comparing only
+// the claim's first port. Without this, a ranged Podman mapping like
+// 8000-8005 only recognizes host port 8000 as "already covered" — ss then
+// exposes ports 8001-8005 as independent, un-owned host-listener claims,
+// which is self-conflicting: a mutation that correctly ignores its own
+// container's claim by ContainerID can still collide with that container's
+// own duplicated ss observations for the rest of its range.
+func claimCoversListener(claim PortClaim, l HostListener) bool {
+	if NormalizeProtocol(claim.Protocol) != NormalizeProtocol(l.Protocol) {
+		return false
+	}
+	for _, expanded := range expandClaimRange(claim) {
+		if expanded.Port == l.Port && AddressesConflict(expanded.Address, l.Address) {
+			return true
+		}
+	}
+	return false
+}
+
 // CollectPortClaimsForDisplay aggregates claims from running containers,
 // host listeners, and optional registry for DISPLAY/reconciliation purposes
 // only. It is deliberately tolerant: a failure to inspect any one source
@@ -464,10 +493,7 @@ func (p *PodmanService) CollectPortClaimsForDisplay() ([]PortClaim, error) {
 		for _, l := range listeners {
 			alreadyCovered := false
 			for _, c := range claims {
-				if c.Source == "podman" &&
-					c.Port == l.Port &&
-					NormalizeProtocol(c.Protocol) == NormalizeProtocol(l.Protocol) &&
-					AddressesConflict(c.Address, l.Address) {
+				if c.Source == "podman" && claimCoversListener(c, l) {
 					alreadyCovered = true
 					break
 				}
@@ -591,10 +617,7 @@ func (p *PodmanService) CollectBlockingClaimsStrict() ([]PortClaim, error) {
 	for _, l := range listeners {
 		alreadyCovered := false
 		for _, c := range claims {
-			if c.Source == "podman" &&
-				c.Port == l.Port &&
-				NormalizeProtocol(c.Protocol) == NormalizeProtocol(l.Protocol) &&
-				AddressesConflict(c.Address, l.Address) {
+			if c.Source == "podman" && claimCoversListener(c, l) {
 				alreadyCovered = true
 				break
 			}
@@ -700,7 +723,15 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	// 127.0.0.1:3000 — the two would conflict at the socket layer if both
 	// tried to bind, but they are not the same declaration. Records scoped
 	// to a different node are never matched against local runtime state.
-	findRegistryMatch := func(bind string, port uint16, protocol string, _ string) *RegistryPort {
+	// rangeSize is the runtime endpoint's effective range (1 for a single
+	// port); a registry declaration of 8000-8005 is NOT a MATCH for a
+	// runtime mapping that only actually covers 8000 (or vice versa) — the
+	// effective range/count is part of what "the same declared endpoint"
+	// means here, exactly like every other endpoint field this function
+	// already compares. This is registry configuration equivalence, not
+	// socket-allocation conflict equivalence (see ClaimsConflict/
+	// EndpointsConflict for that, deliberately looser, question).
+	findRegistryMatch := func(bind string, port uint16, protocol string, rangeSize int, _ string) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded {
 			return nil
 		}
@@ -711,6 +742,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			}
 			if rp.Listener.Port == port &&
 				NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) &&
+				normalizedRangeSize(rp.RangeSize) == normalizedRangeSize(rangeSize) &&
 				EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
 				return rp
 			}
@@ -718,7 +750,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		return nil
 	}
 
-	findRegistryBindMismatch := func(bind string, port uint16, protocol string, serviceName string) *RegistryPort {
+	findRegistryBindMismatch := func(bind string, port uint16, protocol string, rangeSize int, serviceName string) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded || serviceName == "" {
 			return nil
 		}
@@ -727,7 +759,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
 				continue
 			}
-			if rp.Listener.Port == port && NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) && strings.EqualFold(rp.Service, serviceName) && !EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
+			if rp.Listener.Port == port && NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) && normalizedRangeSize(rp.RangeSize) == normalizedRangeSize(rangeSize) && strings.EqualFold(rp.Service, serviceName) && !EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
 				return rp
 			}
 		}
@@ -774,7 +806,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			reconcileStatus := "UNDECLARED"
 			var regID, regState, scope, appProto, purpose string
 			scope = exposure
-			if regMatch := findRegistryMatch(m.HostIP, m.HostPort, m.Protocol, cName); regMatch != nil {
+			if regMatch := findRegistryMatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName); regMatch != nil {
 				reconcileStatus = "MATCH"
 				matchedRegistryIDs[regMatch.ID] = true
 				registryMatchCount++
@@ -783,7 +815,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				scope = regMatch.Scope
 				appProto = regMatch.ApplicationProtocol
 				purpose = regMatch.Purpose
-			} else if mismatch := findRegistryBindMismatch(m.HostIP, m.HostPort, m.Protocol, cName); mismatch != nil {
+			} else if mismatch := findRegistryBindMismatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName); mismatch != nil {
 				reconcileStatus = "DECLARED_ENDPOINT_MISMATCH"
 				matchedRegistryIDs[mismatch.ID] = true
 				regID = mismatch.ID
@@ -822,14 +854,16 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 		}
 	}
 
-	// Add host listeners that are not owned by Podman mappings
+	// Add host listeners that are not owned by Podman mappings. Uses the
+	// same range-aware claimCoversListener check as claim collection
+	// (see claimCoversListener) instead of comparing only a Podman item's
+	// first port — otherwise a ranged mapping like 8000-8005 only
+	// recognizes port 8000 as its own, and the overview would list
+	// 8001-8005 a second time as independent, un-owned host listeners.
 	for idx, l := range listeners {
 		isPodmanListener := false
-		for _, item := range items {
-			if item.IsContainer &&
-				item.HostPort == l.Port &&
-				strings.EqualFold(item.Protocol, l.Protocol) &&
-				AddressesConflict(item.BindAddress, l.Address) {
+		for _, c := range claims {
+			if c.Source == "podman" && claimCoversListener(c, l) {
 				isPodmanListener = true
 				break
 			}
@@ -862,7 +896,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			reconcileStatus := "HOST"
 			var regID, regState, scope, appProto, purpose string
 			scope = exposure
-			if regMatch := findRegistryMatch(l.Address, l.Port, l.Protocol, owner); regMatch != nil {
+			if regMatch := findRegistryMatch(l.Address, l.Port, l.Protocol, 1, owner); regMatch != nil {
 				reconcileStatus = "MATCH"
 				matchedRegistryIDs[regMatch.ID] = true
 				registryMatchCount++
@@ -1042,13 +1076,28 @@ func (p *PodmanService) ValidatePortMapping(req PortMappingRequest) (*PortValida
 
 	// 1. Port range validation
 	if req.HostPort == 0 {
-		result.Valid = false
-		result.Checks = append(result.Checks, ValidationCheck{
-			Name:    "Host Port",
-			Passed:  false,
-			Message: "Host port must be between 1 and 65535",
-			Level:   "error",
-		})
+		if req.Managed {
+			result.Valid = false
+			result.Checks = append(result.Checks, ValidationCheck{
+				Name:    "Host Port",
+				Passed:  false,
+				Message: "Host port must be explicitly set between 1 and 65535 for a Podder-managed workload; an auto-assigned host port is not supported for managed services.",
+				Level:   "error",
+			})
+		} else {
+			// Unmanaged/ad-hoc creation may leave the host port unset and
+			// let Podman auto-assign one. Podder cannot validate a
+			// specific port as free/reserved beforehand for a port that
+			// does not exist yet, so the collision/exposure checks below
+			// (all gated on req.HostPort > 0) are intentionally skipped
+			// for this mapping.
+			result.Checks = append(result.Checks, ValidationCheck{
+				Name:    "Host Port",
+				Passed:  true,
+				Message: "Host port not set: Podman will auto-assign an available host port. Podder cannot validate a specific port as free beforehand for an auto-assigned mapping.",
+				Level:   "warning",
+			})
+		}
 	} else {
 		result.Checks = append(result.Checks, ValidationCheck{
 			Name:    "Host Port Range",

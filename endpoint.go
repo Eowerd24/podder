@@ -10,12 +10,23 @@ import (
 // FormatHostBind formats a host bind address for embedding into a
 // colon-delimited publish spec (Podman -p, Compose ports:, Quadlet
 // PublishPort=), bracketing literal IPv6 addresses so the address can be
-// told apart from the port-number colon. Returns "" for an address that
-// should be omitted entirely from the spec (wildcard shorthand: an absent
-// host address already means "all interfaces").
+// told apart from the port-number colon. Returns "" only for an address that
+// should be omitted entirely from the spec: HostIP == "" (unspecified —
+// Podman's own default bind, never emitted) or the internal "*" shorthand
+// used in a few host-listener contexts as an equivalent of unspecified.
+//
+// An explicit "0.0.0.0" is deliberately NOT collapsed into omission here:
+// "" (unspecified/default Podman bind) and "0.0.0.0" (an explicit IPv4
+// wildcard) are distinct declarations that must round-trip distinctly, even
+// though both are classified as wildcard exposure for conflict/exposure
+// purposes elsewhere. Silently canonicalizing an explicit 0.0.0.0 into
+// omission would discard the operator's explicit choice without proof that
+// omission means the same thing on every target (Compose/Quadlet defaults,
+// or a future non-Podman runtime, are not guaranteed to match Podman's own
+// default bind).
 func FormatHostBind(addr string) string {
 	addr = strings.TrimSpace(addr)
-	if addr == "" || addr == "0.0.0.0" || addr == "*" {
+	if addr == "" || addr == "*" {
 		return ""
 	}
 	if strings.Contains(addr, ":") {
@@ -44,6 +55,16 @@ func FormatPublishSpec(m PortMapping) string {
 	switch {
 	case bind != "" && m.HostPort != 0:
 		return fmt.Sprintf("%s:%s:%s/%s", bind, hostComponent, containerComponent, proto)
+	case bind != "" && m.HostPort == 0:
+		// An explicit host address with an auto-assigned host port (an
+		// unmanaged/ad-hoc mapping with HostPort==0) must still restrict the
+		// bind to that address: dropping the address here — as a naive
+		// "no host port set" fallback would — silently widens exposure from
+		// the requested interface to all interfaces, since podman -p
+		// <containerPort>/proto alone binds every interface. The
+		// double-colon form (host::container) is Podman/Quadlet's own
+		// syntax for "this address, auto-assigned port".
+		return fmt.Sprintf("%s::%s/%s", bind, containerComponent, proto)
 	case m.HostPort != 0:
 		return fmt.Sprintf("%s:%s/%s", hostComponent, containerComponent, proto)
 	default:
@@ -195,13 +216,14 @@ func ParsePublishSpec(entry string) (*PortMapping, error) {
 		rangeSize = cCount
 	}
 
-	bind := hostIP
-	if bind == "" {
-		bind = "0.0.0.0"
-	}
-
+	// hostIP is left exactly as parsed: "" means the spec never named a host
+	// address at all (unspecified/default Podman bind), which is distinct
+	// from an explicit "0.0.0.0" (IPv4 wildcard) or "::" (IPv6 wildcard).
+	// Defaulting an omitted address to "0.0.0.0" here would make
+	// "8080:80/tcp" and "0.0.0.0:8080:80/tcp" indistinguishable, silently
+	// losing the operator's explicit choice on the next format/round-trip.
 	return &PortMapping{
-		HostIP:        bind,
+		HostIP:        hostIP,
 		HostPort:      hStart,
 		ContainerPort: cStart,
 		Protocol:      proto,

@@ -339,6 +339,15 @@ func validateAndFilterRegistryPorts(ports []RegistryPort) (valid []RegistryPort,
 		case !validStates[rp.State]:
 			warnings = append(warnings, fmt.Sprintf("%s: unrecognized lifecycle state %q, entry skipped", label, rp.State))
 			continue
+		case rp.RangeSize < 0:
+			warnings = append(warnings, fmt.Sprintf("%s: negative range_size %d, entry skipped", label, rp.RangeSize))
+			continue
+		case rp.RangeSize > 1 && int(rp.Listener.Port)+rp.RangeSize-1 > 65535:
+			warnings = append(warnings, fmt.Sprintf("%s: listener port range of size %d starting at %d overflows past 65535, entry skipped", label, rp.RangeSize, rp.Listener.Port))
+			continue
+		case rp.RangeSize > 1 && rp.Container.Port != 0 && int(rp.Container.Port)+rp.RangeSize-1 > 65535:
+			warnings = append(warnings, fmt.Sprintf("%s: container port range of size %d starting at %d overflows past 65535, entry skipped", label, rp.RangeSize, rp.Container.Port))
+			continue
 		}
 		seenIDs[rp.ID] = true
 		valid = append(valid, rp)

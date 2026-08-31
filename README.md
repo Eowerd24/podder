@@ -13,13 +13,27 @@ Podder is a sleek, lightweight, and modern desktop application and CLI tool for 
 - **External Port Registry & Reconciliation**: Optional, read-only Git-managed inventory (`ports.yaml`) support with live status reconciliation (`MATCH`, `UNDECLARED`, `DECLARED_MISSING`, `RESERVED_FREE`, `RESERVED_IN_USE`, `PLANNED`).
 - **Podder Declarative Workload Specifications**: Atomic persistence to `$XDG_CONFIG_HOME/podder/services/<name>.json`, automatic label injection (`io.podder.managed=true`), and built-in declarative deployer.
 - **Safe Port Mutation Transactions**: Atomic port editing engine with 5-step transaction lifecycle (`Preflight -> Snapshot -> Rename & Launch -> Socket Health Verification -> Commit / Auto-Rollback`).
-- **In-Place Quadlet & Compose Integration**: Directly edit published ports in systemd `.container` unit files (`PublishPort=`) or Docker/Podman Compose project files (`ports:` YAML) with automatic reload and rollback on failure.
+- **Quadlet & Compose Observation and Guidance**: Discovers the systemd `.container` unit or Docker/Podman Compose project backing a workload and generates a ready-to-paste, service-scoped `PublishPort=`/`ports:` snippet reflecting the exact requested port change. Automatic in-place mutation of Quadlet units and Compose files is intentionally disabled — Podder cannot yet prove it preserves every construct in those files (interpolation, anchors, drop-ins, long-form attributes) and their rollback/verification guarantees across providers, so the unit file or compose project always remains authoritative and Podder never writes to it directly. See "Ownership Matrix" below.
 - **Workload Adoption**: One-click conversion of ad-hoc running containers into persistent Podder-managed declarative workloads with inspect-to-spec capture and safety analysis.
 - **Podman Network Browser & IPAM Inspector**: Dedicated Networks view discovering local bridge/macvlan/ipvlan networks, subnets, gateways, internal isolation flags, DNS resolution status, and active container IP address allocations.
 - **Real-Time Logs**: View streaming container stdout/stderr in a scrollable terminal-style modal.
 - **Image Management & Multi-Port Run Modal**: List local images, pull new ones from public registries, run containers with structured multi-port and bind-mount configurations, and delete unneeded images.
 - **Global CLI Command**: Act as a compose provider. Running `pod up` or `pod down` in a folder containing a compose file triggers your compose provider.
 - **Podman Socket Preflight**: Before Podder runs `podman compose`, it checks for the rootless Podman API socket and tries to start `podman.socket` automatically when the socket is missing.
+
+---
+
+## Ownership Matrix
+
+Podder treats a workload differently depending on who actually owns its configuration. It never recreates or force-mutates a workload it doesn't own:
+
+| Ownership | Podder's role |
+|---|---|
+| **Podder-managed** | Transactional direct management: create, deploy, and mutate ports through the declarative `ContainerSpec`, with prepare/verify/commit and automatic rollback on failure. |
+| **Compose-managed** | The compose project file remains authoritative. Podder observes the project/service and produces a safe, service-scoped `ports:` snippet to paste in yourself — it does not edit or apply the compose file automatically. |
+| **Quadlet/systemd-managed** | The `.container` unit file remains authoritative. Podder observes it and produces a `PublishPort=` snippet — it does not edit the unit file or restart the service automatically. |
+| **Pod member** | Ownership is pod-level. Podder never recreates an individual pod member as if it were a standalone container. |
+| **Ad-hoc** | Ordinary start/stop/restart/remove controls apply. Destructive, replay-based operations (port mutation, `DeploySpec`) are only available after explicitly adopting the container into a Podder-managed spec. |
 
 ---
 
@@ -62,7 +76,7 @@ sudo loginctl enable-linger "$USER"
 
 ## Contributing & Building from Source
 
-If you want to modify the code or build Podder from scratch, you will need **Go (v1.22+)** and **Node.js** installed.
+If you want to modify the code or build Podder from scratch, you will need **Go (v1.25+, matching `go.mod`)** and **Node.js** installed.
 
 ### 1. Install Dependencies
 On Debian/Ubuntu systems, install the GTK and WebKitGTK development headers required by Wails:

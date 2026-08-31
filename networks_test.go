@@ -1,10 +1,19 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"testing"
 )
+
+// noHostNetworks stubs hostNetworksFunc to report no host-connected
+// networks, keeping CreateNetwork tests deterministic and independent of
+// whatever real network interfaces happen to exist on the machine running
+// the test suite. Tests that specifically exercise the host-overlap check
+// inject their own stub instead.
+func noHostNetworks() ([]*net.IPNet, error) { return nil, nil }
 
 // networkSim is a scripted CommandRunner covering just the podman
 // subcommands ListNetworks/CreateNetwork/RemoveNetwork issue, so network
@@ -115,7 +124,7 @@ func TestCreateNetwork_RejectsOverlappingSubnet(t *testing.T) {
 
 func TestCreateNetwork_SuccessSendsExpectedArgs(t *testing.T) {
 	sim := &networkSim{networksJSON: bridgeNetworkJSON}
-	svc := &PodmanService{runner: sim}
+	svc := &PodmanService{runner: sim, hostNetworks: noHostNetworks}
 	if err := svc.CreateNetwork("mynet", "", "10.90.0.0/24", "10.90.0.1", true, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -126,6 +135,93 @@ func TestCreateNetwork_SuccessSendsExpectedArgs(t *testing.T) {
 	for _, want := range []string{"--driver bridge", "--subnet 10.90.0.0/24", "--gateway 10.90.0.1", "--internal", "--disable-dns", "mynet"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("expected create args to contain %q, got: %s", want, joined)
+		}
+	}
+}
+
+// --- Host route/LAN overlap: a custom Podman bridge subnet must not
+// overlap a network this host is itself directly connected to. ---
+
+func TestCreateNetwork_RejectsHostLANOverlap(t *testing.T) {
+	sim := &networkSim{} // no existing Podman networks
+	svc := &PodmanService{
+		runner: sim,
+		hostNetworks: func() ([]*net.IPNet, error) {
+			// The host's own LAN interface: 192.168.1.5/24.
+			_, lan, _ := net.ParseCIDR("192.168.1.0/24")
+			return []*net.IPNet{lan}, nil
+		},
+	}
+	// 192.168.1.128/25 is within the host's directly-connected 192.168.1.0/24.
+	if err := svc.CreateNetwork("mynet", "bridge", "192.168.1.128/25", "192.168.1.129", false, true); err == nil {
+		t.Fatalf("expected a subnet overlapping the host's own LAN to be rejected")
+	}
+	if len(sim.createCalls) != 0 {
+		t.Errorf("expected no podman network create call for a subnet overlapping the host LAN")
+	}
+}
+
+func TestCreateNetwork_AcceptsNonOverlappingSubnet(t *testing.T) {
+	sim := &networkSim{networksJSON: bridgeNetworkJSON}
+	svc := &PodmanService{
+		runner: sim,
+		hostNetworks: func() ([]*net.IPNet, error) {
+			_, lan, _ := net.ParseCIDR("192.168.1.0/24")
+			return []*net.IPNet{lan}, nil
+		},
+	}
+	// 172.30.0.0/24 overlaps neither the existing Podman network
+	// (10.88.0.0/16) nor the host's LAN (192.168.1.0/24).
+	if err := svc.CreateNetwork("mynet", "bridge", "172.30.0.0/24", "172.30.0.1", false, true); err != nil {
+		t.Fatalf("expected a genuinely non-overlapping subnet to be accepted: %v", err)
+	}
+	if len(sim.createCalls) != 1 {
+		t.Fatalf("expected exactly 1 network create call, got %d", len(sim.createCalls))
+	}
+}
+
+func TestCreateNetwork_HostNetworkInspectionFailureBlocksCreate(t *testing.T) {
+	sim := &networkSim{}
+	svc := &PodmanService{
+		runner: sim,
+		hostNetworks: func() ([]*net.IPNet, error) {
+			return nil, fmt.Errorf("failed to enumerate interfaces")
+		},
+	}
+	if err := svc.CreateNetwork("mynet", "bridge", "10.90.0.0/24", "10.90.0.1", false, true); err == nil {
+		t.Fatalf("expected network creation to fail closed when host network interfaces cannot be inspected")
+	}
+	if len(sim.createCalls) != 0 {
+		t.Errorf("expected no podman network create call when host interface inspection fails")
+	}
+}
+
+func TestFindHostNetworkOverlap(t *testing.T) {
+	_, lan, _ := net.ParseCIDR("10.0.0.0/8")
+	hostNets := []*net.IPNet{lan}
+
+	_, overlapping, _ := net.ParseCIDR("10.5.0.0/16")
+	if got := findHostNetworkOverlap(hostNets, overlapping); got == "" {
+		t.Errorf("expected an overlap to be found")
+	}
+
+	_, clean, _ := net.ParseCIDR("172.20.0.0/16")
+	if got := findHostNetworkOverlap(hostNets, clean); got != "" {
+		t.Errorf("expected no overlap, got %q", got)
+	}
+}
+
+func TestDefaultHostNetworksExcludesLoopbackAndLinkLocal(t *testing.T) {
+	nets, err := defaultHostNetworks()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, n := range nets {
+		if n.IP.IsLoopback() {
+			t.Errorf("expected loopback addresses to be excluded, got %v", n)
+		}
+		if n.IP.IsLinkLocalUnicast() || n.IP.IsLinkLocalMulticast() {
+			t.Errorf("expected link-local addresses to be excluded, got %v", n)
 		}
 	}
 }

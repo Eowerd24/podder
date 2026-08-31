@@ -17,7 +17,7 @@ We believe container management shouldn't be complicated. Podder strips away the
 - **External Port Registry Reconciliation**: Optional `ports.yaml` Git inventory reconciliation (`MATCH`, `UNDECLARED`, `DECLARED_MISSING`, `RESERVED`)
 - **Podder Declarative Workloads**: Durable JSON specifications under `$XDG_CONFIG_HOME/podder/services/` with built-in deployer
 - **Transactional Port Mutations**: Atomic container mutation with preflight checks, snapshotting, health verification, and automated rollback
-- **Quadlet & Compose Direct Integration**: In-place transactional `.container` and `compose.yml` port editing with service reloads
+- **Quadlet & Compose Observation & Guidance**: Discovers the owning `.container` unit or `compose.yml` project and generates a ready-to-paste port snippet; the unit/project file always remains authoritative and Podder never edits it in place
 - **Workload Adoption**: Automated inspect-to-spec conversion turning unmanaged containers into declarative Podder workloads
 - **Podman Networks & IPAM**: Network inspector exploring bridge/macvlan/ipvlan subnets, gateways, isolation, and live container IP assignments
 - **Real-Time Logs**: Stream container logs in a terminal-style interface

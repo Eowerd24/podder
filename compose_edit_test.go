@@ -266,6 +266,16 @@ func TestMutateComposePorts_SuccessfulServiceScopedApply(t *testing.T) {
 		t.Fatalf("expected Compose mutation to be safely disabled with manual guidance, got: %+v", result)
 	}
 
+	// The generated guidance snippet must use the container's ACTUAL
+	// Compose service ("web"), not a generic placeholder key — a snippet
+	// keyed "service:" could be pasted under the wrong service entirely.
+	if !strings.Contains(result.ComposeSnippet, "web:") {
+		t.Errorf("expected generated snippet to use the real service name 'web', got: %s", result.ComposeSnippet)
+	}
+	if strings.Contains(result.ComposeSnippet, "\n  service:") {
+		t.Errorf("did not expect the generic placeholder service key in the snippet, got: %s", result.ComposeSnippet)
+	}
+
 	updated, err := os.ReadFile(composeFile)
 	if err != nil {
 		t.Fatalf("failed to read updated compose file: %v", err)
@@ -304,6 +314,28 @@ func TestMutateComposePorts_FailedApplyRollsBackFile(t *testing.T) {
 	}
 	if !strings.Contains(string(restored), "8080:80") || strings.Contains(string(restored), "9090") {
 		t.Errorf("expected original compose file content restored, got: %s", restored)
+	}
+}
+
+// TestMutateComposePorts_UnknownServiceIdentityGeneratesNoSnippet proves
+// that when the container's Compose service identity cannot be confidently
+// determined (e.g. the container is not found at all), Podder does not
+// invent a generic placeholder service name for the guidance snippet — it
+// states that the identity could not be determined instead.
+func TestMutateComposePorts_UnknownServiceIdentityGeneratesNoSnippet(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(string, []string) (string, string, error) { return "[]", "", nil })
+	svc := &PodmanService{runner: runner}
+
+	result, err := svc.MutateComposePorts("does-not-exist", []PortMapping{{HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.ComposeSnippet != "" {
+		t.Errorf("expected no snippet when the Compose service identity could not be determined, got: %s", result.ComposeSnippet)
+	}
+	if !strings.Contains(result.Guidance, "could not be safely determined") {
+		t.Errorf("expected guidance to state the identity could not be determined, got: %s", result.Guidance)
 	}
 }
 

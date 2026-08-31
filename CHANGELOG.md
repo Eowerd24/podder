@@ -2,19 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+Post-audit corrective pass on the v1.3.0 hardening work.
+
+### Changed
+- Normal image deletion (`RemoveImage`) no longer passes `podman rmi --force`: it refuses when the image is in use by a container instead of silently deleting that container.
+- Adoption blocks containers using `--rm`/`AutoRemove` (stopping the original to adopt it would destroy the rollback source).
+- Successful adoption now retains the renamed original container, stopped, as a backup by default instead of deleting it automatically — the replacement can be configuration-equivalent while still losing writable-layer state the original held.
+- Port bind addresses now preserve the operator's exact intent: an unset host bind, an explicit `0.0.0.0`, and an explicit `::` are distinct and round-trip distinctly through Podman/Compose/Quadlet publish specs, instead of all three collapsing into the same "omitted" form.
+- Selecting an explicit compose file (not just a directory) in "Run Compose" now actually executes that exact file, instead of falling back to the provider's default filename discovery.
+- Host-listener deduplication against a container's own ranged port mapping (e.g. `8000-8005`) is now range-aware, so a same-container port mutation no longer conflicts with its own duplicated `ss` observations for the rest of the range.
+- `HostPort == 0` is a consistent policy end-to-end: a Podder-managed workload must name an explicit host port; unmanaged/ad-hoc creation may still leave it unset to let Podman auto-assign one, and the frontend and backend now agree on this.
+- Creating a custom Podman network subnet now also checks for overlap with the host's own directly-connected network interfaces (e.g. the physical LAN), not just other Podman networks, and fails closed if that can't be determined.
+- Port registry validation and reconciliation now account for `range_size`: an overflowing or negative range is rejected, and a runtime mapping only reconciles as `MATCH` against a registry declaration when the effective range/count agrees too, not just the start port.
+- `DeleteSpec` now refuses to delete a spec while a live Podder-managed container still carries that service's ownership labels, instead of silently orphaning it.
+- Declarative spec filenames are now derived directly from a validated, canonical service-name grammar instead of a lossy sanitization, so two distinct logical names can no longer collide on the same on-disk spec file.
+- Generated Compose port-editing guidance now names the container's actual Compose service instead of falling back to a generic placeholder key when the real identity is available; it states plainly when the identity can't be determined rather than inventing a name.
+- Documentation (README/ABOUT) no longer describes Compose/Quadlet port editing as in-place/automatic — it is discovery-and-guidance only, matching the code; added an explicit ownership matrix; corrected the documented minimum Go version to match `go.mod`.
+
 ## [1.3.0] - 2026-08-31
 
 ### Added
 - Transaction-safe, schema-versioned Podder workload replay with complete bind, environment, entrypoint, command-argument, lifecycle, and port-range preservation.
 - Default-deny workload adoption checks that block conversion when the source container uses settings Podder cannot reproduce safely.
-- Exact post-change verification and structured rollback reporting for managed containers, Compose services, and user-scoped Quadlet units.
+- Exact post-change verification and structured rollback reporting for Podder-managed container port mutations, deployments, and adoption.
 - Node-scoped external port-registry reconciliation and explicit handling of ambiguous workload provenance.
 - Extensive deterministic tests backed by injectable command runners instead of the host's live Podman state.
 
 ### Changed
 - Port discovery now fails closed during safety-critical validation, while the overview remains tolerant of partial discovery failures.
-- Compose mutations are service-scoped, support safe single-file projects, preserve file permissions, and restore both configuration and runtime state on rollback.
-- Quadlet editing is limited to user-scoped units, validates generated systemd units before restart, and preserves the unit's prior active state.
+- Compose port editing is discovery/guidance-only: Podder identifies the exact project, single-file layout, and service, and generates a paste-ready snippet — it does not write to the compose file or run `compose up` on your behalf (see the Ownership Matrix in the README).
+- Quadlet port editing is discovery/guidance-only: Podder identifies the owning user-scoped `.container` unit and generates a paste-ready `PublishPort=` snippet — it does not edit the unit file or reload/restart the service on your behalf.
 - Network creation validates names, CIDRs, gateways, address families, and subnet overlap; ordinary network removal refuses to detach connected containers forcibly.
 - CI now runs vet, unit tests, race tests, a pinned Wails build, and publishes only the artifact that passed those checks.
 - Release identity, package metadata, module path, and license information now consistently identify Podder.

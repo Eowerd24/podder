@@ -51,6 +51,23 @@ jobs:
       working-directory: ./frontend
       run: npm ci
 
+    # Installed here (rather than right before the final `wails3 build`)
+    # because the frontend build below needs it first: vite.config.js's
+    # `wails("./bindings")` plugin requires frontend/bindings/ (gitignored,
+    # generated — never checked in) to already exist, or `npm run build`
+    # fails outright with "Event bindings module not found". `wails3 build`
+    # regenerates the same bindings later; running `generate bindings` here
+    # is not redundant work, it's what makes the standalone frontend build
+    # (and therefore go vet/test, which need frontend/dist to exist for
+    # main.go's //go:embed) possible before the full application build.
+    - name: Install Wails v3 CLI
+      run: go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}
+
+    - name: Generate Wails Bindings
+      run: |
+        export PATH="$PATH:$(go env GOPATH)/bin"
+        wails3 generate bindings ./...
+
     - name: Build Frontend
       working-directory: ./frontend
       run: npm run build
@@ -69,9 +86,6 @@ jobs:
       # and build/android helper packages are platform-scaffolding, not
       # part of the tested application).
       run: go test -race .
-
-    - name: Install Wails v3 CLI
-      run: go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}
 
     - name: Build Application Binary
       run: |

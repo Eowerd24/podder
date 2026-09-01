@@ -400,6 +400,23 @@
                     </div>
                     <div id="registry-test-result" class="registry-status-banner" style="display: none;"></div>
                 </div>
+
+                <div class="form-group" style="margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+                    <label class="form-label" style="margin-bottom: 4px;">Compose Trusted Roots</label>
+                    <p class="form-hint">
+                        A container's own labels (working directory, config file) are discovery hints only — Podder will
+                        never automatically read a reported Compose file unless it resolves inside one of these
+                        operator-approved roots. Leave empty to disable automatic Compose file reading entirely (the
+                        claimed path is still shown as unverified metadata).
+                    </p>
+                    <div id="compose-trusted-roots-list" class="port-rows-container" style="margin-top: 8px;">
+                        <!-- Dynamically managed trusted-root rows -->
+                    </div>
+                    <div class="picker-actions" style="margin-top: 8px;">
+                        <button type="button" class="btn btn-secondary" onclick="addComposeTrustedRootRow()">+ Add Root Manually</button>
+                        <button type="button" class="btn btn-secondary" onclick="pickComposeTrustedRoot()">Browse...</button>
+                    </div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="testRegistryFile()">Test / Reload</button>

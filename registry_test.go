@@ -1108,6 +1108,13 @@ func TestCollectBlockingClaimsStrict_PartiallyInvalidRegistryBlocksSafetyOperati
 
 // --- Registry lifecycle reconciliation semantics (item 6) ---
 
+// TestClassifyRegistryMatch_AllLifecycleStates pins the v1.4 round-2
+// correction: only a genuine "active" (or unrecognized/default) match
+// counts toward the ordinary registryMatch summary bucket.
+// TEMPORARY_ACTIVE/DEPRECATED_ACTIVE/RETIRED_IN_USE must NEVER be folded
+// into ordinary MATCH — DEPRECATED_ACTIVE and RETIRED_IN_USE are
+// specifically drift (see registryStatusIsDrift/RegistryDrift) that would
+// otherwise be invisible if counted as an everyday match.
 func TestClassifyRegistryMatch_AllLifecycleStates(t *testing.T) {
 	cases := []struct {
 		state           string
@@ -1118,9 +1125,9 @@ func TestClassifyRegistryMatch_AllLifecycleStates(t *testing.T) {
 		{"", "MATCH", true}, // unrecognized/empty defaults to active semantics
 		{"reserved", "RESERVED_IN_USE", false},
 		{"planned", "PLANNED", false},
-		{"temporary", "TEMPORARY_ACTIVE", true},
-		{"deprecated", "DEPRECATED_ACTIVE", true},
-		{"retired", "RETIRED_IN_USE", true},
+		{"temporary", "TEMPORARY_ACTIVE", false},
+		{"deprecated", "DEPRECATED_ACTIVE", false},
+		{"retired", "RETIRED_IN_USE", false},
 	}
 	for _, tc := range cases {
 		status, ordinary := classifyRegistryMatch(tc.state)
@@ -1129,6 +1136,32 @@ func TestClassifyRegistryMatch_AllLifecycleStates(t *testing.T) {
 		}
 		if ordinary != tc.wantOrdinaryLog {
 			t.Errorf("classifyRegistryMatch(%q) countsAsOrdinaryMatch = %v, want %v", tc.state, ordinary, tc.wantOrdinaryLog)
+		}
+	}
+}
+
+func TestRegistryStatusIsDrift(t *testing.T) {
+	drift := map[string]bool{
+		"DEPRECATED_ACTIVE":          true,
+		"RETIRED_IN_USE":             true,
+		"OWNER_MISMATCH":             true,
+		"OWNER_UNKNOWN":              true,
+		"DECLARED_ENDPOINT_MISMATCH": true,
+		"MATCH":                      false,
+		"UNDECLARED":                 false,
+		"DECLARED_MISSING":           false,
+		"RESERVED_FREE":              false,
+		"RESERVED_IN_USE":            false,
+		"PLANNED":                    false,
+		"TEMPORARY_ACTIVE":           false,
+		"TEMPORARY_MISSING":          false,
+		"DEPRECATED_MISSING":         false,
+		"RETIRED_FREE":               false,
+		"HOST":                       false,
+	}
+	for status, want := range drift {
+		if got := registryStatusIsDrift(status); got != want {
+			t.Errorf("registryStatusIsDrift(%q) = %v, want %v", status, got, want)
 		}
 	}
 }
@@ -1284,6 +1317,14 @@ func TestReconciliationStates_TemporaryDeprecatedRetiredMatchedAgainstLiveContai
 	if !foundRetiredInUse {
 		t.Fatalf("expected to find the running container's item matched against the retired registry entry")
 	}
+	// v1.4 round-2 correction: RETIRED_IN_USE is drift, never counted as
+	// an ordinary match (see classifyRegistryMatch/registryStatusIsDrift).
+	if overview.Summary.RegistryMatch != 0 {
+		t.Errorf("expected RegistryMatch to NOT count a RETIRED_IN_USE endpoint, got %d", overview.Summary.RegistryMatch)
+	}
+	if overview.Summary.RegistryDrift != 1 {
+		t.Errorf("expected RegistryDrift to count the one RETIRED_IN_USE endpoint, got %d", overview.Summary.RegistryDrift)
+	}
 }
 
 func TestDisabledRegistryDoesNotBlockNormalOperation(t *testing.T) {
@@ -1321,5 +1362,258 @@ func TestDisabledRegistryDoesNotBlockNormalOperation(t *testing.T) {
 	}
 	if !validation.Valid {
 		t.Errorf("expected validation to succeed when the registry is disabled, got: %+v", validation.Checks)
+	}
+}
+
+// =====================================================================
+// v1.4 hardening round 2: registry matching must include intended
+// owner/service identity, not just endpoint occupation (finding 2)
+// =====================================================================
+
+const ownerIdentityRegistryV1 = `
+version: 1
+ports:
+  - id: flowise-http
+    service: flowise
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3100
+    state: active
+    purpose: Flowise web frontend
+
+  - id: analytics-temp
+    service: analytics
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3200
+    state: temporary
+
+  - id: legacy-api
+    service: legacy-api
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3300
+    state: deprecated
+
+  - id: relp-reservation
+    service: relp
+    protocol: tcp
+    listener:
+      address: 0.0.0.0
+      port: 3400
+    state: reserved
+`
+
+func newOwnerIdentityTestService(t *testing.T, psJSON, ssOutput string) (*PodmanService, string) {
+	t.Helper()
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(ownerIdentityRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	t.Cleanup(func() { os.Setenv("HOME", origHome) })
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return ssOutput, "", nil })
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+	return service, registryPath
+}
+
+func TestRegistryOwnerIdentity_MatchingOwnerReportsMatch(t *testing.T) {
+	psJSON := `[{"Id":"1111111111111111111111111111111111111111","Names":["flowise"],"Image":"flowise","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3100,"container_port":3000,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "flowise-http" {
+			found = true
+			if item.ReconciliationStatus != "MATCH" {
+				t.Errorf("expected MATCH for matching owner, got %q (note: %s)", item.ReconciliationStatus, item.ConflictNote)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against flowise-http")
+	}
+}
+
+func TestRegistryOwnerIdentity_DifferentOwnerReportsOwnerMismatch(t *testing.T) {
+	psJSON := `[{"Id":"2222222222222222222222222222222222222222","Names":["rogue-service"],"Image":"rogue","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3100,"container_port":3000,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "flowise-http" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_MISMATCH" {
+				t.Fatalf("expected OWNER_MISMATCH for a different observed owner, got %q", item.ReconciliationStatus)
+			}
+			if !strings.Contains(item.ConflictNote, "flowise") || !strings.Contains(item.ConflictNote, "rogue-service") {
+				t.Errorf("expected diagnostic note naming expected/observed owners, got: %q", item.ConflictNote)
+			}
+		}
+		// The declaration must not ALSO be double-counted as unmatched/missing.
+		if item.RegistryID == "flowise-http" && item.Source == "registry-declared" {
+			t.Fatalf("expected the owner-mismatched declaration to be consumed by the runtime item, not also listed as a separate unmatched declared row: %+v", item)
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against flowise-http")
+	}
+	if overview.Summary.RegistryMatch != 0 {
+		t.Errorf("expected RegistryMatch to NOT count an owner-mismatched endpoint, got %d", overview.Summary.RegistryMatch)
+	}
+	if overview.Summary.RegistryDrift != 1 {
+		t.Errorf("expected RegistryDrift to count exactly the one owner-mismatched endpoint, got %d", overview.Summary.RegistryDrift)
+	}
+}
+
+func TestRegistryOwnerIdentity_UnidentifiableHostListenerReportsOwnerUnknown(t *testing.T) {
+	// A host listener with no resolvable process (ss line without a
+	// trailing users:(...) segment) occupies the exact declared endpoint,
+	// but Podder cannot confidently say who -- must never report MATCH.
+	psJSON := `[]`
+	ssOutput := "LISTEN   0        4096                     127.0.0.1:3100      0.0.0.0:*   \n"
+	service, _ := newOwnerIdentityTestService(t, psJSON, ssOutput)
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "flowise-http" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_UNKNOWN" {
+				t.Errorf("expected OWNER_UNKNOWN for an unidentifiable host-listener occupant, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against flowise-http for the host listener")
+	}
+	if overview.Summary.RegistryMatch != 0 {
+		t.Errorf("expected RegistryMatch to NOT count an OWNER_UNKNOWN endpoint, got %d", overview.Summary.RegistryMatch)
+	}
+	if overview.Summary.RegistryDrift != 1 {
+		t.Errorf("expected RegistryDrift to count exactly the one OWNER_UNKNOWN endpoint, got %d", overview.Summary.RegistryDrift)
+	}
+}
+
+func TestRegistryOwnerIdentity_ReservedEndpointNeedsNoOwnerIdentity(t *testing.T) {
+	// Reserved semantics are unchanged: ANY occupant -- regardless of
+	// identity -- makes a reservation RESERVED_IN_USE.
+	psJSON := `[{"Id":"3333333333333333333333333333333333333333","Names":["whatever-process"],"Image":"x","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"0.0.0.0","host_port":3400,"container_port":3400,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "relp-reservation" {
+			found = true
+			if item.ReconciliationStatus != "RESERVED_IN_USE" {
+				t.Errorf("expected RESERVED_IN_USE regardless of occupant identity, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against relp-reservation")
+	}
+}
+
+func TestRegistryOwnerIdentity_TemporaryStateOwnerMismatch(t *testing.T) {
+	psJSON := `[{"Id":"4444444444444444444444444444444444444444","Names":["not-analytics"],"Image":"x","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3200,"container_port":3200,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "analytics-temp" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_MISMATCH" {
+				t.Errorf("expected OWNER_MISMATCH for a temporary-state declaration with the wrong observed owner, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against analytics-temp")
+	}
+}
+
+func TestRegistryOwnerIdentity_DeprecatedStateOwnerMismatch(t *testing.T) {
+	psJSON := `[{"Id":"5555555555555555555555555555555555555555","Names":["not-legacy-api"],"Image":"x","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3300,"container_port":3300,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "legacy-api" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_MISMATCH" {
+				t.Errorf("expected OWNER_MISMATCH for a deprecated-state declaration with the wrong observed owner, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against legacy-api")
+	}
+}
+
+func TestClassifyRegistryStateExpectsOwnerIdentity(t *testing.T) {
+	// registryStateExpectsBindMatch doubles as "expects owner identity" —
+	// pin the exact set so a future addition to this switch can't silently
+	// change owner-check scope without a test noticing.
+	cases := map[string]bool{
+		"active":     true,
+		"temporary":  true,
+		"deprecated": true,
+		"reserved":   false,
+		"planned":    false,
+		"retired":    false,
+	}
+	for state, want := range cases {
+		if got := registryStateExpectsBindMatch(state); got != want {
+			t.Errorf("registryStateExpectsBindMatch(%q) = %v, want %v", state, got, want)
+		}
 	}
 }

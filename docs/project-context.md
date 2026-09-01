@@ -80,3 +80,22 @@ graph TD
 * **Consequences & Benefits**:
   - A malicious or malformed container's labels can no longer make Podder read an arbitrary file the process can access.
   - Normal, well-formed Compose/Quadlet discovery is unaffected — only out-of-root/invalid-identifier cases are refused.
+
+### ADR 8: A Container's Reported Working Directory Is Never Its Own Trust Root (v1.4, final static round)
+* **Context**: ADR 7 proved containment within a container's CLAIMED `working_dir` label. That is necessary but not sufficient: the working directory itself is still container-supplied label content (`working_dir=/etc, config_files=passwd` trivially satisfies "the candidate is inside the claimed working directory").
+* **Decision**:
+  - Automatic Compose file reading (`InspectCompose`) now additionally requires the resolved candidate to fall under an explicit, operator-approved root — `AppSettings.ComposeTrustedRoots`, configured in Settings, empty by default. A candidate must pass BOTH the working-directory containment check (ADR 7) AND the trusted-root containment check (this ADR); neither alone is sufficient.
+  - `ComposeFileDetails` distinguishes CLAIMED provenance (`workingDir`/`claimedConfigFile`, always populated when any compose provenance exists) from VERIFIED, actually-read content (`composeFile`/`content`, populated only when `trusted` is true). `InspectCompose` returns this claimed-but-untrusted shape (not a hard error) whenever it detects Compose provenance it won't read, so the operator still sees what the container claims.
+* **Consequences & Benefits**:
+  - With no trusted roots configured (the default), Podder never automatically reads a Compose file — equivalent in effect to the brief's "acceptable simpler alternative" of disabling automatic reading entirely, while still supporting real automatic discovery once an operator explicitly approves a root.
+  - A container cannot manufacture its own authorization merely by claiming a working directory; only an operator-configured root can grant it.
+
+### ADR 9: Registry Reconciliation Verifies OWNERSHIP, Not Just Endpoint Occupation (v1.4, final static round)
+* **Context**: Registry matching (`findRegistryMatch`) checked node/bind/port/protocol/range equality but not who actually occupies the endpoint. A different container coincidentally bound to a declared endpoint would report as an ordinary `MATCH`, hiding a real "the wrong workload is here" condition — the registry models *intended ownership*, not merely socket occupation.
+* **Decision**:
+  - For lifecycle states that assert a live workload identity (`active`, `temporary`, `deprecated` — the same set `registryStateExpectsBindMatch` already used for bind-mismatch detection), an exact match now additionally requires the observed owner (container name, or host-listener process name) to equal the registry's declared `service`, via a conservative case-insensitive exact comparison — never fuzzy/substring matching.
+  - Two new reconciliation statuses distinguish the failure modes: `OWNER_MISMATCH` (a confidently-identified different owner occupies the endpoint) and `OWNER_UNKNOWN` (the endpoint is occupied, but Podder could not confidently identify who — e.g. a host listener `ss` couldn't resolve a process for). Neither is ever reported as `MATCH`.
+  - `reserved`/`planned`/`retired` are explicitly exempted — those states make no live-identity assertion (a reservation cares only whether *something* occupies it; a retired declaration being occupied by anyone is itself the notable drift signal), so this owner check never applies to them.
+* **Consequences & Benefits**:
+  - A registry entry can no longer be satisfied by an unrelated workload that happens to occupy the same address/port.
+  - `registryMatch` was reviewed alongside this change: `TEMPORARY_ACTIVE`/`DEPRECATED_ACTIVE`/`RETIRED_IN_USE` are no longer counted as ordinary matches (they never fully were "just like an active match" semantically); a new `registryDrift` counter tracks `DEPRECATED_ACTIVE`, `RETIRED_IN_USE`, `DECLARED_ENDPOINT_MISMATCH`, `OWNER_MISMATCH`, and `OWNER_UNKNOWN` as a distinct, explicit bucket.

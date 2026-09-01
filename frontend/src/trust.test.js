@@ -16,6 +16,8 @@ import {
     withMaskedSecrets,
     describeBindAddress,
     formatPortRangeSuffix,
+    RECONCILIATION_STATUS_META,
+    STATUS_PILL_CLASS_FOR_RECONCILE_CLASS,
 } from './trust.js';
 
 // Payloads an attacker-controlled field (a container name, an image tag, a
@@ -293,4 +295,64 @@ test('formatPortRangeSuffix renders an inclusive start-end range and never hides
     assert.equal(formatPortRangeSuffix(9000, 2), '9000-9001');
     const rendered = formatPortRangeSuffix(8000, 6);
     assert.ok(rendered.includes('8005'), 'expected the range end port to be visible, not collapsed to only the first port');
+});
+
+// --- RECONCILIATION_STATUS_META: every backend lifecycle status must
+// render explicitly (v1.4 hardening round 2, finding 3) ---
+
+// Every reconciliationStatus value the Go backend can produce (see
+// classifyRegistryMatch/classifyRegistryMissing/registryStateExpectsBindMatch
+// in registry.go, and the OWNER_MISMATCH/OWNER_UNKNOWN outcomes added to
+// ports.go). This list is the frontend-side contract: if the backend adds a
+// new status and this map isn't updated to match, this test catches it
+// rather than the operator silently seeing a generic/blank badge.
+const ALL_BACKEND_RECONCILIATION_STATUSES = [
+    'MATCH',
+    'UNDECLARED',
+    'DECLARED_MISSING',
+    'DECLARED_ENDPOINT_MISMATCH',
+    'RESERVED_FREE',
+    'RESERVED_IN_USE',
+    'PLANNED',
+    'UNSCOPED',
+    'REMOTE',
+    'TEMPORARY_ACTIVE',
+    'TEMPORARY_MISSING',
+    'DEPRECATED_ACTIVE',
+    'DEPRECATED_MISSING',
+    'RETIRED_IN_USE',
+    'RETIRED_FREE',
+    'OWNER_MISMATCH',
+    'OWNER_UNKNOWN',
+];
+
+test('RECONCILIATION_STATUS_META has an explicit entry for every backend reconciliation status', () => {
+    for (const status of ALL_BACKEND_RECONCILIATION_STATUSES) {
+        const meta = RECONCILIATION_STATUS_META[status];
+        assert.ok(meta, `expected an explicit rendering entry for ${status}, would otherwise fall back to a generic badge`);
+        assert.ok(meta.label && meta.label.length > 0, `expected a non-empty label for ${status}`);
+        assert.ok(meta.cls && meta.cls.length > 0, `expected a non-empty CSS class for ${status}`);
+        assert.ok(meta.tooltip && meta.tooltip.length > 0, `expected a non-empty tooltip for ${status}`);
+    }
+});
+
+test('RECONCILIATION_STATUS_META never re-uses the MATCH class for a lifecycle-nuanced or drift status', () => {
+    // A deprecated/retired/temporary declaration being fulfilled, or an
+    // owner/bind mismatch, must never render as an indistinguishable green
+    // "MATCH" pill -- that would hide exactly the nuance these statuses
+    // exist to surface.
+    const mustNotLookLikeMatch = [
+        'TEMPORARY_ACTIVE', 'DEPRECATED_ACTIVE', 'RETIRED_IN_USE',
+        'OWNER_MISMATCH', 'OWNER_UNKNOWN', 'DECLARED_ENDPOINT_MISMATCH',
+    ];
+    for (const status of mustNotLookLikeMatch) {
+        assert.notEqual(RECONCILIATION_STATUS_META[status].cls, 'match', `expected ${status} to render distinctly from an ordinary MATCH`);
+    }
+});
+
+test('every reconcile-pill class used has a status-pill class mapping', () => {
+    const usedClasses = new Set(Object.values(RECONCILIATION_STATUS_META).map(m => m.cls));
+    for (const cls of usedClasses) {
+        assert.ok(STATUS_PILL_CLASS_FOR_RECONCILE_CLASS[cls], `expected a status-pill mapping for reconcile-pill class ${cls}`);
+    }
 });

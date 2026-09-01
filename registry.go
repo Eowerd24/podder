@@ -28,6 +28,19 @@ type AppSettings struct {
 	// effective value falls back to os.Hostname() at resolution time (see
 	// resolveLocalNode), never to a hard-coded name.
 	LocalNode string `json:"localNode,omitempty"`
+	// ComposeTrustedRoots is an explicit, operator-configured allowlist of
+	// filesystem roots Podder is permitted to automatically read a Compose
+	// project file from during provenance-based discovery (InspectCompose).
+	// A container's own labels (working_dir, config_files) are a discovery
+	// HINT, never authorization: containment within the container-reported
+	// working directory alone is not sufficient (a malicious/malformed
+	// container could report working_dir=/etc, config_files=passwd).
+	// Automatic Compose file reading is disabled by default — the safe
+	// default is an empty list — until the operator explicitly approves at
+	// least one root here. Each root is canonicalized (cleaned,
+	// symlink-resolved where it exists) at check time; see
+	// FindComposeFile/composeFileWithinTrustedRoots.
+	ComposeTrustedRoots []string `json:"composeTrustedRoots,omitempty"`
 }
 
 // RegistryListener models the listener block of a registry port entry.
@@ -426,15 +439,16 @@ func registryWarnings(result *PortRegistryResult) []string {
 // classifyRegistryMatch computes the reconciliation status to report for a
 // registry-declared record that HAS a currently-observed runtime endpoint
 // (container port mapping or host listener) exactly fulfilling its
-// declaration, and whether that observation should count toward the
-// "matched" (ordinary active-service) summary bucket as opposed to some
-// other lifecycle-specific bucket (e.g. a reservation that is, notably,
-// currently in use).
+// declaration (and, for states that assert live workload identity, whose
+// owner also matches — see findRegistryMatch in ports.go), and whether that
+// observation should count toward the "matched" (ordinary active-service)
+// summary bucket as opposed to some other lifecycle-specific bucket (e.g. a
+// reservation that is, notably, currently in use).
 //
 // Lifecycle semantics (explicit, not inferred from "not reserved/planned"):
 //
 //   - active/unrecognized: MATCH — this is the ordinary "declared and
-//     running" case.
+//     running" case, and the ONLY one counted toward registryMatch.
 //   - reserved: RESERVED_IN_USE — a reservation is expected to stay UNUSED;
 //     something occupying it is drift worth surfacing distinctly, never
 //     folded into ordinary MATCH.
@@ -442,11 +456,16 @@ func registryWarnings(result *PortRegistryResult) []string {
 //     already happens to occupy that endpoint, planned records never
 //     report anything but PLANNED (see the brief's lifecycle table).
 //   - temporary: TEMPORARY_ACTIVE — running, but explicitly not ordinary
-//     permanent active state.
+//     permanent active state. Informational, not counted as an ordinary
+//     match NOR as drift (a temporary declaration running is expected).
 //   - deprecated: DEPRECATED_ACTIVE — still permitted to exist, flagged for
-//     migration/removal.
+//     migration/removal. Counted as drift (registryStatusIsDrift), never as
+//     an ordinary match — conflating "deprecated but still running" with a
+//     clean MATCH would hide exactly the migration signal this state
+//     exists to surface.
 //   - retired: RETIRED_IN_USE — should no longer exist; a live match here
-//     is real, useful drift information, not an ordinary match.
+//     is real, useful drift information (registryStatusIsDrift), never an
+//     ordinary match.
 func classifyRegistryMatch(state string) (status string, countsAsOrdinaryMatch bool) {
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "reserved":
@@ -454,11 +473,11 @@ func classifyRegistryMatch(state string) (status string, countsAsOrdinaryMatch b
 	case "planned":
 		return "PLANNED", false
 	case "temporary":
-		return "TEMPORARY_ACTIVE", true
+		return "TEMPORARY_ACTIVE", false
 	case "deprecated":
-		return "DEPRECATED_ACTIVE", true
+		return "DEPRECATED_ACTIVE", false
 	case "retired":
-		return "RETIRED_IN_USE", true
+		return "RETIRED_IN_USE", false
 	default: // "active" and any future/unrecognized state default to active semantics.
 		return "MATCH", true
 	}
@@ -498,6 +517,32 @@ func classifyRegistryMissing(state string) (status string, isOperationalFault bo
 func registryStateExpectsBindMatch(state string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "active", "temporary", "deprecated":
+		return true
+	default:
+		return false
+	}
+}
+
+// registryStatusIsDrift reports whether a reconciliation status
+// (PortOverviewItem.ReconciliationStatus) represents a lifecycle-aware
+// operator-visible problem worth counting toward
+// PortOverviewSummary.RegistryDrift, as opposed to an ordinary match, a
+// reservation (already tracked by RegistryDrift's sibling
+// RegistryReserved/RESERVED_IN_USE badge), or a merely-informational
+// lifecycle status (PLANNED, TEMPORARY_ACTIVE/MISSING, DEPRECATED_MISSING,
+// RETIRED_FREE — none of these assert something is currently wrong).
+//
+// Explicit and separate from "ordinary MATCH" so a deprecated/retired
+// endpoint that is still running, an endpoint whose bind differs from what
+// was declared, or one occupied by the wrong workload entirely, can never
+// be silently folded into the plain "registryMatch" metric — see
+// classifyRegistryMatch's countsAsOrdinaryMatch, which already excludes
+// these, and findRegistryOwnerMismatch/findRegistryBindMismatch in
+// ports.go, which produce OWNER_MISMATCH/OWNER_UNKNOWN/
+// DECLARED_ENDPOINT_MISMATCH.
+func registryStatusIsDrift(status string) bool {
+	switch status {
+	case "DEPRECATED_ACTIVE", "RETIRED_IN_USE", "OWNER_MISMATCH", "OWNER_UNKNOWN", "DECLARED_ENDPOINT_MISMATCH":
 		return true
 	default:
 		return false

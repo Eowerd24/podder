@@ -11,6 +11,69 @@ findings identified during review of the v1.3.0 post-audit corrective pass
 performed, any validation against a real Podman installation — see
 "Remaining integration gate" below.
 
+### Final static pre-integration hardening round (baseline `ff31953`)
+
+This closes the last five static/code-review findings before the v1.4
+static hardening phase is considered complete. Like the round above, it
+performs no validation against a real Podman installation — see "Remaining
+integration gate" below. **This completes the v1.4 static pre-integration
+hardening phase**; the next gate is a disposable real rootless-Podman
+integration campaign, not another static review round.
+
+- **Compose provenance is no longer its own authorization.** A container's
+  `working_dir`/`config_files` labels could previously make `InspectCompose`
+  read any file the label claimed was "the" compose file, as long as it
+  resolved inside the (also label-supplied) working directory — e.g.
+  `working_dir=/etc, config_files=passwd` trivially satisfied that
+  containment check. Automatic reading now additionally requires the
+  resolved candidate to fall under an explicit, operator-approved root
+  (new `AppSettings.ComposeTrustedRoots`, configurable in Settings, symlink-safe
+  canonicalized at check time). With no roots configured — the default —
+  nothing is read automatically. `InspectCompose`/`ComposeFileDetails` now
+  distinguish what the container CLAIMS (`workingDir`/`claimedConfigFile`,
+  always shown) from what Podder actually VERIFIED and read
+  (`composeFile`/`content`, populated only when `trusted` is true); the
+  editor UI shows "Compose path claimed by container" separately from
+  "Verified local Compose file" and states plainly when it won't read the
+  reported path automatically.
+- **Registry reconciliation now checks the intended OWNER, not just socket
+  occupation.** A registry entry for `service: flowise` on `127.0.0.1:3100`
+  used to report `MATCH` if ANY workload occupied that endpoint — including
+  an unrelated container. For lifecycle states that assert a live workload
+  identity (`active`, `temporary`, `deprecated`), the observed owner must
+  now also match the declared `service` name. New statuses: `OWNER_MISMATCH`
+  (endpoint right, confidently-identified owner differs — the diagnostic
+  note names both) and `OWNER_UNKNOWN` (endpoint right, but the occupying
+  host-listener process couldn't be confidently identified). `reserved`
+  keeps its existing "any occupant matters" semantics unchanged.
+- **Every registry lifecycle/reconciliation status now renders explicitly in
+  the Ports tab** — `TEMPORARY_ACTIVE`/`TEMPORARY_MISSING`,
+  `DEPRECATED_ACTIVE`/`DEPRECATED_MISSING`, `RETIRED_IN_USE`/`RETIRED_FREE`,
+  and the new `OWNER_MISMATCH`/`OWNER_UNKNOWN`, each with its own badge
+  color and explanatory tooltip, instead of falling back to a generic/blank
+  presentation. The Ports tab's "Registry" filter now shows every row
+  associated with a registry record (`registryId != ""`), not only clean
+  matches. `registryMatch` no longer silently counts
+  `TEMPORARY_ACTIVE`/`DEPRECATED_ACTIVE`/`RETIRED_IN_USE` as an ordinary
+  match; a new `registryDrift` summary counter (and Ports-tab "Drift"
+  metric) tracks `DEPRECATED_ACTIVE`, `RETIRED_IN_USE`,
+  `DECLARED_ENDPOINT_MISMATCH`, `OWNER_MISMATCH`, and `OWNER_UNKNOWN`
+  distinctly.
+- **Compose service identifiers are validated before being emitted into
+  generated YAML.** `GenerateComposeSnippet` (and the `PreviewComposeSnippet`
+  bound method) now reject a service name that cannot be safely represented
+  as a plain YAML mapping key — the identity commonly originates from
+  external Compose provenance labels, and a hostile value (embedded
+  newlines, YAML structural characters) is refused outright rather than
+  silently sanitized into a different identity or trusted to concatenate
+  safely into guidance text.
+- **`GetContainerPortEditState` now requires an exact container ID.** It
+  previously resolved through `findContainerByIdentity`, which accepts an
+  unproven ID prefix or a container name; this safety-critical lookup now
+  uses a new `findContainerByExactID` (exact match only — no prefix or name
+  fallback). `findContainerByIdentity` is retained unchanged for its other,
+  non-safety-critical callers.
+
 ### Added
 - `GetContainerPortEditState(containerID)`: the single backend method the
   port editor now uses to populate itself, resolving a container's current
@@ -105,19 +168,29 @@ performed, any validation against a real Podman installation — see
   Quadlet search directory (symlink-safe) before it is stat'd or read.
 
 ### Remaining known limitations (v1.4 pre-integration)
-- Real rootless-Podman integration testing has **not** been performed by
-  this pass — every test above runs against injectable command runners and
-  fixtures, never a live `podman` install. In particular, whether Podman's
-  own `inspect`/`ps` output actually preserves the omitted-bind vs.
-  explicit-`0.0.0.0` distinction end-to-end is a real-runtime fact this
-  pass does not (and cannot yet) verify; that is exactly what the next,
-  dedicated disposable rootless-Podman integration campaign covers.
+
+The next gate for this project is **disposable real rootless-Podman
+integration** — not another static review round. Real Podman behavior
+(create, image resolution, inspect output, port mappings including omitted
+vs. explicit IPv4/IPv6 wildcard binds, TCP/UDP, ranges, managed deploy,
+mutation, induced-failure rollback, stopped-lifecycle preservation,
+adoption, retained backup, `AutoRemove` refusal, image/container removal
+safeguards, network overlap, registry reservations, and enabled-but-invalid
+registry failure behavior) has **not** been validated by this or any prior
+pass in this series — every test in this repository runs against injectable
+command runners and fixtures, never a live `podman` install.
+
+Deliberately deferred, unrelated to the integration gate:
 - Full host route-table-aware Podman subnet overlap (netlink route
   inspection) is not implemented; network creation still only checks
   Podman-known subnets and directly-connected host interfaces.
 - Retained-backup management (adoption/mutation backups left behind for
   manual cleanup) still has no dedicated management UI.
-- Automatic Compose/Quadlet mutation remains intentionally disabled.
+- Automatic Compose mutation remains intentionally disabled.
+- Automatic Quadlet mutation remains intentionally disabled.
+- Broader multi-host Podman administration is out of scope.
+- Production-readiness validation (beyond this static hardening series) has
+  not been performed.
 
 ### Earlier in this Unreleased series: v1.3.0 post-audit corrective pass
 

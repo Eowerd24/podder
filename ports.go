@@ -116,6 +116,15 @@ type PortOverviewSummary struct {
 	// must be able to tell "registry loaded cleanly" apart from "registry
 	// loaded for observation with N invalid entries" at a glance.
 	RegistryWarnings []string `json:"registryWarnings,omitempty"`
+	// RegistryDrift counts reconciled items whose status represents a
+	// lifecycle-aware operator-visible problem that is NOT an ordinary
+	// match, a reservation, or a merely-informational lifecycle status —
+	// see registryStatusIsDrift: a deprecated/retired declaration still
+	// running, a declared/observed bind mismatch, or an endpoint occupied
+	// by the wrong workload entirely (OWNER_MISMATCH/OWNER_UNKNOWN). Kept
+	// separate from RegistryMatch precisely so those statuses are never
+	// silently folded into "ordinary match" at the summary level.
+	RegistryDrift int `json:"registryDrift"`
 }
 
 // PortOverview is the aggregate model returned to the frontend.
@@ -731,37 +740,87 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	registryReservedCount := 0
 	registryRemoteCount := 0
 	registryUnscopedCount := 0
+	registryDriftCount := 0
 
-	// Helper to find matching registry port. Uses
-	// EndpointsEquivalentForReconciliation (not EndpointsConflict/
-	// AddressesConflict): a registry entry declaring 0.0.0.0:3000 is not
-	// considered fulfilled by a runtime endpoint that only bound
-	// 127.0.0.1:3000 — the two would conflict at the socket layer if both
-	// tried to bind, but they are not the same declaration. Records scoped
-	// to a different node are never matched against local runtime state.
+	// registryEndpointMatches reports whether rp's declared endpoint
+	// (node/port/protocol/range/bind) is exactly the same declared endpoint
+	// as the observed candidate. Uses EndpointsEquivalentForReconciliation
+	// (not EndpointsConflict/AddressesConflict): a registry entry declaring
+	// 0.0.0.0:3000 is not considered fulfilled by a runtime endpoint that
+	// only bound 127.0.0.1:3000 — the two would conflict at the socket
+	// layer if both tried to bind, but they are not the same declaration.
+	// Records scoped to a different node never match local runtime state.
 	// rangeSize is the runtime endpoint's effective range (1 for a single
-	// port); a registry declaration of 8000-8005 is NOT a MATCH for a
-	// runtime mapping that only actually covers 8000 (or vice versa) — the
-	// effective range/count is part of what "the same declared endpoint"
-	// means here, exactly like every other endpoint field this function
-	// already compares. This is registry configuration equivalence, not
-	// socket-allocation conflict equivalence (see ClaimsConflict/
-	// EndpointsConflict for that, deliberately looser, question).
-	findRegistryMatch := func(bind string, port uint16, protocol string, rangeSize int, _ string) *RegistryPort {
+	// port); a registry declaration of 8000-8005 is NOT a match for a
+	// runtime mapping that only actually covers 8000 (or vice versa).
+	registryEndpointMatches := func(rp *RegistryPort, bind string, port uint16, protocol string, rangeSize int) bool {
+		return nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) &&
+			rp.Listener.Port == port &&
+			NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) &&
+			normalizedRangeSize(rp.RangeSize) == normalizedRangeSize(rangeSize) &&
+			EndpointsEquivalentForReconciliation(bind, rp.Listener.Address)
+	}
+
+	// findRegistryMatch locates a registry record whose declared endpoint
+	// matches the observed candidate exactly AND — for lifecycle states
+	// that assert a live workload identity (active/temporary/deprecated;
+	// see registryStateExpectsBindMatch) — whose declared Service also
+	// matches the observed owner. The registry models INTENDED OWNERSHIP,
+	// not merely socket occupation: a different container/process occupying
+	// the declared endpoint must never report as an ordinary match for
+	// those states (see findRegistryOwnerMismatch). Reserved/planned/retired
+	// records make no live-identity assertion, so occupation alone
+	// (regardless of who) fulfills them — unchanged from before this owner
+	// check existed.
+	findRegistryMatch := func(bind string, port uint16, protocol string, rangeSize int, ownerName string, ownerKnown bool) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded {
 			return nil
 		}
 		for i := range registryResult.Ports {
 			rp := &registryResult.Ports[i]
-			if !nodeApplies(rp.Node, localNode, settings.PortRegistry.TreatUnscopedAsLocal) {
+			if !registryEndpointMatches(rp, bind, port, protocol, rangeSize) {
 				continue
 			}
-			if rp.Listener.Port == port &&
-				NormalizeProtocol(rp.Protocol) == NormalizeProtocol(protocol) &&
-				normalizedRangeSize(rp.RangeSize) == normalizedRangeSize(rangeSize) &&
-				EndpointsEquivalentForReconciliation(bind, rp.Listener.Address) {
+			if !registryStateExpectsBindMatch(rp.State) {
 				return rp
 			}
+			if ownerKnown && strings.EqualFold(strings.TrimSpace(rp.Service), strings.TrimSpace(ownerName)) {
+				return rp
+			}
+			// Endpoint matches, but this state expects a specific owner and
+			// the observed one doesn't match (or isn't known) — not an
+			// ordinary match. Keep scanning in case another record at this
+			// same endpoint DOES have the right owner (unusual, but don't
+			// let a coincidental unrelated declaration hide a real match).
+		}
+		return nil
+	}
+
+	// findRegistryOwnerMismatch locates a registry record whose declared
+	// endpoint matches the observed candidate exactly, for a lifecycle
+	// state that asserts live workload identity, but whose declared
+	// Service does NOT match the observed owner (or the observed owner
+	// could not be confidently identified at all — see ownerKnown).
+	// Distinguishing "endpoint right, owner wrong/unknown" from an ordinary
+	// match is exactly what closes the gap where a different workload
+	// squatting on a declared endpoint could otherwise be misreported as
+	// fulfilling someone else's registry declaration.
+	findRegistryOwnerMismatch := func(bind string, port uint16, protocol string, rangeSize int, ownerName string, ownerKnown bool) *RegistryPort {
+		if registryResult == nil || !registryResult.Loaded {
+			return nil
+		}
+		for i := range registryResult.Ports {
+			rp := &registryResult.Ports[i]
+			if !registryStateExpectsBindMatch(rp.State) {
+				continue
+			}
+			if !registryEndpointMatches(rp, bind, port, protocol, rangeSize) {
+				continue
+			}
+			if ownerKnown && strings.EqualFold(strings.TrimSpace(rp.Service), strings.TrimSpace(ownerName)) {
+				continue // this one actually matches on owner too; not a mismatch
+			}
+			return rp
 		}
 		return nil
 	}
@@ -771,7 +830,9 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	// expectation (see registryStateExpectsBindMatch) — a reservation or a
 	// planned/retired record makes no such runtime assertion, so a
 	// different observed bind at the same port/protocol/service is not a
-	// "mismatch" for those states.
+	// "mismatch" for those states. This is a DIFFERENT axis from owner
+	// mismatch: same declared OWNER, different BIND (as opposed to same
+	// bind/endpoint, different owner).
 	findRegistryBindMismatch := func(bind string, port uint16, protocol string, rangeSize int, serviceName string) *RegistryPort {
 		if registryResult == nil || !registryResult.Loaded || serviceName == "" {
 			return nil
@@ -799,7 +860,13 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 	for _, c := range containers {
 		cName := "unnamed"
 		if len(c.Names) > 0 {
-			cName = c.Names[0]
+			// Podman container identity, so registry owner-identity
+			// comparisons (findRegistryMatch/findRegistryOwnerMismatch)
+			// have a stable name — a stray leading "/" (a Docker API
+			// convention some tooling still emits) must not make an
+			// otherwise-correct owner name fail to match a registry's
+			// plain `service:` value.
+			cName = strings.TrimPrefix(c.Names[0], "/")
 		}
 
 		for idx, m := range c.PortMappings {
@@ -827,11 +894,15 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				conflictNote = fmt.Sprintf("Conflicts with %s (%s)", conflict.OwnerName, conflict.Source)
 			}
 
-			// Reconciliation against registry
+			// Reconciliation against registry. A container's name is
+			// always a confidently-known owner identity (Podman never
+			// leaves it unset), so ownerKnown is always true here — the
+			// OWNER_UNKNOWN outcome is specific to host listeners below,
+			// whose process identity ss may fail to resolve.
 			reconcileStatus := "UNDECLARED"
 			var regID, regState, scope, appProto, purpose string
 			scope = exposure
-			if regMatch := findRegistryMatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName); regMatch != nil {
+			if regMatch := findRegistryMatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName, true); regMatch != nil {
 				lifecycleStatus, countsAsMatch := classifyRegistryMatch(regMatch.State)
 				reconcileStatus = lifecycleStatus
 				matchedRegistryIDs[regMatch.ID] = true
@@ -845,6 +916,18 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				scope = regMatch.Scope
 				appProto = regMatch.ApplicationProtocol
 				purpose = regMatch.Purpose
+			} else if ownerMismatch := findRegistryOwnerMismatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName, true); ownerMismatch != nil {
+				// The declared endpoint IS occupied exactly as declared,
+				// but by a different, confidently-identified workload than
+				// the registry expects — the registry models intended
+				// OWNERSHIP, not merely socket occupation.
+				reconcileStatus = "OWNER_MISMATCH"
+				matchedRegistryIDs[ownerMismatch.ID] = true
+				regID = ownerMismatch.ID
+				regState = ownerMismatch.State
+				appProto = ownerMismatch.ApplicationProtocol
+				purpose = ownerMismatch.Purpose
+				conflictNote = fmt.Sprintf("Expected owner: %s. Observed owner: %s.", ownerMismatch.Service, cName)
 			} else if mismatch := findRegistryBindMismatch(m.HostIP, m.HostPort, m.Protocol, m.RangeSize, cName); mismatch != nil {
 				reconcileStatus = "DECLARED_ENDPOINT_MISMATCH"
 				matchedRegistryIDs[mismatch.ID] = true
@@ -857,6 +940,9 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				if registryResult != nil && registryResult.Loaded {
 					registryUndeclaredCount++
 				}
+			}
+			if registryStatusIsDrift(reconcileStatus) {
+				registryDriftCount++
 			}
 
 			item := PortOverviewItem{
@@ -902,6 +988,12 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 
 		if !isPodmanListener {
 			portSet[l.Port] = struct{}{}
+			// ownerKnown reflects whether `ss` could actually resolve a
+			// process identity for this listener BEFORE the display-only
+			// "Host listener" fallback below — a registry entry expecting
+			// a named service must never be reported as matched by an
+			// endpoint whose real occupant Podder couldn't identify.
+			ownerKnown := l.Process != ""
 			owner := l.Process
 			if owner == "" {
 				owner = "Host listener"
@@ -927,7 +1019,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			reconcileStatus := "HOST"
 			var regID, regState, scope, appProto, purpose string
 			scope = exposure
-			if regMatch := findRegistryMatch(l.Address, l.Port, l.Protocol, 1, owner); regMatch != nil {
+			if regMatch := findRegistryMatch(l.Address, l.Port, l.Protocol, 1, l.Process, ownerKnown); regMatch != nil {
 				lifecycleStatus, countsAsMatch := classifyRegistryMatch(regMatch.State)
 				reconcileStatus = lifecycleStatus
 				matchedRegistryIDs[regMatch.ID] = true
@@ -941,10 +1033,31 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 				scope = regMatch.Scope
 				appProto = regMatch.ApplicationProtocol
 				purpose = regMatch.Purpose
+			} else if ownerMismatch := findRegistryOwnerMismatch(l.Address, l.Port, l.Protocol, 1, l.Process, ownerKnown); ownerMismatch != nil {
+				if ownerKnown {
+					reconcileStatus = "OWNER_MISMATCH"
+					conflictNote = fmt.Sprintf("Expected owner: %s. Observed owner: %s.", ownerMismatch.Service, l.Process)
+				} else {
+					// The declared endpoint is occupied at exactly the
+					// declared address/port/protocol, but Podder could not
+					// confidently identify the occupying process — this is
+					// deliberately NOT reported as MATCH; see the "Host
+					// process case" in the registry-ownership hardening.
+					reconcileStatus = "OWNER_UNKNOWN"
+					conflictNote = fmt.Sprintf("Expected owner: %s. Observed workload owner could not be confidently identified.", ownerMismatch.Service)
+				}
+				matchedRegistryIDs[ownerMismatch.ID] = true
+				regID = ownerMismatch.ID
+				regState = ownerMismatch.State
+				appProto = ownerMismatch.ApplicationProtocol
+				purpose = ownerMismatch.Purpose
 			} else {
 				if registryResult != nil && registryResult.Loaded {
 					registryUndeclaredCount++
 				}
+			}
+			if registryStatusIsDrift(reconcileStatus) {
+				registryDriftCount++
 			}
 
 			item := PortOverviewItem{
@@ -1106,6 +1219,7 @@ func (p *PodmanService) GetPortOverview() (*PortOverview, error) {
 			RegistryUnscoped:       registryUnscopedCount,
 			LocalNode:              localNode,
 			RegistryWarnings:       registryWarnings(registryResult),
+			RegistryDrift:          registryDriftCount,
 		},
 	}
 

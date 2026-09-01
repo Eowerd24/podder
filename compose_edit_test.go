@@ -102,7 +102,7 @@ func TestUpdateComposePorts(t *testing.T) {
 }
 
 func TestFindComposeFileBlocksMultipleConfigFiles(t *testing.T) {
-	_, err := FindComposeFile("/some/dir", "compose.yaml,compose.override.yaml")
+	_, err := FindComposeFile("/some/dir", "compose.yaml,compose.override.yaml", nil)
 	if err == nil {
 		t.Fatalf("expected multiple compose files to be blocked")
 	}
@@ -112,12 +112,16 @@ func TestFindComposeFileBlocksMultipleConfigFiles(t *testing.T) {
 }
 
 // --- v1.4 hardening: Compose provenance is a discovery hint, not
-// filesystem authorization (item 5) ---
+// filesystem authorization (round 1 + round 2 item 1) ---
 //
 // com.docker.compose.project.working_dir / .config_files are external,
 // container-supplied label metadata. A malicious or malformed container
 // must not be able to make Podder read an arbitrary accessible file merely
-// by claiming its path is "the" compose file.
+// by claiming its path is "the" compose file -- and, critically, the
+// CLAIMED WORKING DIRECTORY ITSELF is not treated as an implicit trust
+// root just because a candidate resolves inside it. Automatic reading
+// additionally requires the candidate to fall under an operator-approved
+// AppSettings.ComposeTrustedRoots entry.
 
 func TestFindComposeFile_RejectsAbsolutePathOutsideWorkingDir(t *testing.T) {
 	workingDir := t.TempDir()
@@ -127,7 +131,10 @@ func TestFindComposeFile_RejectsAbsolutePathOutsideWorkingDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if path, err := FindComposeFile(workingDir, outsideFile); err == nil {
+	// Even with a trusted root configured that would cover the working
+	// dir, an absolute config-file path escaping the CLAIMED working
+	// directory is refused before the trusted-root check is ever reached.
+	if path, err := FindComposeFile(workingDir, outsideFile, []string{workingDir, outsideDir}); err == nil {
 		t.Fatalf("expected an absolute config-file path outside the working dir to be refused, got path=%q", path)
 	} else if !errors.Is(err, ErrComposeFileOutsideWorkingDir) {
 		t.Errorf("expected ErrComposeFileOutsideWorkingDir, got: %v", err)
@@ -150,7 +157,7 @@ func TestFindComposeFile_RejectsTraversalInConfigFilesValue(t *testing.T) {
 		"foo/../../bar",
 	}
 	for _, cfg := range malicious {
-		if path, err := FindComposeFile(workingDir, cfg); err == nil {
+		if path, err := FindComposeFile(workingDir, cfg, []string{workingDir, filepath.Dir(workingDir)}); err == nil {
 			t.Errorf("expected FindComposeFile(workingDir, %q) to be refused as a traversal attempt, got path=%q", cfg, path)
 		}
 	}
@@ -159,44 +166,44 @@ func TestFindComposeFile_RejectsTraversalInConfigFilesValue(t *testing.T) {
 func TestFindComposeFile_RejectsAbsolutePathWithNoWorkingDir(t *testing.T) {
 	// No working directory at all to validate an absolute claim against:
 	// this must fail closed, never read the absolute path anyway.
-	if path, err := FindComposeFile("", "/etc/passwd"); err == nil {
+	if path, err := FindComposeFile("", "/etc/passwd", []string{"/etc"}); err == nil {
 		t.Fatalf("expected refusal when there is no working directory to validate against, got path=%q", path)
 	}
 }
 
-func TestFindComposeFile_AcceptsRecognizedFileWithinWorkingDir(t *testing.T) {
+func TestFindComposeFile_AcceptsRecognizedFileWithinWorkingDirAndTrustedRoot(t *testing.T) {
 	workingDir := t.TempDir()
 	composePath := filepath.Join(workingDir, "compose.yaml")
 	if err := os.WriteFile(composePath, []byte("version: '3'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	path, err := FindComposeFile(workingDir, "")
+	path, err := FindComposeFile(workingDir, "", []string{workingDir})
 	if err != nil {
-		t.Fatalf("expected a normal recognized compose file under the working dir to resolve: %v", err)
+		t.Fatalf("expected a normal recognized compose file under a working dir that IS an approved trusted root to resolve: %v", err)
 	}
 	if path != composePath {
 		t.Errorf("expected %q, got %q", composePath, path)
 	}
 }
 
-func TestFindComposeFile_AcceptsExplicitRelativeConfigFileWithinWorkingDir(t *testing.T) {
+func TestFindComposeFile_AcceptsExplicitRelativeConfigFileWithinWorkingDirAndTrustedRoot(t *testing.T) {
 	workingDir := t.TempDir()
 	composePath := filepath.Join(workingDir, "docker-compose.yml")
 	if err := os.WriteFile(composePath, []byte("version: '3'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	path, err := FindComposeFile(workingDir, "docker-compose.yml")
+	path, err := FindComposeFile(workingDir, "docker-compose.yml", []string{workingDir})
 	if err != nil {
-		t.Fatalf("expected an explicit relative config-file path within the working dir to resolve: %v", err)
+		t.Fatalf("expected an explicit relative config-file path within a trusted working dir to resolve: %v", err)
 	}
 	if path != composePath {
 		t.Errorf("expected %q, got %q", composePath, path)
 	}
 }
 
-func TestFindComposeFile_AcceptsAbsolutePathWithinWorkingDir(t *testing.T) {
+func TestFindComposeFile_AcceptsAbsolutePathWithinWorkingDirAndTrustedRoot(t *testing.T) {
 	workingDir := t.TempDir()
 	composePath := filepath.Join(workingDir, "compose.yaml")
 	if err := os.WriteFile(composePath, []byte("version: '3'\n"), 0o644); err != nil {
@@ -204,43 +211,182 @@ func TestFindComposeFile_AcceptsAbsolutePathWithinWorkingDir(t *testing.T) {
 	}
 
 	// An absolute path that legitimately resolves inside the reported
-	// working directory is fine -- containment is what matters, not
-	// whether the label happened to spell it as absolute or relative.
-	path, err := FindComposeFile(workingDir, composePath)
+	// working directory, itself under an approved root, is fine --
+	// containment is what matters, not whether the label happened to
+	// spell it as absolute or relative.
+	path, err := FindComposeFile(workingDir, composePath, []string{workingDir})
 	if err != nil {
-		t.Fatalf("expected an absolute path within the working dir to resolve: %v", err)
+		t.Fatalf("expected an absolute path within a trusted working dir to resolve: %v", err)
 	}
 	if path != composePath {
 		t.Errorf("expected %q, got %q", composePath, path)
 	}
 }
 
-// TestInspectCompose_MaliciousWorkingDirCannotReadArbitraryFile is an
+// TestFindComposeFile_ClaimedWorkingDirAloneIsNotAuthorization is the
+// core regression test for round-2 finding 1: containment inside the
+// CLAIMED working directory is necessary but not sufficient. Here the
+// candidate genuinely resolves inside workingDir (no traversal at all —
+// exactly the "working_dir=/etc, config_files=passwd" scenario from the
+// review), but NO trusted root covers it, so it must still be refused.
+func TestFindComposeFile_ClaimedWorkingDirAloneIsNotAuthorization(t *testing.T) {
+	fakeEtc := t.TempDir()
+	passwdLike := filepath.Join(fakeEtc, "passwd")
+	if err := os.WriteFile(passwdLike, []byte("root:x:0:0::/root:/bin/bash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// No trusted roots configured at all (the safe default).
+	if path, err := FindComposeFile(fakeEtc, "passwd", nil); err == nil {
+		t.Fatalf("expected a syntactically-contained candidate to still be refused with no trusted roots configured, got path=%q", path)
+	} else if !errors.Is(err, ErrComposeFileNotTrusted) {
+		t.Errorf("expected ErrComposeFileNotTrusted, got: %v", err)
+	}
+
+	// A trusted root IS configured, but it's a different, legitimate
+	// project root -- proving workingDir itself is never implicitly
+	// trusted just because *some* root exists elsewhere on the system.
+	legitimateRoot := t.TempDir()
+	if path, err := FindComposeFile(fakeEtc, "passwd", []string{legitimateRoot}); err == nil {
+		t.Fatalf("expected the claimed working dir to remain untrusted even with an unrelated trusted root configured, got path=%q", path)
+	} else if !errors.Is(err, ErrComposeFileNotTrusted) {
+		t.Errorf("expected ErrComposeFileNotTrusted, got: %v", err)
+	}
+}
+
+// TestFindComposeFile_WorkingDirUnderApprovedRootIsAllowed proves a
+// legitimate case still works: the claimed working directory is a real
+// subdirectory of an operator-approved root (the root need not equal the
+// working dir exactly, only contain it).
+func TestFindComposeFile_WorkingDirUnderApprovedRootIsAllowed(t *testing.T) {
+	approvedRoot := t.TempDir()
+	projectDir := filepath.Join(approvedRoot, "myapp")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(projectDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte("version: '3'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path, err := FindComposeFile(projectDir, "", []string{approvedRoot})
+	if err != nil {
+		t.Fatalf("expected a working dir nested under an approved root to resolve: %v", err)
+	}
+	if path != composePath {
+		t.Errorf("expected %q, got %q", composePath, path)
+	}
+}
+
+// TestFindComposeFile_SymlinkInsideApprovedRootEscapingOutsideIsBlocked
+// proves a symlink physically placed under an approved trusted root, but
+// pointing at a file outside it, is still refused -- containment is
+// checked on the symlink-resolved target, not just the syntactic path.
+func TestFindComposeFile_SymlinkInsideApprovedRootEscapingOutsideIsBlocked(t *testing.T) {
+	approvedRoot := t.TempDir()
+	secretDir := t.TempDir()
+	secretFile := filepath.Join(secretDir, "compose.yaml")
+	if err := os.WriteFile(secretFile, []byte("THIS-MUST-NEVER-BE-READ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkPath := filepath.Join(approvedRoot, "compose.yaml")
+	if err := os.Symlink(secretFile, linkPath); err != nil {
+		t.Skipf("symlinks not supported in this environment: %v", err)
+	}
+
+	if path, err := FindComposeFile(approvedRoot, "", []string{approvedRoot}); err == nil {
+		t.Fatalf("expected a symlink escaping the approved root to be refused, got path=%q", path)
+	}
+}
+
+// TestInspectCompose_ClaimedWorkingDirAloneCannotReadArbitraryFile is an
 // end-to-end regression proving InspectCompose (the actual bound method
-// exposed to the frontend) never returns the content of a file outside a
-// container's reported working directory, even when that working directory
-// itself is entirely attacker-controlled label content.
-func TestInspectCompose_MaliciousWorkingDirCannotReadArbitraryFile(t *testing.T) {
+// exposed to the frontend) never returns the content of a file merely
+// because it is syntactically contained within the container's reported
+// working directory. With no ComposeTrustedRoots configured (the default),
+// InspectCompose must return untrusted claimed metadata, never file
+// content, and never a hard error that would hide the claimed metadata.
+func TestInspectCompose_ClaimedWorkingDirAloneCannotReadArbitraryFile(t *testing.T) {
 	secretDir := t.TempDir()
 	secretFile := filepath.Join(secretDir, "secret.yaml")
 	if err := os.WriteFile(secretFile, []byte("THIS-MUST-NEVER-BE-READ"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	tempHome := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempHome)
+	setTestConfigHome(t, tempHome)
+
 	runner := newFakeCommandRunner()
 	psJSON := `[{"Id":"cafebabe00000000000000000000000000000001","Names":["evil"],"Image":"alpine","ImageID":"sha256:x","State":"running","Ports":[],` +
 		`"Labels":{"com.docker.compose.project":"proj","com.docker.compose.service":"svc",` +
-		`"com.docker.compose.project.working_dir":"/tmp/does-not-exist-as-a-real-project-dir",` +
-		`"com.docker.compose.project.config_files":"` + secretFile + `"}}]`
+		`"com.docker.compose.project.working_dir":"` + secretDir + `",` +
+		`"com.docker.compose.project.config_files":"secret.yaml"}}]`
 	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
 	svc := &PodmanService{runner: runner}
 
 	details, err := svc.InspectCompose("cafebabe00000000000000000000000000000001")
-	if err == nil {
-		t.Fatalf("expected InspectCompose to refuse an out-of-working-dir absolute path, got: %+v", details)
+	if err != nil {
+		t.Fatalf("expected InspectCompose to return claimed-but-untrusted metadata rather than a hard error, got err: %v", err)
 	}
-	if !errors.Is(err, ErrComposeFileOutsideWorkingDir) {
-		t.Errorf("expected ErrComposeFileOutsideWorkingDir, got: %v", err)
+	if details == nil {
+		t.Fatalf("expected a non-nil details object describing the claimed provenance")
+	}
+	if details.Trusted {
+		t.Fatalf("expected Trusted=false with no ComposeTrustedRoots configured, got: %+v", details)
+	}
+	if details.Content != "" || details.ComposeFile != "" {
+		t.Fatalf("expected no file content/path to be populated for an untrusted result, got: %+v", details)
+	}
+	if details.WorkingDir != secretDir {
+		t.Errorf("expected the claimed working dir to still be reported for display, got %q", details.WorkingDir)
+	}
+	if details.UntrustedReason == "" {
+		t.Errorf("expected a human-readable reason the file was not read")
+	}
+}
+
+// TestInspectCompose_TrustedRootAllowsReadingContent proves the positive
+// path: with the exact working directory configured as an operator-approved
+// trusted root, InspectCompose actually reads and returns the file.
+func TestInspectCompose_TrustedRootAllowsReadingContent(t *testing.T) {
+	projectDir := t.TempDir()
+	composeContent := "services:\n  svc:\n    image: nginx\n    ports:\n      - \"8080:80\"\n"
+	if err := os.WriteFile(filepath.Join(projectDir, "compose.yaml"), []byte(composeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tempHome := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempHome)
+	setTestConfigHome(t, tempHome)
+
+	runner := newFakeCommandRunner()
+	psJSON := `[{"Id":"cafebabe00000000000000000000000000000002","Names":["good"],"Image":"nginx","ImageID":"sha256:x","State":"running","Ports":[],` +
+		`"Labels":{"com.docker.compose.project":"proj","com.docker.compose.service":"svc",` +
+		`"com.docker.compose.project.working_dir":"` + projectDir + `"}}]`
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	svc := &PodmanService{runner: runner}
+	if err := svc.SaveSettings(AppSettings{ComposeTrustedRoots: []string{projectDir}}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	details, err := svc.InspectCompose("cafebabe00000000000000000000000000000002")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !details.Trusted {
+		t.Fatalf("expected Trusted=true with the working dir configured as an approved root, got: %+v", details)
+	}
+	if details.Content != composeContent {
+		t.Errorf("expected the actual file content, got: %q", details.Content)
+	}
+	if len(details.PortMappings) != 1 || details.PortMappings[0].HostPort != 8080 {
+		t.Errorf("expected parsed port mappings, got: %+v", details.PortMappings)
 	}
 }
 

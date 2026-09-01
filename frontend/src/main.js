@@ -6,6 +6,8 @@ import {
     withMaskedSecrets,
     describeBindAddress,
     formatPortRangeSuffix,
+    RECONCILIATION_STATUS_META,
+    STATUS_PILL_CLASS_FOR_RECONCILE_CLASS,
 } from "./trust.js";
 
 // Trust-boundary escaping/masking helpers (escapeHtml, escapeAttr,
@@ -405,6 +407,9 @@ function renderRegistryStatusBar(summary) {
             <span class="reg-metric reserved" title="Ports reserved in registry">
                 ${summary.registryReserved} Reserved
             </span>
+            <span class="reg-metric drift" title="Lifecycle-aware problems: a deprecated/retired declaration still running, a declared/observed bind mismatch, or an endpoint occupied by an unexpected workload owner">
+                ${summary.registryDrift || 0} Drift
+            </span>
             <button class="btn btn-secondary btn-xs" onclick="openSettingsModal()" style="margin-left: 8px;">Config</button>
         </div>
     `;
@@ -432,13 +437,20 @@ function renderPortItems() {
 
     let items = cachedPortOverview.items || [];
 
-    // Filter by source / category
+    // Filter by source / category. "Registry" means ANY row associated
+    // with a registry record -- not just an ordinary MATCH -- so a
+    // mismatch/drift/lifecycle row is never invisible merely because it
+    // isn't a clean match. registryId is set on every reconciled runtime
+    // row (match, bind mismatch, owner mismatch/unknown, ...) and on every
+    // registry-declared standalone row, so this is the same property the
+    // backend already treats as authoritative for "this row is
+    // registry-associated" -- see PortOverviewItem.RegistryID.
     if (currentPortFilter === 'podman') {
         items = items.filter(i => i.source === 'podman');
     } else if (currentPortFilter === 'host') {
         items = items.filter(i => i.source === 'host-listener');
     } else if (currentPortFilter === 'registry') {
-        items = items.filter(i => i.source === 'registry-declared' || (i.reconciliationStatus && i.reconciliationStatus === 'MATCH'));
+        items = items.filter(i => !!i.registryId);
     } else if (currentPortFilter === 'conflicts') {
         items = items.filter(i => i.status === 'CONFLICT');
     }
@@ -526,42 +538,34 @@ function renderPortItems() {
                             statusBadge = `<span class="status-pill conflict" title="${escapeAttr(item.conflictNote || 'Conflict')}">CONFLICT</span>`;
                         } else if (item.status === 'STOPPED_CONFIGURED') {
                             statusBadge = `<span class="status-pill stopped">CONFIGURED</span>`;
-                        } else if (item.status === 'DECLARED_MISSING') {
-                            statusBadge = `<span class="status-pill missing">MISSING</span>`;
-                        } else if (item.status === 'RESERVED_FREE') {
-                            statusBadge = `<span class="status-pill reserved">RESERVED</span>`;
-                        } else if (item.status === 'RESERVED_IN_USE') {
-                            statusBadge = `<span class="status-pill conflict">RESERVED (IN USE)</span>`;
-                        } else if (item.status === 'PLANNED') {
-                            statusBadge = `<span class="status-pill planned">PLANNED</span>`;
-                        } else if (item.status === 'UNSCOPED') {
-                            statusBadge = `<span class="status-pill planned" title="Registry record has no node scope and is informational only">UNSCOPED</span>`;
-                        } else if (item.status === 'REMOTE') {
-                            statusBadge = `<span class="status-pill planned" title="Registry record belongs to another node">REMOTE</span>`;
+                        } else {
+                            // Every other item.status value used for a
+                            // standalone registry-declared row shares the
+                            // exact same string as reconciliationStatus
+                            // (see GetPortOverview's unmatched-declared
+                            // loop) -- render it from the same explicit
+                            // lifecycle table rather than falling back to a
+                            // generic/blank "ACTIVE" badge for any status
+                            // this block doesn't individually enumerate.
+                            const statusMeta = RECONCILIATION_STATUS_META[item.status];
+                            if (statusMeta) {
+                                const cls = STATUS_PILL_CLASS_FOR_RECONCILE_CLASS[statusMeta.cls] || 'stopped';
+                                statusBadge = `<span class="status-pill ${cls}" title="${escapeAttr(item.conflictNote || statusMeta.tooltip)}">${escapeHtml(statusMeta.label)}</span>`;
+                            }
                         }
 
-                        // Reconciliation badge
+                        // Reconciliation badge -- covers EVERY lifecycle
+                        // reconciliation status the backend can report (see
+                        // RECONCILIATION_STATUS_META above); a status this
+                        // table doesn't recognize falls back to a generic
+                        // HOST pill rather than silently disappearing.
                         let reconcileBadge = '';
                         if (hasRegistry) {
                             const rec = item.reconciliationStatus || 'UNDECLARED';
-                            if (rec === 'MATCH') {
-                                reconcileBadge = `<span class="reconcile-pill match" title="Matches declared entry in external registry">MATCH</span>`;
-                            } else if (rec === 'UNDECLARED') {
-                                reconcileBadge = `<span class="reconcile-pill undeclared" title="Running workload not registered in ports.yaml">UNDECLARED</span>`;
-                            } else if (rec === 'DECLARED_MISSING') {
-                                reconcileBadge = `<span class="reconcile-pill missing" title="Declared service is not currently active on host">MISSING</span>`;
-                            } else if (rec === 'RESERVED_FREE') {
-                                reconcileBadge = `<span class="reconcile-pill reserved" title="Declared reservation (free)">RESERVED</span>`;
-                            } else if (rec === 'RESERVED_IN_USE') {
-                                reconcileBadge = `<span class="reconcile-pill conflict" title="Declared reservation occupied by socket">IN USE</span>`;
-                            } else if (rec === 'PLANNED') {
-                                reconcileBadge = `<span class="reconcile-pill planned" title="Planned future service">PLANNED</span>`;
-                            } else if (rec === 'UNSCOPED') {
-                                reconcileBadge = `<span class="reconcile-pill planned" title="Informational registry record without a node scope">UNSCOPED</span>`;
-                            } else if (rec === 'REMOTE') {
-                                reconcileBadge = `<span class="reconcile-pill planned" title="Registry record belongs to another node">REMOTE</span>`;
-                            } else if (rec === 'DECLARED_ENDPOINT_MISMATCH') {
-                                reconcileBadge = `<span class="reconcile-pill conflict" title="${escapeAttr(item.conflictNote || 'Declared and observed bind addresses differ')}">BIND MISMATCH</span>`;
+                            const meta = RECONCILIATION_STATUS_META[rec];
+                            if (meta) {
+                                const tooltip = item.conflictNote || meta.tooltip;
+                                reconcileBadge = `<span class="reconcile-pill ${meta.cls}" title="${escapeAttr(tooltip)}">${escapeHtml(meta.label)}</span>`;
                             } else {
                                 reconcileBadge = `<span class="reconcile-pill host">HOST</span>`;
                             }
@@ -671,6 +675,14 @@ window.copyText = (text, successMsg = "Copied to clipboard!") => {
 
 // --- Settings & External Registry Handlers ---
 
+// Compose Trusted Roots state -- an operator-approved allowlist of
+// filesystem roots Podder is permitted to automatically read a Compose
+// project file from. A container's own working_dir/config_files labels are
+// never, by themselves, treated as authorization -- see
+// AppSettings.ComposeTrustedRoots / FindComposeFile.
+let composeTrustedRootRows = [];
+let nextComposeTrustedRootRowId = 1;
+
 window.openSettingsModal = async () => {
     try {
         const settings = await Podman.GetSettings();
@@ -691,9 +703,60 @@ window.openSettingsModal = async () => {
             banner.innerHTML = '';
         }
 
+        const trustedRoots = (settings && Array.isArray(settings.composeTrustedRoots)) ? settings.composeTrustedRoots : [];
+        composeTrustedRootRows = trustedRoots.map(root => ({ id: nextComposeTrustedRootRowId++, path: root }));
+        renderComposeTrustedRootRows();
+
         openModal('settings-modal');
     } catch (err) {
         showNotification(`Failed to read settings: ${err}`, true);
+    }
+};
+
+function renderComposeTrustedRootRows() {
+    const container = document.getElementById('compose-trusted-roots-list');
+    if (!container) return;
+
+    if (composeTrustedRootRows.length === 0) {
+        container.innerHTML = `<div class="empty-port-hint">No trusted roots configured. Automatic Compose file reading is disabled.</div>`;
+        return;
+    }
+
+    container.innerHTML = composeTrustedRootRows.map(row => `
+        <div class="port-input-row" id="compose-root-row-${row.id}">
+            <div class="port-field-group" style="flex: 4;">
+                <input type="text" class="form-input" value="${escapeAttr(row.path)}" placeholder="/home/user/projects" onchange="updateComposeTrustedRootRow(${row.id}, this.value)"/>
+            </div>
+            <div style="display: flex; gap: 4px; align-items: center;">
+                <button type="button" class="btn btn-danger btn-xs" onclick="removeComposeTrustedRootRow(${row.id})" title="Remove trusted root">&times;</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+window.addComposeTrustedRootRow = (path = '') => {
+    composeTrustedRootRows.push({ id: nextComposeTrustedRootRowId++, path });
+    renderComposeTrustedRootRows();
+};
+
+window.removeComposeTrustedRootRow = (id) => {
+    composeTrustedRootRows = composeTrustedRootRows.filter(r => r.id !== id);
+    renderComposeTrustedRootRows();
+};
+
+window.updateComposeTrustedRootRow = (id, value) => {
+    const row = composeTrustedRootRows.find(r => r.id === id);
+    if (row) row.path = value;
+};
+
+window.pickComposeTrustedRoot = async () => {
+    try {
+        const selected = await Podman.SelectHostPath('folder');
+        if (selected) {
+            addComposeTrustedRootRow(selected);
+        }
+    } catch (err) {
+        showNotification(`Error selecting folder: ${err}`, true);
     }
 };
 
@@ -754,12 +817,16 @@ window.testRegistryFile = async () => {
 window.saveAppSettings = async () => {
     const enabled = document.getElementById('setting-registry-enabled').checked;
     const path = document.getElementById('setting-registry-path').value.trim();
+    const trustedRoots = composeTrustedRootRows
+        .map(r => (r.path || '').trim())
+        .filter(p => p !== '');
 
     const settings = {
         portRegistry: {
             enabled: enabled,
             path: path
-        }
+        },
+        composeTrustedRoots: trustedRoots
     };
 
     try {
@@ -1274,13 +1341,28 @@ function renderReadOnlyGuidance(kind, details) {
     note.textContent = details.note;
     guidanceText.appendChild(note);
 
+    // Compose provenance (working_dir/config_files) is untrusted,
+    // container-supplied label content -- containment inside the claimed
+    // working directory is NOT authorization to read it automatically. The
+    // UI must clearly distinguish what the container CLAIMS from what
+    // Podder actually VERIFIED and read (AppSettings.ComposeTrustedRoots).
+    if (kind === 'compose' && details.trusted === false) {
+        const untrusted = document.createElement('div');
+        untrusted.style.marginTop = '6px';
+        untrusted.style.color = 'var(--color-amber, #f59e0b)';
+        untrusted.textContent = 'Compose provenance detected, but Podder will not read the reported file automatically because its path is not trusted.' +
+            (details.untrustedReason ? ` (${details.untrustedReason})` : ' Configure an approved Compose trusted root in Settings to allow automatic reading.');
+        guidanceText.appendChild(untrusted);
+    }
+
     fileInfo.textContent = '';
     fileInfo.style.display = 'block';
     if (kind === 'quadlet') {
         appendGuidanceLine(fileInfo, 'Unit:', details.unitValue);
         if (details.filePath) appendGuidanceLine(fileInfo, 'Unit File:', details.filePath);
     } else {
-        appendGuidanceLine(fileInfo, 'Authoritative configuration:', details.filePath || '(could not be safely resolved -- see notice above)');
+        appendGuidanceLine(fileInfo, 'Compose path claimed by container:', details.claimedPath || '(none reported)');
+        appendGuidanceLine(fileInfo, 'Verified local Compose file:', details.trusted && details.filePath ? details.filePath : '(not read -- see notice above)');
         appendGuidanceLine(fileInfo, 'Service:', details.service);
     }
 }
@@ -1471,20 +1553,35 @@ window.openEditPortsModal = async (containerId, containerNameHint) => {
         submitBtn.textContent = 'Generate Updated Ports Snippet';
 
         let composeFile = '';
+        let claimedPath = '';
+        let trusted = false;
+        let untrustedReason = '';
         try {
             const composeDetails = await Podman.InspectCompose(containerId);
-            if (composeDetails && composeDetails.composeFile) {
-                composeFile = composeDetails.composeFile;
-                if (composeDetails.portMappings && composeDetails.portMappings.length > 0) {
-                    portMappings = composeDetails.portMappings;
+            if (composeDetails) {
+                claimedPath = composeDetails.claimedConfigFile || composeDetails.workingDir || '';
+                trusted = !!composeDetails.trusted;
+                untrustedReason = composeDetails.untrustedReason || '';
+                if (trusted && composeDetails.composeFile) {
+                    composeFile = composeDetails.composeFile;
+                    if (composeDetails.portMappings && composeDetails.portMappings.length > 0) {
+                        portMappings = composeDetails.portMappings;
+                    }
                 }
             }
         } catch (e) {
+            // Fresh runtime state (from GetContainerPortEditState above) is
+            // already loaded into portMappings; a failed inspect just means
+            // we fall back to that instead of the file's own (possibly more
+            // precise) view -- never to a blank/cached list.
             console.warn("Could not inspect compose file directly; using last known runtime configuration:", e);
         }
 
         renderReadOnlyGuidance('compose', {
+            claimedPath: claimedPath,
             filePath: composeFile,
+            trusted: trusted,
+            untrustedReason: untrustedReason,
             service: currentEditProvenance.service || '(unknown)',
             note: 'Podder will not modify this Compose project automatically.'
         });

@@ -589,6 +589,107 @@ func TestRangeVsExistingConflictDetected(t *testing.T) {
 	}
 }
 
+// --- v1.4 hardening: RangeSize preservation end-to-end (item 2) ---
+
+func TestValidatePortMapping_RangeSizeOverflowRejected(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+
+	// A range starting near the top of the port space that would overflow
+	// past 65535 must be rejected outright, not silently truncated.
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 65530, ContainerPort: 9000, Protocol: "tcp", RangeSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected a host-port range overflowing past 65535 to be rejected, got: %+v", validation.Checks)
+	}
+
+	validationContainer, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "0.0.0.0", HostPort: 3000, ContainerPort: 65530, Protocol: "tcp", RangeSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validationContainer.Valid {
+		t.Errorf("expected a container-port range overflowing past 65535 to be rejected, got: %+v", validationContainer.Checks)
+	}
+}
+
+func TestValidatePortMapping_SinglePortRangeSizeOneOrZeroEquivalent(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+
+	for _, rs := range []int{0, 1} {
+		validation, err := service.ValidatePortMapping(PortMappingRequest{
+			HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", RangeSize: rs,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !validation.Valid {
+			t.Errorf("expected a single-port mapping (RangeSize=%d) to be valid, got: %+v", rs, validation.Checks)
+		}
+	}
+}
+
+func TestValidatePortMapping_RangeAcceptedForTCPAndUDP(t *testing.T) {
+	for _, proto := range []string{"tcp", "udp"} {
+		runner := newFakeCommandRunner()
+		runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+		runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+		service := &PodmanService{runner: runner}
+
+		validation, err := service.ValidatePortMapping(PortMappingRequest{
+			HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: proto, RangeSize: 6,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error for %s: %v", proto, err)
+		}
+		if !validation.Valid {
+			t.Errorf("expected a valid range-size-6 mapping over %s to pass, got: %+v", proto, validation.Checks)
+		}
+	}
+}
+
+// TestGetPortOverview_RetainsRangeSize proves PortOverviewItem carries
+// RangeSize through from a container's published port range, and that a
+// registry-declared range likewise round-trips into the overview item --
+// the Ports tab must never silently collapse a range down to its first
+// port.
+func TestGetPortOverview_RetainsRangeSize(t *testing.T) {
+	runner := newFakeCommandRunner()
+	psJSON := `[{"Id":"2222222222222222222222222222222222222222","Names":["ranged"],"Image":"alpine","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"0.0.0.0","host_port":8000,"container_port":9000,"protocol":"tcp","range":6}],"Labels":{}}]`
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.IsContainer && item.HostPort == 8000 {
+			found = true
+			if item.RangeSize != 6 {
+				t.Errorf("expected PortOverviewItem.RangeSize=6, got %d (item: %+v)", item.RangeSize, item)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected to find the ranged container's overview item")
+	}
+}
+
 func TestFindConflictWithIgnoreContainer(t *testing.T) {
 	claims := []PortClaim{
 		{

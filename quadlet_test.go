@@ -431,3 +431,100 @@ func TestInspectQuadletReportsDropInsAndServiceNameOverride(t *testing.T) {
 		t.Fatalf("drop-in-bearing Quadlet must remain read-only: result=%+v err=%v", result, err)
 	}
 }
+
+// --- v1.4 hardening: provenance-derived Quadlet identifiers are not
+// filesystem authorization (item 5) ---
+//
+// PODMAN_SYSTEMD_UNIT / io.systemd.unit is external, container-supplied
+// metadata. A malicious or malformed container must not be able to abuse
+// it to make Podder read a file outside the Quadlet search directories.
+
+func TestValidateQuadletUnitIdentifier_RejectsTraversalAndInvalidForms(t *testing.T) {
+	bad := []string{
+		"",
+		"..",
+		".",
+		"../../etc/passwd",
+		"../foo.container",
+		"foo/../../bar",
+		"/etc/passwd",
+		"/absolute/path.container",
+		"foo/bar.container",
+		"foo\\bar.container",
+		"has\x00nul.container",
+	}
+	for _, name := range bad {
+		if err := validateQuadletUnitIdentifier(name); err == nil {
+			t.Errorf("expected validateQuadletUnitIdentifier(%q) to be rejected", name)
+		}
+	}
+
+	good := []string{
+		"myapp.service",
+		"myapp.container",
+		"my-app_v2.service",
+		"template@instance.service",
+	}
+	for _, name := range good {
+		if err := validateQuadletUnitIdentifier(name); err != nil {
+			t.Errorf("expected validateQuadletUnitIdentifier(%q) to be accepted, got: %v", name, err)
+		}
+	}
+}
+
+func TestFindQuadletFile_RejectsPathTraversalInUnitName(t *testing.T) {
+	withQuadletTestDirs(t)
+
+	malicious := []string{
+		"../../../../etc/passwd",
+		"../secrets.container",
+		"foo/../../bar.container",
+		"/etc/passwd",
+	}
+	for _, unitName := range malicious {
+		if _, _, err := FindQuadletFile(unitName); err == nil {
+			t.Errorf("expected FindQuadletFile(%q) to be refused as a path-traversal attempt", unitName)
+		}
+	}
+}
+
+// TestFindQuadletFile_CannotEscapeSearchRootViaTraversal proves the
+// traversal doesn't merely fail to find a match -- it must never actually
+// read whatever file happens to sit at the traversed location, even when
+// one exists there.
+func TestFindQuadletFile_CannotEscapeSearchRootViaTraversal(t *testing.T) {
+	root := t.TempDir()
+	userDir := filepath.Join(root, "xdg", "containers", "systemd")
+	if err := os.MkdirAll(userDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A real file that sits OUTSIDE the Quadlet search root, at the exact
+	// location a "../secret.container" traversal from userDir would land.
+	outsideFile := filepath.Join(root, "xdg", "secret.container")
+	if err := os.WriteFile(outsideFile, []byte("[Container]\nImage=should-not-be-read\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origXDG := os.Getenv("XDG_CONFIG_HOME")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	t.Cleanup(func() { os.Setenv("XDG_CONFIG_HOME", origXDG) })
+
+	if path, _, err := FindQuadletFile("../secret.service"); err == nil {
+		t.Fatalf("expected traversal to be refused, got path=%q", path)
+	}
+}
+
+func TestFindQuadletFile_NormalValidUnitStillResolves(t *testing.T) {
+	userDir, _ := withQuadletTestDirs(t)
+	unitPath := filepath.Join(userDir, "normal-app.container")
+	if err := os.WriteFile(unitPath, []byte("[Container]\nImage=alpine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path, scope, err := FindQuadletFile("normal-app.service")
+	if err != nil {
+		t.Fatalf("expected a normal, valid unit identifier to still resolve: %v", err)
+	}
+	if path != unitPath || scope != QuadletScopeUser {
+		t.Errorf("unexpected result: path=%q scope=%q", path, scope)
+	}
+}

@@ -60,3 +60,42 @@ graph TD
   - Users can mount host content without copying filesystem paths manually.
   - The bind-mount flow remains local and secure because Podder validates and passes paths directly to `podman` without shell interpolation.
   - Filtered dashboard navigation behaves more like a focused drill-down than a blind tab switch.
+
+### ADR 6: Declared-Endpoint Equality Is Separate From Conflict Detection (v1.4)
+* **Context**: Two different questions were being answered by the same normalization function. "Can these two bind addresses collide if both try to listen" (conflict/allocation safety) legitimately treats an omitted host bind, `0.0.0.0`, and `*` as interchangeable "wildcard" — but "are these two declarations/configurations exactly the same" (mutation verification, `DeploySpec` verification, registry reconciliation) must NOT make that same collapse, or a verification step can silently accept a runtime configuration that doesn't actually match what was declared.
+* **Decision**:
+  - `AddressesConflict`/`EndpointsConflict` (via `NormalizeAddress`) remain the conservative, deliberately-loose conflict/allocation-safety comparison. Unchanged.
+  - `CanonicalDeclaredBind`/`DeclaredEndpointsEquivalent` are a new, separate EXACT declared-endpoint comparison that keeps an omitted bind, an explicit IPv4/IPv6 wildcard, IPv4/IPv6 loopback, and any specific address mutually distinct. `portMappingSetEqual` (managed-create verification, port-mutation PREFLIGHT/VERIFY, `DeploySpec` verification) and `EndpointsEquivalentForReconciliation` (registry reconciliation) both key on this, not on `NormalizeAddress`.
+  - Whether Podman's own `inspect`/`ps` JSON actually preserves the omitted-vs-`0.0.0.0` distinction end-to-end is a real-runtime fact this architectural split does not itself prove — that is explicitly deferred to the dedicated rootless-Podman integration campaign.
+* **Consequences & Benefits**:
+  - A mutation/deploy/create verification step can no longer silently treat "the operator declared no host bind" and "the operator declared an explicit wildcard" as the same known-good configuration.
+  - Conflict detection stays conservative (overblocking is preferred to underblocking) without contaminating the stricter equality question, and vice versa.
+
+### ADR 7: Provenance Metadata Is a Discovery Hint, Not Filesystem Authorization (v1.4)
+* **Context**: Compose/Quadlet auto-discovery (working directory, config-file list, systemd unit name) is sourced from container labels — data any container, including a malicious or malformed one, can set. Treating it as an authoritative path to open is a path-traversal / arbitrary-file-read risk (`../../etc/passwd`-style label values).
+* **Decision**:
+  - `resolveWithinRoot` (`pathtrust.go`) is the shared containment check: every candidate path derived from provenance metadata is joined against, and proven to remain within, an allowed root — syntactically (clean + prefix check) and, for a path that exists, physically (symlink-resolved), so an in-tree symlink can't be used to defeat containment.
+  - `validateQuadletUnitIdentifier` rejects any Quadlet unit identifier that isn't a plain, safe basename (no `/`, `\`, `..`, absolute paths, NUL, or characters outside a conservative systemd-unit charset) before any candidate path is even built.
+  - An absolute Compose config-file path that resolves outside the container's reported working directory is treated as unresolved provenance (`ErrComposeFileOutsideWorkingDir`) and never read, rather than trusted because a label claims it is authoritative.
+* **Consequences & Benefits**:
+  - A malicious or malformed container's labels can no longer make Podder read an arbitrary file the process can access.
+  - Normal, well-formed Compose/Quadlet discovery is unaffected — only out-of-root/invalid-identifier cases are refused.
+
+### ADR 8: A Container's Reported Working Directory Is Never Its Own Trust Root (v1.4, final static round)
+* **Context**: ADR 7 proved containment within a container's CLAIMED `working_dir` label. That is necessary but not sufficient: the working directory itself is still container-supplied label content (`working_dir=/etc, config_files=passwd` trivially satisfies "the candidate is inside the claimed working directory").
+* **Decision**:
+  - Automatic Compose file reading (`InspectCompose`) now additionally requires the resolved candidate to fall under an explicit, operator-approved root — `AppSettings.ComposeTrustedRoots`, configured in Settings, empty by default. A candidate must pass BOTH the working-directory containment check (ADR 7) AND the trusted-root containment check (this ADR); neither alone is sufficient.
+  - `ComposeFileDetails` distinguishes CLAIMED provenance (`workingDir`/`claimedConfigFile`, always populated when any compose provenance exists) from VERIFIED, actually-read content (`composeFile`/`content`, populated only when `trusted` is true). `InspectCompose` returns this claimed-but-untrusted shape (not a hard error) whenever it detects Compose provenance it won't read, so the operator still sees what the container claims.
+* **Consequences & Benefits**:
+  - With no trusted roots configured (the default), Podder never automatically reads a Compose file — equivalent in effect to the brief's "acceptable simpler alternative" of disabling automatic reading entirely, while still supporting real automatic discovery once an operator explicitly approves a root.
+  - A container cannot manufacture its own authorization merely by claiming a working directory; only an operator-configured root can grant it.
+
+### ADR 9: Registry Reconciliation Verifies OWNERSHIP, Not Just Endpoint Occupation (v1.4, final static round)
+* **Context**: Registry matching (`findRegistryMatch`) checked node/bind/port/protocol/range equality but not who actually occupies the endpoint. A different container coincidentally bound to a declared endpoint would report as an ordinary `MATCH`, hiding a real "the wrong workload is here" condition — the registry models *intended ownership*, not merely socket occupation.
+* **Decision**:
+  - For lifecycle states that assert a live workload identity (`active`, `temporary`, `deprecated` — the same set `registryStateExpectsBindMatch` already used for bind-mismatch detection), an exact match now additionally requires the observed owner (container name, or host-listener process name) to equal the registry's declared `service`, via a conservative case-insensitive exact comparison — never fuzzy/substring matching.
+  - Two new reconciliation statuses distinguish the failure modes: `OWNER_MISMATCH` (a confidently-identified different owner occupies the endpoint) and `OWNER_UNKNOWN` (the endpoint is occupied, but Podder could not confidently identify who — e.g. a host listener `ss` couldn't resolve a process for). Neither is ever reported as `MATCH`.
+  - `reserved`/`planned`/`retired` are explicitly exempted — those states make no live-identity assertion (a reservation cares only whether *something* occupies it; a retired declaration being occupied by anyone is itself the notable drift signal), so this owner check never applies to them.
+* **Consequences & Benefits**:
+  - A registry entry can no longer be satisfied by an unrelated workload that happens to occupy the same address/port.
+  - `registryMatch` was reviewed alongside this change: `TEMPORARY_ACTIVE`/`DEPRECATED_ACTIVE`/`RETIRED_IN_USE` are no longer counted as ordinary matches (they never fully were "just like an active match" semantically); a new `registryDrift` counter tracks `DEPRECATED_ACTIVE`, `RETIRED_IN_USE`, `DECLARED_ENDPOINT_MISMATCH`, `OWNER_MISMATCH`, and `OWNER_UNKNOWN` as a distinct, explicit bucket.

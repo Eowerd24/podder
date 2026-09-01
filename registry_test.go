@@ -896,3 +896,724 @@ func TestRegistryRangeReconciliation_MismatchedRangeIsNotMatch(t *testing.T) {
 		}
 	}
 }
+
+// =====================================================================
+// v1.4 hardening: registry fail-closed safety mode (item 6)
+// =====================================================================
+
+// partiallyInvalidRegistryV1 is valid YAML overall (Loaded=true) with
+// three good entries and ONE malformed entry (missing id). This is the
+// exact gap the pre-hardening code missed: it only failed closed when the
+// WHOLE registry failed to parse (Loaded=false); a registry that parses
+// fine but silently drops one entry as a warning previously sailed straight
+// through safety-critical validation as if that dropped entry never
+// existed.
+const partiallyInvalidRegistryV1 = `
+version: 1
+ports:
+  - id: good-one
+    service: svc-one
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3000
+    state: active
+
+  - id: good-two
+    service: svc-two
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3001
+    state: reserved
+
+  - service: missing-id-entry
+    protocol: tcp
+    listener:
+      port: 9999
+    state: active
+
+  - id: good-three
+    service: svc-three
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3002
+    state: planned
+`
+
+func TestLoadPortRegistryStrict_CleanRegistrySucceeds(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(cleanRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := &PodmanService{}
+	result, err := svc.LoadPortRegistryStrict(registryPath)
+	if err != nil {
+		t.Fatalf("expected a clean registry to load in strict mode without error, got: %v", err)
+	}
+	if !result.Loaded || len(result.Warnings) != 0 {
+		t.Errorf("expected Loaded=true and no warnings, got: %+v", result)
+	}
+}
+
+func TestLoadPortRegistryStrict_MalformedYAMLFails(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(malformedRegistryYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := &PodmanService{}
+	if _, err := svc.LoadPortRegistryStrict(registryPath); err == nil {
+		t.Fatalf("expected malformed YAML to fail in strict mode")
+	}
+}
+
+func TestLoadPortRegistryStrict_UnsupportedSchemaFails(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte("version: 99\nports: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := &PodmanService{}
+	if _, err := svc.LoadPortRegistryStrict(registryPath); err == nil {
+		t.Fatalf("expected an unsupported schema version to fail in strict mode")
+	}
+}
+
+// TestLoadPortRegistryStrict_OneInvalidEntryAmongValidOnesFails is the core
+// regression test for item 6: a registry that PARSES successfully overall
+// (Loaded=true) but silently dropped one entry must still fail closed in
+// strict/safety mode — "unknown" must never be silently treated as "free".
+func TestLoadPortRegistryStrict_OneInvalidEntryAmongValidOnesFails(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(partiallyInvalidRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &PodmanService{}
+
+	// Tolerant/display mode must still succeed with the valid subset.
+	tolerant, err := svc.LoadPortRegistry(registryPath)
+	if err != nil {
+		t.Fatalf("unexpected error from tolerant loader: %v", err)
+	}
+	if !tolerant.Loaded {
+		t.Fatalf("expected tolerant display mode to still load despite one invalid entry: %s", tolerant.Error)
+	}
+	if len(tolerant.Ports) != 3 {
+		t.Fatalf("expected 3 valid entries to survive tolerant parsing, got %d: %+v", len(tolerant.Ports), tolerant.Ports)
+	}
+	if len(tolerant.Warnings) == 0 {
+		t.Fatalf("expected at least one warning for the dropped entry")
+	}
+
+	// Strict/safety mode must fail closed on exactly this registry.
+	strict, err := svc.LoadPortRegistryStrict(registryPath)
+	if err == nil {
+		t.Fatalf("expected strict mode to fail when the registry contains any invalid entry, got success: %+v", strict)
+	}
+}
+
+func TestDuplicateIDRegistryFailsStrictModeButNotDisplay(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	dup := `
+version: 1
+ports:
+  - id: dup
+    service: one
+    protocol: tcp
+    listener: { port: 3000 }
+    state: active
+  - id: dup
+    service: two
+    protocol: tcp
+    listener: { port: 3001 }
+    state: active
+`
+	if err := os.WriteFile(registryPath, []byte(dup), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := &PodmanService{}
+
+	tolerant, err := svc.LoadPortRegistry(registryPath)
+	if err != nil || !tolerant.Loaded {
+		t.Fatalf("expected display mode to tolerate a duplicate id, got loaded=%v err=%v", tolerant != nil && tolerant.Loaded, err)
+	}
+
+	if _, err := svc.LoadPortRegistryStrict(registryPath); err == nil {
+		t.Fatalf("expected strict mode to fail closed on a duplicate registry id")
+	}
+}
+
+// TestCollectBlockingClaimsStrict_PartiallyInvalidRegistryBlocksSafetyOperations
+// proves the fail-closed behavior actually reaches the safety-critical call
+// sites (ValidatePortMapping / FindFreePort / CollectBlockingClaimsStrict,
+// which validateMappingsForCreate/validateMappingsForMutation/
+// AdoptContainer's port checks all route through), end to end.
+func TestCollectBlockingClaimsStrict_PartiallyInvalidRegistryBlocksSafetyOperations(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(partiallyInvalidRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	if _, err := service.CollectBlockingClaimsStrict(); err == nil {
+		t.Fatalf("expected CollectBlockingClaimsStrict to fail closed when the enabled registry has one invalid entry among valid ones")
+	}
+
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if validation.Valid {
+		t.Errorf("expected ValidatePortMapping to be BLOCKED when the enabled registry is partially invalid, got: %+v", validation.Checks)
+	}
+
+	if _, err := service.FindFreePort(3000, "tcp", "127.0.0.1"); err == nil {
+		t.Errorf("expected FindFreePort to refuse reporting a free port when the enabled registry is partially invalid")
+	}
+
+	// GetPortOverview (display) must still succeed and surface the warning.
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("expected the Ports overview to remain available despite invalid registry entries, got: %v", err)
+	}
+	if !overview.Summary.RegistryLoaded {
+		t.Errorf("expected the registry to still show as loaded for display purposes")
+	}
+	if len(overview.Summary.RegistryWarnings) == 0 {
+		t.Errorf("expected the overview summary to surface the registry's invalid-entry warning")
+	}
+}
+
+// --- Registry lifecycle reconciliation semantics (item 6) ---
+
+// TestClassifyRegistryMatch_AllLifecycleStates pins the v1.4 round-2
+// correction: only a genuine "active" (or unrecognized/default) match
+// counts toward the ordinary registryMatch summary bucket.
+// TEMPORARY_ACTIVE/DEPRECATED_ACTIVE/RETIRED_IN_USE must NEVER be folded
+// into ordinary MATCH — DEPRECATED_ACTIVE and RETIRED_IN_USE are
+// specifically drift (see registryStatusIsDrift/RegistryDrift) that would
+// otherwise be invisible if counted as an everyday match.
+func TestClassifyRegistryMatch_AllLifecycleStates(t *testing.T) {
+	cases := []struct {
+		state           string
+		wantStatus      string
+		wantOrdinaryLog bool
+	}{
+		{"active", "MATCH", true},
+		{"", "MATCH", true}, // unrecognized/empty defaults to active semantics
+		{"reserved", "RESERVED_IN_USE", false},
+		{"planned", "PLANNED", false},
+		{"temporary", "TEMPORARY_ACTIVE", false},
+		{"deprecated", "DEPRECATED_ACTIVE", false},
+		{"retired", "RETIRED_IN_USE", false},
+	}
+	for _, tc := range cases {
+		status, ordinary := classifyRegistryMatch(tc.state)
+		if status != tc.wantStatus {
+			t.Errorf("classifyRegistryMatch(%q) status = %q, want %q", tc.state, status, tc.wantStatus)
+		}
+		if ordinary != tc.wantOrdinaryLog {
+			t.Errorf("classifyRegistryMatch(%q) countsAsOrdinaryMatch = %v, want %v", tc.state, ordinary, tc.wantOrdinaryLog)
+		}
+	}
+}
+
+func TestRegistryStatusIsDrift(t *testing.T) {
+	drift := map[string]bool{
+		"DEPRECATED_ACTIVE":          true,
+		"RETIRED_IN_USE":             true,
+		"OWNER_MISMATCH":             true,
+		"OWNER_UNKNOWN":              true,
+		"DECLARED_ENDPOINT_MISMATCH": true,
+		"MATCH":                      false,
+		"UNDECLARED":                 false,
+		"DECLARED_MISSING":           false,
+		"RESERVED_FREE":              false,
+		"RESERVED_IN_USE":            false,
+		"PLANNED":                    false,
+		"TEMPORARY_ACTIVE":           false,
+		"TEMPORARY_MISSING":          false,
+		"DEPRECATED_MISSING":         false,
+		"RETIRED_FREE":               false,
+		"HOST":                       false,
+	}
+	for status, want := range drift {
+		if got := registryStatusIsDrift(status); got != want {
+			t.Errorf("registryStatusIsDrift(%q) = %v, want %v", status, got, want)
+		}
+	}
+}
+
+func TestClassifyRegistryMissing_AllLifecycleStates(t *testing.T) {
+	cases := []struct {
+		state      string
+		wantStatus string
+		wantFault  bool
+	}{
+		{"active", "DECLARED_MISSING", true},
+		{"", "DECLARED_MISSING", true},
+		{"planned", "PLANNED", false},
+		{"temporary", "TEMPORARY_MISSING", false},
+		{"deprecated", "DEPRECATED_MISSING", false},
+		{"retired", "RETIRED_FREE", false},
+	}
+	for _, tc := range cases {
+		status, fault := classifyRegistryMissing(tc.state)
+		if status != tc.wantStatus {
+			t.Errorf("classifyRegistryMissing(%q) status = %q, want %q", tc.state, status, tc.wantStatus)
+		}
+		if fault != tc.wantFault {
+			t.Errorf("classifyRegistryMissing(%q) isOperationalFault = %v, want %v", tc.state, fault, tc.wantFault)
+		}
+	}
+}
+
+// lifecycleRegistryV1 declares one entry in each of the six lifecycle
+// states, each on a port nothing is currently running on -- so the
+// reconciliation loop exercises the classifyRegistryMissing() path for
+// every state. See TestReconciliationStates_TemporaryDeprecatedRetiredMatched
+// below for the classifyRegistryMatch() (currently-running) counterpart.
+const lifecycleRegistryV1 = `
+version: 1
+ports:
+  - id: lc-active
+    service: lc-active-svc
+    protocol: tcp
+    listener: { address: 127.0.0.1, port: 7001 }
+    state: active
+
+  - id: lc-temporary
+    service: lc-temporary-svc
+    protocol: tcp
+    listener: { address: 127.0.0.1, port: 7002 }
+    state: temporary
+
+  - id: lc-deprecated
+    service: lc-deprecated-svc
+    protocol: tcp
+    listener: { address: 127.0.0.1, port: 7003 }
+    state: deprecated
+
+  - id: lc-retired
+    service: lc-retired-svc
+    protocol: tcp
+    listener: { address: 127.0.0.1, port: 7004 }
+    state: retired
+`
+
+func TestReconciliationStates_TemporaryDeprecatedRetiredAreNotOrdinaryMissingFaults(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(lifecycleRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	service := &PodmanService{runner: newFakeCommandRunner()}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("failed to get port overview: %v", err)
+	}
+
+	want := map[string]string{
+		"lc-active":     "DECLARED_MISSING",
+		"lc-temporary":  "TEMPORARY_MISSING",
+		"lc-deprecated": "DEPRECATED_MISSING",
+		"lc-retired":    "RETIRED_FREE",
+	}
+	found := map[string]bool{}
+	for _, item := range overview.Items {
+		if want[item.RegistryID] != "" {
+			if item.ReconciliationStatus != want[item.RegistryID] {
+				t.Errorf("registry id %s: ReconciliationStatus = %q, want %q", item.RegistryID, item.ReconciliationStatus, want[item.RegistryID])
+			}
+			found[item.RegistryID] = true
+		}
+	}
+	for id := range want {
+		if !found[id] {
+			t.Errorf("expected an overview item for registry id %s", id)
+		}
+	}
+
+	// Only the genuinely "active" (or unrecognized-state) declaration
+	// should count toward RegistryMissing -- temporary/deprecated/retired
+	// being unmatched is expected, not an operational fault.
+	if overview.Summary.RegistryMissing != 1 {
+		t.Errorf("expected exactly 1 RegistryMissing (only the active entry), got %d", overview.Summary.RegistryMissing)
+	}
+}
+
+func TestReconciliationStates_TemporaryDeprecatedRetiredMatchedAgainstLiveContainer(t *testing.T) {
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(lifecycleRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	// A live container occupies the exact declared endpoint for the
+	// "retired" registry entry -- a real, useful drift signal that must
+	// surface as RETIRED_IN_USE, never ordinary MATCH.
+	psJSON := `[{"Id":"1111111111111111111111111111111111111111","Names":["ghost"],"Image":"alpine","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":7004,"container_port":80,"protocol":"tcp","range":1}],"Labels":{}}]`
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("failed to get port overview: %v", err)
+	}
+
+	foundRetiredInUse := false
+	for _, item := range overview.Items {
+		if item.IsContainer && item.HostPort == 7004 {
+			if item.ReconciliationStatus != "RETIRED_IN_USE" {
+				t.Errorf("expected a running container matching a 'retired' registry declaration to report RETIRED_IN_USE, got %q", item.ReconciliationStatus)
+			}
+			foundRetiredInUse = true
+		}
+	}
+	if !foundRetiredInUse {
+		t.Fatalf("expected to find the running container's item matched against the retired registry entry")
+	}
+	// v1.4 round-2 correction: RETIRED_IN_USE is drift, never counted as
+	// an ordinary match (see classifyRegistryMatch/registryStatusIsDrift).
+	if overview.Summary.RegistryMatch != 0 {
+		t.Errorf("expected RegistryMatch to NOT count a RETIRED_IN_USE endpoint, got %d", overview.Summary.RegistryMatch)
+	}
+	if overview.Summary.RegistryDrift != 1 {
+		t.Errorf("expected RegistryDrift to count the one RETIRED_IN_USE endpoint, got %d", overview.Summary.RegistryDrift)
+	}
+}
+
+func TestDisabledRegistryDoesNotBlockNormalOperation(t *testing.T) {
+	tempDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", origHome)
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	// Even a registry file that would fail strict validation must not
+	// block anything while the registry itself is disabled.
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(partiallyInvalidRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return "", "", nil })
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: false, Path: registryPath},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+
+	if _, err := service.CollectBlockingClaimsStrict(); err != nil {
+		t.Fatalf("expected a disabled registry to never block, got: %v", err)
+	}
+	validation, err := service.ValidatePortMapping(PortMappingRequest{
+		HostIP: "127.0.0.1", HostPort: 9090, ContainerPort: 80, Protocol: "tcp",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !validation.Valid {
+		t.Errorf("expected validation to succeed when the registry is disabled, got: %+v", validation.Checks)
+	}
+}
+
+// =====================================================================
+// v1.4 hardening round 2: registry matching must include intended
+// owner/service identity, not just endpoint occupation (finding 2)
+// =====================================================================
+
+const ownerIdentityRegistryV1 = `
+version: 1
+ports:
+  - id: flowise-http
+    service: flowise
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3100
+    state: active
+    purpose: Flowise web frontend
+
+  - id: analytics-temp
+    service: analytics
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3200
+    state: temporary
+
+  - id: legacy-api
+    service: legacy-api
+    protocol: tcp
+    listener:
+      address: 127.0.0.1
+      port: 3300
+    state: deprecated
+
+  - id: relp-reservation
+    service: relp
+    protocol: tcp
+    listener:
+      address: 0.0.0.0
+      port: 3400
+    state: reserved
+`
+
+func newOwnerIdentityTestService(t *testing.T, psJSON, ssOutput string) (*PodmanService, string) {
+	t.Helper()
+	tempDir := t.TempDir()
+	registryPath := filepath.Join(tempDir, "ports.yaml")
+	if err := os.WriteFile(registryPath, []byte(ownerIdentityRegistryV1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origHome := os.Getenv("HOME")
+	t.Cleanup(func() { os.Setenv("HOME", origHome) })
+	os.Setenv("HOME", tempDir)
+	setTestConfigHome(t, tempDir)
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	runner.On("ss", func(n string, args []string) (string, string, error) { return ssOutput, "", nil })
+	service := &PodmanService{runner: runner}
+	if err := service.SaveSettings(AppSettings{
+		PortRegistry: PortRegistryConfig{Enabled: true, Path: registryPath, TreatUnscopedAsLocal: true},
+	}); err != nil {
+		t.Fatalf("failed to save settings: %v", err)
+	}
+	return service, registryPath
+}
+
+func TestRegistryOwnerIdentity_MatchingOwnerReportsMatch(t *testing.T) {
+	psJSON := `[{"Id":"1111111111111111111111111111111111111111","Names":["flowise"],"Image":"flowise","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3100,"container_port":3000,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "flowise-http" {
+			found = true
+			if item.ReconciliationStatus != "MATCH" {
+				t.Errorf("expected MATCH for matching owner, got %q (note: %s)", item.ReconciliationStatus, item.ConflictNote)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against flowise-http")
+	}
+}
+
+func TestRegistryOwnerIdentity_DifferentOwnerReportsOwnerMismatch(t *testing.T) {
+	psJSON := `[{"Id":"2222222222222222222222222222222222222222","Names":["rogue-service"],"Image":"rogue","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3100,"container_port":3000,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "flowise-http" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_MISMATCH" {
+				t.Fatalf("expected OWNER_MISMATCH for a different observed owner, got %q", item.ReconciliationStatus)
+			}
+			if !strings.Contains(item.ConflictNote, "flowise") || !strings.Contains(item.ConflictNote, "rogue-service") {
+				t.Errorf("expected diagnostic note naming expected/observed owners, got: %q", item.ConflictNote)
+			}
+		}
+		// The declaration must not ALSO be double-counted as unmatched/missing.
+		if item.RegistryID == "flowise-http" && item.Source == "registry-declared" {
+			t.Fatalf("expected the owner-mismatched declaration to be consumed by the runtime item, not also listed as a separate unmatched declared row: %+v", item)
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against flowise-http")
+	}
+	if overview.Summary.RegistryMatch != 0 {
+		t.Errorf("expected RegistryMatch to NOT count an owner-mismatched endpoint, got %d", overview.Summary.RegistryMatch)
+	}
+	if overview.Summary.RegistryDrift != 1 {
+		t.Errorf("expected RegistryDrift to count exactly the one owner-mismatched endpoint, got %d", overview.Summary.RegistryDrift)
+	}
+}
+
+func TestRegistryOwnerIdentity_UnidentifiableHostListenerReportsOwnerUnknown(t *testing.T) {
+	// A host listener with no resolvable process (ss line without a
+	// trailing users:(...) segment) occupies the exact declared endpoint,
+	// but Podder cannot confidently say who -- must never report MATCH.
+	psJSON := `[]`
+	ssOutput := "LISTEN   0        4096                     127.0.0.1:3100      0.0.0.0:*   \n"
+	service, _ := newOwnerIdentityTestService(t, psJSON, ssOutput)
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "flowise-http" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_UNKNOWN" {
+				t.Errorf("expected OWNER_UNKNOWN for an unidentifiable host-listener occupant, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against flowise-http for the host listener")
+	}
+	if overview.Summary.RegistryMatch != 0 {
+		t.Errorf("expected RegistryMatch to NOT count an OWNER_UNKNOWN endpoint, got %d", overview.Summary.RegistryMatch)
+	}
+	if overview.Summary.RegistryDrift != 1 {
+		t.Errorf("expected RegistryDrift to count exactly the one OWNER_UNKNOWN endpoint, got %d", overview.Summary.RegistryDrift)
+	}
+}
+
+func TestRegistryOwnerIdentity_ReservedEndpointNeedsNoOwnerIdentity(t *testing.T) {
+	// Reserved semantics are unchanged: ANY occupant -- regardless of
+	// identity -- makes a reservation RESERVED_IN_USE.
+	psJSON := `[{"Id":"3333333333333333333333333333333333333333","Names":["whatever-process"],"Image":"x","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"0.0.0.0","host_port":3400,"container_port":3400,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "relp-reservation" {
+			found = true
+			if item.ReconciliationStatus != "RESERVED_IN_USE" {
+				t.Errorf("expected RESERVED_IN_USE regardless of occupant identity, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against relp-reservation")
+	}
+}
+
+func TestRegistryOwnerIdentity_TemporaryStateOwnerMismatch(t *testing.T) {
+	psJSON := `[{"Id":"4444444444444444444444444444444444444444","Names":["not-analytics"],"Image":"x","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3200,"container_port":3200,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "analytics-temp" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_MISMATCH" {
+				t.Errorf("expected OWNER_MISMATCH for a temporary-state declaration with the wrong observed owner, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against analytics-temp")
+	}
+}
+
+func TestRegistryOwnerIdentity_DeprecatedStateOwnerMismatch(t *testing.T) {
+	psJSON := `[{"Id":"5555555555555555555555555555555555555555","Names":["not-legacy-api"],"Image":"x","ImageID":"sha256:x","State":"running",` +
+		`"Ports":[{"host_ip":"127.0.0.1","host_port":3300,"container_port":3300,"protocol":"tcp","range":1}],"Labels":{}}]`
+	service, _ := newOwnerIdentityTestService(t, psJSON, "")
+
+	overview, err := service.GetPortOverview()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, item := range overview.Items {
+		if item.RegistryID == "legacy-api" {
+			found = true
+			if item.ReconciliationStatus != "OWNER_MISMATCH" {
+				t.Errorf("expected OWNER_MISMATCH for a deprecated-state declaration with the wrong observed owner, got %q", item.ReconciliationStatus)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected an overview item reconciled against legacy-api")
+	}
+}
+
+func TestClassifyRegistryStateExpectsOwnerIdentity(t *testing.T) {
+	// registryStateExpectsBindMatch doubles as "expects owner identity" —
+	// pin the exact set so a future addition to this switch can't silently
+	// change owner-check scope without a test noticing.
+	cases := map[string]bool{
+		"active":     true,
+		"temporary":  true,
+		"deprecated": true,
+		"reserved":   false,
+		"planned":    false,
+		"retired":    false,
+	}
+	for state, want := range cases {
+		if got := registryStateExpectsBindMatch(state); got != want {
+			t.Errorf("registryStateExpectsBindMatch(%q) = %v, want %v", state, got, want)
+		}
+	}
+}

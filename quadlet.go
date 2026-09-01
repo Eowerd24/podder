@@ -97,20 +97,36 @@ type QuadletFileDetails struct {
 
 // FindQuadletFile searches the standard Quadlet unit paths for a matching
 // .container file and reports which systemd scope (user/system) manages it.
+//
+// unitName is external provenance metadata (a container's PODMAN_SYSTEMD_UNIT
+// / io.systemd.unit label) — not filesystem authorization. It is validated
+// against a plain-basename grammar (validateQuadletUnitIdentifier) before
+// any candidate path is built, and every candidate is proven contained
+// within its search root (resolveWithinRoot, symlink-safe) before it is
+// stat'd or returned, so a malicious/malformed label can never traverse out
+// of the Quadlet search directories.
 func FindQuadletFile(unitName string) (path string, scope QuadletScope, err error) {
 	unitName = strings.TrimSpace(unitName)
-	if unitName == "" {
-		return "", "", fmt.Errorf("unit name cannot be empty")
+	if err := validateQuadletUnitIdentifier(unitName); err != nil {
+		return "", "", fmt.Errorf("refusing to search for quadlet unit: %w", err)
 	}
 
 	baseName := strings.TrimSuffix(unitName, ".service")
 	baseName = strings.TrimSuffix(baseName, ".container")
+	if err := validateQuadletUnitIdentifier(baseName); err != nil {
+		return "", "", fmt.Errorf("refusing to search for quadlet unit: %w", err)
+	}
 
 	candidates := []string{baseName + ".container", unitName}
 
 	for _, dir := range getQuadletSearchDirs() {
 		for _, cand := range candidates {
-			p := filepath.Join(dir.path, cand)
+			p, resolveErr := resolveWithinRoot(dir.path, cand)
+			if resolveErr != nil {
+				// A candidate that fails containment is never stat'd or
+				// returned; it is simply not a match in this directory.
+				continue
+			}
 			if _, statErr := os.Stat(p); statErr == nil {
 				return p, dir.scope, nil
 			} else if !os.IsNotExist(statErr) {
@@ -140,7 +156,11 @@ func FindQuadletFile(unitName string) (path string, scope QuadletScope, err erro
 			return "", "", fmt.Errorf("cannot recursively inspect Quadlet directory %s: %w", dir.path, walkErr)
 		}
 		if found != "" {
-			return found, dir.scope, nil
+			resolved, resolveErr := resolveWithinRoot(dir.path, found)
+			if resolveErr != nil {
+				continue
+			}
+			return resolved, dir.scope, nil
 		}
 	}
 

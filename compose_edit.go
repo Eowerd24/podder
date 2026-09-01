@@ -10,15 +10,31 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ComposeFileDetails holds inspection details of a Docker/Podman Compose file.
+// ComposeFileDetails holds inspection details of a Docker/Podman Compose
+// file, distinguishing what the container CLAIMS (untrusted provenance
+// metadata) from what Podder actually VERIFIED and read.
 type ComposeFileDetails struct {
-	ContainerID  string        `json:"containerId"`
-	WorkingDir   string        `json:"workingDir"`
-	ComposeFile  string        `json:"composeFile"`
-	Project      string        `json:"project"`
-	Service      string        `json:"service"`
-	Content      string        `json:"content"`
-	PortMappings []PortMapping `json:"portMappings"`
+	ContainerID string `json:"containerId"`
+	// WorkingDir and ClaimedConfigFile are exactly what the container's own
+	// labels report — untrusted discovery hints, always safe to display as
+	// metadata, never implicitly safe to read from. Always populated when
+	// any compose provenance was detected, regardless of Trusted.
+	WorkingDir        string `json:"workingDir"`
+	ClaimedConfigFile string `json:"claimedConfigFile,omitempty"`
+	// ComposeFile and Content are populated ONLY when Trusted is true — the
+	// candidate resolved inside both the claimed working directory AND an
+	// operator-approved trusted root, and Podder actually read it.
+	ComposeFile string `json:"composeFile,omitempty"`
+	Content     string `json:"content,omitempty"`
+	// Trusted reports whether ComposeFile/Content reflect an actually-read
+	// local file. false means Podder detected Compose provenance but is
+	// refusing to read the reported location automatically; UntrustedReason
+	// explains why (see FindComposeFile's sentinel errors).
+	Trusted         bool          `json:"trusted"`
+	UntrustedReason string        `json:"untrustedReason,omitempty"`
+	Project         string        `json:"project"`
+	Service         string        `json:"service"`
+	PortMappings    []PortMapping `json:"portMappings"`
 }
 
 // ErrMultipleComposeFiles is returned when a container's Compose provenance
@@ -29,8 +45,77 @@ type ComposeFileDetails struct {
 // back to manual guidance rather than guess which file to touch.
 var ErrMultipleComposeFiles = errors.New("compose project is defined by multiple configuration files; automatic mutation is not safe")
 
-// FindComposeFile locates the compose file from project metadata or directory scan.
-func FindComposeFile(workingDir, projectConfigFiles string) (string, error) {
+// ErrComposeFileOutsideWorkingDir is returned when a container's Compose
+// provenance metadata (com.docker.compose.project.config_files or
+// equivalent) names a file that does not resolve within the container's
+// reported working directory. Provenance labels are discovery hints, not
+// filesystem authorization — a container (malicious or merely malformed)
+// must never be able to make Podder open an arbitrary accessible file
+// simply by claiming it is "the" compose file. Such a declaration is
+// treated as unresolved provenance: Podder will not guess at reading it.
+var ErrComposeFileOutsideWorkingDir = errors.New("declared compose config file is outside the container's reported working directory; treating as unresolved provenance rather than reading it")
+
+// ErrComposeFileNotTrusted is returned when a candidate compose file DOES
+// resolve within the container's reported working directory, but that
+// working directory itself has not been established as a legitimate
+// Compose project location — it is, itself, still just container-supplied
+// label content. Containment within a claimed working directory alone is
+// not authorization: a malicious/malformed container could report
+// working_dir=/etc, config_files=passwd, and "/etc/passwd is inside /etc"
+// would trivially hold. Automatic reading additionally requires the
+// resolved candidate to fall under at least one operator-approved root
+// (AppSettings.ComposeTrustedRoots); with no roots configured, this is
+// always the outcome (safe default).
+var ErrComposeFileNotTrusted = errors.New("compose file is outside every operator-approved Compose trusted root; a container-reported working directory alone is never sufficient authorization to read it automatically")
+
+// composeFileWithinTrustedRoots reports whether the resolved, absolute
+// candidate path falls within at least one operator-configured trusted
+// root. Each root is canonicalized at check time (resolveWithinRoot itself
+// performs the clean + symlink-safe containment check), so a symlink
+// planted inside an approved root that points outside it is still refused.
+// An empty/unconfigured root list always returns false — the safe default
+// is that NOTHING is automatically trusted until the operator opts in.
+func composeFileWithinTrustedRoots(candidate string, trustedRoots []string) bool {
+	for _, root := range trustedRoots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		if _, err := resolveWithinRoot(root, candidate); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// FindComposeFile locates the compose file from project metadata or
+// directory scan. workingDir and projectConfigFiles are external
+// provenance metadata sourced from container labels — not filesystem
+// authorization — so a candidate must pass BOTH of the following before it
+// is stat'd/read:
+//
+//  1. it is contained within the claimed workingDir itself
+//     (resolveWithinRoot, symlink-safe canonicalization) — see
+//     ErrComposeFileOutsideWorkingDir; and
+//  2. it is contained within at least one operator-approved Compose
+//     trusted root (composeFileWithinTrustedRoots) — see
+//     ErrComposeFileNotTrusted. The claimed workingDir is NEVER itself
+//     treated as an implicit trust root, no matter how deeply a candidate
+//     nests inside it.
+//
+// trustedRoots is the caller's resolved AppSettings.ComposeTrustedRoots; an
+// empty list means nothing will ever be read automatically (the safe
+// default until an operator explicitly approves at least one root).
+func FindComposeFile(workingDir, projectConfigFiles string, trustedRoots []string) (string, error) {
+	workingDir = strings.TrimSpace(workingDir)
+
+	checkCandidate := func(resolved string) (string, error) {
+		if !composeFileWithinTrustedRoots(resolved, trustedRoots) {
+			return "", fmt.Errorf("%w: %q", ErrComposeFileNotTrusted, resolved)
+		}
+		return resolved, nil
+	}
+
 	if projectConfigFiles != "" {
 		var files []string
 		for _, f := range strings.Split(projectConfigFiles, ",") {
@@ -46,15 +131,15 @@ func FindComposeFile(workingDir, projectConfigFiles string) (string, error) {
 
 		if len(files) == 1 {
 			f := files[0]
-			if filepath.IsAbs(f) {
-				if _, err := os.Stat(f); err == nil {
-					return f, nil
-				}
-			} else if workingDir != "" {
-				p := filepath.Join(workingDir, f)
-				if _, err := os.Stat(p); err == nil {
-					return p, nil
-				}
+			if workingDir == "" {
+				return "", fmt.Errorf("%w: %q (no working directory reported to validate it against)", ErrComposeFileOutsideWorkingDir, f)
+			}
+			resolved, resolveErr := resolveWithinRoot(workingDir, f)
+			if resolveErr != nil {
+				return "", fmt.Errorf("%w: %q", ErrComposeFileOutsideWorkingDir, f)
+			}
+			if _, err := os.Stat(resolved); err == nil {
+				return checkCandidate(resolved)
 			}
 		}
 	}
@@ -69,9 +154,12 @@ func FindComposeFile(workingDir, projectConfigFiles string) (string, error) {
 			"podman-compose.yml",
 		}
 		for _, cand := range candidates {
-			p := filepath.Join(workingDir, cand)
+			p, resolveErr := resolveWithinRoot(workingDir, cand)
+			if resolveErr != nil {
+				continue
+			}
 			if _, err := os.Stat(p); err == nil {
-				return p, nil
+				return checkCandidate(p)
 			}
 		}
 	}
@@ -327,7 +415,17 @@ func writeFileAtomicPreservingMode(path string, data []byte, mode os.FileMode) e
 	return nil
 }
 
-// InspectCompose discovers and parses the compose file for a given container.
+// InspectCompose discovers and parses the compose file for a given
+// container. A container's Compose provenance labels (working_dir,
+// config_files) are DISCOVERY HINTS only, never filesystem authorization —
+// see FindComposeFile / AppSettings.ComposeTrustedRoots. When the reported
+// location cannot be established as trustworthy, this still returns a
+// details object describing the CLAIMED metadata (so the operator sees what
+// the container reports) with Trusted=false and no file content — it never
+// silently reads and returns an unverified file, and it never returns a
+// same-shaped "success" result for content that was never actually
+// verified. A hard error is returned only when there's nothing meaningful
+// to show at all (container not found, no compose provenance whatsoever).
 func (p *PodmanService) InspectCompose(containerID string) (*ComposeFileDetails, error) {
 	containers, err := p.ListContainers(true)
 	if err != nil {
@@ -347,9 +445,25 @@ func (p *PodmanService) InspectCompose(containerID string) (*ComposeFileDetails,
 		return nil, fmt.Errorf("container %s has no compose provenance labels", containerID)
 	}
 
-	foundFile, err := FindComposeFile(workingDir, configFile)
+	claimed := &ComposeFileDetails{
+		ContainerID:       target.Id,
+		WorkingDir:        workingDir,
+		ClaimedConfigFile: configFile,
+		Project:           target.Provenance.Project,
+		Service:           serviceName,
+		Trusted:           false,
+	}
+
+	settings, err := p.GetSettings()
 	if err != nil {
-		return nil, err
+		claimed.UntrustedReason = fmt.Sprintf("could not read Podder settings to resolve approved Compose trusted roots: %v", err)
+		return claimed, nil
+	}
+
+	foundFile, err := FindComposeFile(workingDir, configFile, settings.ComposeTrustedRoots)
+	if err != nil {
+		claimed.UntrustedReason = err.Error()
+		return claimed, nil
 	}
 
 	data, err := os.ReadFile(foundFile)
@@ -365,15 +479,11 @@ func (p *PodmanService) InspectCompose(containerID string) (*ComposeFileDetails,
 	// outright — the caller degrades to already-known live Podman ports.
 	ports, _ := ParseComposePorts(content, serviceName)
 
-	return &ComposeFileDetails{
-		ContainerID:  target.Id,
-		WorkingDir:   workingDir,
-		ComposeFile:  foundFile,
-		Project:      target.Provenance.Project,
-		Service:      serviceName,
-		Content:      content,
-		PortMappings: ports,
-	}, nil
+	claimed.ComposeFile = foundFile
+	claimed.Content = content
+	claimed.Trusted = true
+	claimed.PortMappings = ports
+	return claimed, nil
 }
 
 // findComposeServiceContainer locates the container Podman/Compose most
@@ -417,10 +527,10 @@ func (p *PodmanService) MutateComposePorts(containerID string, newPorts []PortMa
 		}
 	}
 
-	if serviceName != "" {
-		result.ComposeSnippet = GenerateComposeSnippet(serviceName, newPorts)
+	if snippet, err := GenerateComposeSnippet(serviceName, newPorts); err == nil {
+		result.ComposeSnippet = snippet
 	} else {
-		result.Guidance += " The Compose service identity for this container could not be safely determined, so no snippet was generated; update your compose file's ports: for the correct service manually."
+		result.Guidance += " The Compose service identity for this container could not be safely determined or represented, so no snippet was generated; update your compose file's ports: for the correct service manually."
 	}
 
 	result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: result.Guidance})

@@ -14,6 +14,10 @@ import {
     jsStringLiteral,
     jsonToSafeAttr,
     withMaskedSecrets,
+    describeBindAddress,
+    formatPortRangeSuffix,
+    RECONCILIATION_STATUS_META,
+    STATUS_PILL_CLASS_FOR_RECONCILE_CLASS,
 } from './trust.js';
 
 // Payloads an attacker-controlled field (a container name, an image tag, a
@@ -229,5 +233,126 @@ test('untrusted label/provenance/registry-YAML/process/network values are neutra
         assert.ok(!escaped.includes('<script'), `${field}: expected no live <script in escaped output, got: ${escaped}`);
         assert.ok(!escaped.includes('<img'), `${field}: expected no live <img in escaped output, got: ${escaped}`);
         assert.ok(!escaped.includes('<svg'), `${field}: expected no live <svg in escaped output, got: ${escaped}`);
+    }
+});
+
+// --- describeBindAddress: bind-address terminology (v1.4 hardening) ---
+
+test('describeBindAddress distinguishes omitted/default from every explicit address', () => {
+    assert.equal(describeBindAddress('').category, 'default');
+    assert.equal(describeBindAddress(undefined).category, 'default');
+    assert.equal(describeBindAddress(null).category, 'default');
+    assert.equal(describeBindAddress('').display, 'DEFAULT');
+});
+
+test('describeBindAddress distinguishes IPv4 ANY from IPv6 ANY', () => {
+    const v4 = describeBindAddress('0.0.0.0');
+    const v6 = describeBindAddress('::');
+    assert.equal(v4.category, 'wildcard4');
+    assert.equal(v6.category, 'wildcard6');
+    assert.notEqual(v4.category, v6.category);
+    // Internal host-listener shorthand "*" is a real wildcard, not omitted.
+    assert.equal(describeBindAddress('*').category, 'wildcard4');
+});
+
+test('describeBindAddress distinguishes IPv4 LOOPBACK from IPv6 LOOPBACK', () => {
+    const v4 = describeBindAddress('127.0.0.1');
+    const v6 = describeBindAddress('::1');
+    assert.equal(v4.category, 'loopback4');
+    assert.equal(v6.category, 'loopback6');
+    assert.notEqual(v4.category, v6.category);
+    assert.equal(describeBindAddress('localhost').category, 'loopback4');
+});
+
+test('describeBindAddress falls back to SPECIFIC for a named interface address', () => {
+    const info = describeBindAddress('192.168.1.50');
+    assert.equal(info.category, 'specific');
+    assert.equal(info.display, '192.168.1.50');
+});
+
+test('describeBindAddress never claims Internet-public exposure for a wildcard bind', () => {
+    for (const addr of ['0.0.0.0', '::', '', '*']) {
+        const info = describeBindAddress(addr);
+        // "Internet-public" may appear only as part of a hedge/negation
+        // ("not necessarily Internet-public"), never as a bare claim.
+        if (/internet[- ]?public/i.test(info.detail)) {
+            assert.ok(/not\s+(necessarily\s+)?internet[- ]?public/i.test(info.detail), `expected any Internet-public mention to be hedged/negated for ${JSON.stringify(addr)}, got: ${info.detail}`);
+        }
+        assert.ok(!/\bpublic\b/i.test(info.display), `expected no "public" in display for ${JSON.stringify(addr)}`);
+    }
+});
+
+// --- formatPortRangeSuffix: port-range display (v1.4 hardening) ---
+
+test('formatPortRangeSuffix renders a single port with no/1 rangeSize', () => {
+    assert.equal(formatPortRangeSuffix(8080, 0), '8080');
+    assert.equal(formatPortRangeSuffix(8080, 1), '8080');
+    assert.equal(formatPortRangeSuffix(8080, undefined), '8080');
+});
+
+test('formatPortRangeSuffix renders an inclusive start-end range and never hides the rest of the range', () => {
+    assert.equal(formatPortRangeSuffix(8000, 6), '8000-8005');
+    assert.equal(formatPortRangeSuffix(9000, 2), '9000-9001');
+    const rendered = formatPortRangeSuffix(8000, 6);
+    assert.ok(rendered.includes('8005'), 'expected the range end port to be visible, not collapsed to only the first port');
+});
+
+// --- RECONCILIATION_STATUS_META: every backend lifecycle status must
+// render explicitly (v1.4 hardening round 2, finding 3) ---
+
+// Every reconciliationStatus value the Go backend can produce (see
+// classifyRegistryMatch/classifyRegistryMissing/registryStateExpectsBindMatch
+// in registry.go, and the OWNER_MISMATCH/OWNER_UNKNOWN outcomes added to
+// ports.go). This list is the frontend-side contract: if the backend adds a
+// new status and this map isn't updated to match, this test catches it
+// rather than the operator silently seeing a generic/blank badge.
+const ALL_BACKEND_RECONCILIATION_STATUSES = [
+    'MATCH',
+    'UNDECLARED',
+    'DECLARED_MISSING',
+    'DECLARED_ENDPOINT_MISMATCH',
+    'RESERVED_FREE',
+    'RESERVED_IN_USE',
+    'PLANNED',
+    'UNSCOPED',
+    'REMOTE',
+    'TEMPORARY_ACTIVE',
+    'TEMPORARY_MISSING',
+    'DEPRECATED_ACTIVE',
+    'DEPRECATED_MISSING',
+    'RETIRED_IN_USE',
+    'RETIRED_FREE',
+    'OWNER_MISMATCH',
+    'OWNER_UNKNOWN',
+];
+
+test('RECONCILIATION_STATUS_META has an explicit entry for every backend reconciliation status', () => {
+    for (const status of ALL_BACKEND_RECONCILIATION_STATUSES) {
+        const meta = RECONCILIATION_STATUS_META[status];
+        assert.ok(meta, `expected an explicit rendering entry for ${status}, would otherwise fall back to a generic badge`);
+        assert.ok(meta.label && meta.label.length > 0, `expected a non-empty label for ${status}`);
+        assert.ok(meta.cls && meta.cls.length > 0, `expected a non-empty CSS class for ${status}`);
+        assert.ok(meta.tooltip && meta.tooltip.length > 0, `expected a non-empty tooltip for ${status}`);
+    }
+});
+
+test('RECONCILIATION_STATUS_META never re-uses the MATCH class for a lifecycle-nuanced or drift status', () => {
+    // A deprecated/retired/temporary declaration being fulfilled, or an
+    // owner/bind mismatch, must never render as an indistinguishable green
+    // "MATCH" pill -- that would hide exactly the nuance these statuses
+    // exist to surface.
+    const mustNotLookLikeMatch = [
+        'TEMPORARY_ACTIVE', 'DEPRECATED_ACTIVE', 'RETIRED_IN_USE',
+        'OWNER_MISMATCH', 'OWNER_UNKNOWN', 'DECLARED_ENDPOINT_MISMATCH',
+    ];
+    for (const status of mustNotLookLikeMatch) {
+        assert.notEqual(RECONCILIATION_STATUS_META[status].cls, 'match', `expected ${status} to render distinctly from an ordinary MATCH`);
+    }
+});
+
+test('every reconcile-pill class used has a status-pill class mapping', () => {
+    const usedClasses = new Set(Object.values(RECONCILIATION_STATUS_META).map(m => m.cls));
+    for (const cls of usedClasses) {
+        assert.ok(STATUS_PILL_CLASS_FOR_RECONCILE_CLASS[cls], `expected a status-pill mapping for reconcile-pill class ${cls}`);
     }
 });

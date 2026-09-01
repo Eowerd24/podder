@@ -63,6 +63,130 @@ export function jsonToSafeAttr(value) {
     return escapeHtml(JSON.stringify(value));
 }
 
+// --- Bind-address terminology & port-range display helpers ---
+//
+// Podder must never claim Internet-public exposure merely because a mapping
+// binds a wildcard address -- reachability from the wider Internet depends
+// on routing/NAT/firewall rules Podder cannot see. It also must not display
+// an omitted host address as though it literally said "0.0.0.0": those are
+// distinct declarations (see DeclaredEndpointsEquivalent in endpoint.go).
+// Kept here (DOM-free, pure) alongside the escaping helpers so both can be
+// unit tested with a plain Node test runner -- see trust.test.js.
+
+// describeBindAddress classifies a raw bind address string for display,
+// distinguishing an omitted/default bind from an explicit IPv4/IPv6
+// wildcard and from IPv4/IPv6 loopback: DEFAULT / IPv4 ANY / IPv6 ANY /
+// LOOPBACK / IPv6 LOOPBACK / SPECIFIC.
+export function describeBindAddress(raw) {
+    const bind = (raw === undefined || raw === null) ? '' : String(raw).trim();
+    if (bind === '') {
+        return {
+            category: 'default',
+            display: 'DEFAULT',
+            detail: 'Host address not explicitly set; Podman applies its own default bind for this mapping.'
+        };
+    }
+    if (bind === '0.0.0.0' || bind === '*') {
+        return {
+            category: 'wildcard4',
+            display: bind === '*' ? '0.0.0.0' : bind,
+            detail: 'IPv4 ANY (0.0.0.0): all local IPv4 interfaces -- network reachable subject to routing and firewall rules, not necessarily Internet-public.'
+        };
+    }
+    if (bind === '::') {
+        return {
+            category: 'wildcard6',
+            display: '::',
+            detail: 'IPv6 ANY (::): all local IPv6 interfaces -- network reachable subject to routing and firewall rules, not necessarily Internet-public.'
+        };
+    }
+    if (bind === '127.0.0.1') {
+        return { category: 'loopback4', display: bind, detail: 'LOOPBACK: this host only.' };
+    }
+    if (bind === '::1') {
+        return { category: 'loopback6', display: bind, detail: 'IPv6 LOOPBACK: this host only.' };
+    }
+    if (bind.toLowerCase() === 'localhost') {
+        return { category: 'loopback4', display: bind, detail: 'LOOPBACK: this host only.' };
+    }
+    return {
+        category: 'specific',
+        display: bind,
+        detail: 'SPECIFIC: a single named interface -- network reachable subject to routing and firewall rules.'
+    };
+}
+
+// formatPortRangeSuffix renders a single port, or (when rangeSize > 1) an
+// inclusive "start-end" range string, for DISPLAY only -- never for a
+// Compose/Quadlet configuration snippet, which must always go through the
+// backend's canonical FormatPublishSpec (see PreviewComposeSnippet /
+// PreviewQuadletSnippet in main.js). A range must always show its full
+// span; showing only the first port would silently hide the rest of the
+// range from the operator.
+export function formatPortRangeSuffix(start, rangeSize) {
+    const s = parseInt(start, 10);
+    const n = parseInt(rangeSize, 10);
+    if (isNaN(s)) return String(start != null ? start : '');
+    if (n && n > 1) {
+        return `${s}-${s + n - 1}`;
+    }
+    return String(s);
+}
+
+// --- Registry reconciliation lifecycle status presentation (v1.4 round 2) ---
+//
+// Explicit visual + tooltip semantics for EVERY registry reconciliation
+// lifecycle status the backend can report (see classifyRegistryMatch /
+// classifyRegistryMissing / registryStateExpectsBindMatch in registry.go,
+// and the OWNER_MISMATCH/OWNER_UNKNOWN outcomes in ports.go). Falling back
+// to a generic/blank presentation for a status this map doesn't recognize
+// would make correct backend semantics invisible to the operator -- keep
+// this in sync with every value those Go functions can produce. Kept here
+// (DOM-free, pure data) so completeness can be unit tested -- see
+// trust.test.js.
+//
+// `cls` names a `.reconcile-pill.<cls>` CSS class (see style.css); the
+// palette groups by meaning per the v1.4 hardening review:
+//   match      = green  (good / fulfilled as declared)
+//   undeclared = gray   (informational / expected absence)
+//   reserved   = cyan   (informational / currently running but not
+//                        ordinary permanent state)
+//   planned    = purple (informational future intent)
+//   missing    = amber  (attention: still permitted but flagged, or an
+//                        active declaration that isn't running)
+//   conflict   = red    (drift/problem: needs operator attention)
+//   host       = indigo (no registry involvement at all)
+export const RECONCILIATION_STATUS_META = {
+    MATCH: { label: 'MATCH', cls: 'match', tooltip: 'Matches the declared registry entry.' },
+    UNDECLARED: { label: 'UNDECLARED', cls: 'undeclared', tooltip: 'Running workload is not registered in the external registry.' },
+    DECLARED_MISSING: { label: 'MISSING', cls: 'missing', tooltip: 'Declared as active in the registry, but is not currently running.' },
+    DECLARED_ENDPOINT_MISMATCH: { label: 'BIND MISMATCH', cls: 'conflict', tooltip: 'The declared and observed bind addresses differ.' },
+    RESERVED_FREE: { label: 'RESERVED', cls: 'reserved', tooltip: 'Reserved in the registry and currently unused, as expected.' },
+    RESERVED_IN_USE: { label: 'RESERVED (IN USE)', cls: 'conflict', tooltip: 'Reserved in the registry, but something is occupying it.' },
+    PLANNED: { label: 'PLANNED', cls: 'planned', tooltip: 'Declared as a future/planned service; not expected to be running yet.' },
+    UNSCOPED: { label: 'UNSCOPED', cls: 'planned', tooltip: 'Registry record has no node scope; informational only.' },
+    REMOTE: { label: 'REMOTE', cls: 'planned', tooltip: 'Registry record belongs to a different node.' },
+    TEMPORARY_ACTIVE: { label: 'TEMPORARY', cls: 'reserved', tooltip: 'Declared as temporary and currently running -- not ordinary permanent active state.' },
+    TEMPORARY_MISSING: { label: 'TEMPORARY (IDLE)', cls: 'undeclared', tooltip: 'Declared as temporary and not currently running -- expected, not a fault.' },
+    DEPRECATED_ACTIVE: { label: 'DEPRECATED', cls: 'missing', tooltip: 'Still running, but marked deprecated in the registry and flagged for migration/removal.' },
+    DEPRECATED_MISSING: { label: 'DEPRECATED (IDLE)', cls: 'undeclared', tooltip: 'Marked deprecated in the registry and not currently running.' },
+    RETIRED_IN_USE: { label: 'RETIRED (IN USE)', cls: 'conflict', tooltip: 'Registry marks this endpoint retired, but it is still active -- useful drift information.' },
+    RETIRED_FREE: { label: 'RETIRED', cls: 'undeclared', tooltip: 'Registry marks this endpoint retired; it is correctly not running.' },
+    OWNER_MISMATCH: { label: 'OWNER MISMATCH', cls: 'conflict', tooltip: 'Endpoint matches the declaration, but the observed workload owner differs.' },
+    OWNER_UNKNOWN: { label: 'OWNER UNKNOWN', cls: 'conflict', tooltip: 'Endpoint matches the declaration, but the observed workload owner could not be confidently identified.' },
+};
+
+// reconcile-pill classes don't have a 1:1 twin in the status-pill palette
+// (status-pill has no 'match'/'undeclared'/'host' variant) -- this maps a
+// RECONCILIATION_STATUS_META class onto the closest status-pill class for
+// standalone registry-declared rows, which reuse the SAME status strings
+// as reconciliationStatus (see GetPortOverview's unmatched-declared loop in
+// ports.go).
+export const STATUS_PILL_CLASS_FOR_RECONCILE_CLASS = {
+    match: 'active', undeclared: 'stopped', host: 'stopped',
+    missing: 'missing', reserved: 'reserved', planned: 'planned', conflict: 'conflict'
+};
+
 // Case-insensitive fragments of environment variable / spec field names
 // treated as sensitive. Matching values are masked by default wherever a
 // spec or adoption preview is rendered, since a stored spec's Env map can

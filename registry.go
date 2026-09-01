@@ -28,6 +28,19 @@ type AppSettings struct {
 	// effective value falls back to os.Hostname() at resolution time (see
 	// resolveLocalNode), never to a hard-coded name.
 	LocalNode string `json:"localNode,omitempty"`
+	// ComposeTrustedRoots is an explicit, operator-configured allowlist of
+	// filesystem roots Podder is permitted to automatically read a Compose
+	// project file from during provenance-based discovery (InspectCompose).
+	// A container's own labels (working_dir, config_files) are a discovery
+	// HINT, never authorization: containment within the container-reported
+	// working directory alone is not sufficient (a malicious/malformed
+	// container could report working_dir=/etc, config_files=passwd).
+	// Automatic Compose file reading is disabled by default — the safe
+	// default is an empty list — until the operator explicitly approves at
+	// least one root here. Each root is canonicalized (cleaned,
+	// symlink-resolved where it exists) at check time; see
+	// FindComposeFile/composeFileWithinTrustedRoots.
+	ComposeTrustedRoots []string `json:"composeTrustedRoots,omitempty"`
 }
 
 // RegistryListener models the listener block of a registry port entry.
@@ -355,7 +368,12 @@ func validateAndFilterRegistryPorts(ports []RegistryPort) (valid []RegistryPort,
 	return valid, warnings
 }
 
-// LoadPortRegistry reads and parses an external registry file.
+// LoadPortRegistry reads and parses an external registry file. This is the
+// TOLERANT, DISPLAY/OBSERVATION-mode loader: a malformed entry is dropped
+// with a warning (see validateAndFilterRegistryPorts) and the rest of the
+// registry still loads — one bad record must never make the Ports tab go
+// blank. Never use this result to decide whether it is safe to mutate,
+// create, or adopt a workload; see LoadPortRegistryStrict for that.
 func (p *PodmanService) LoadPortRegistry(path string) (*PortRegistryResult, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -375,4 +393,158 @@ func (p *PodmanService) LoadPortRegistry(path string) (*PortRegistryResult, erro
 	}
 
 	return ParseRegistryYAML(data, path), nil
+}
+
+// LoadPortRegistryStrict loads and parses the registry exactly like
+// LoadPortRegistry, but is the FAIL-CLOSED, SAFETY/BLOCKING-mode
+// counterpart used wherever the registry is being consulted to gate a
+// destructive/safety-critical operation (port validation, free-port
+// selection, and everything that gates create/mutate/adopt — see
+// CollectBlockingClaimsStrict).
+//
+// Once an operator has explicitly enabled the registry as a source of port
+// safety truth, a malformed or ambiguous entry can never be silently
+// treated as irrelevant: the skipped record could have been exactly the
+// reservation that would have blocked this operation. So unlike the
+// tolerant display loader, ANY parse failure OR ANY dropped/invalid entry
+// (even alongside otherwise-valid ones) makes this fail with an error —
+// "unknown" must never be silently downgraded to "free".
+func (p *PodmanService) LoadPortRegistryStrict(path string) (*PortRegistryResult, error) {
+	result, err := p.LoadPortRegistry(path)
+	if err != nil {
+		return nil, err
+	}
+	if !result.Loaded {
+		return result, fmt.Errorf("port registry is enabled but failed to load: %s", result.Error)
+	}
+	if len(result.Warnings) > 0 {
+		return result, fmt.Errorf("registry cannot be safely enforced because it contains %d invalid/unsupported entry(ies) that could affect endpoint ownership/reservation safety: %s", len(result.Warnings), strings.Join(result.Warnings, "; "))
+	}
+	return result, nil
+}
+
+// registryWarnings nil-safely extracts the tolerant loader's per-entry
+// warnings for display, so GetPortOverview's summary can distinguish
+// "registry loaded cleanly" from "registry loaded for observation with N
+// invalid entries" (and, by extension, so the frontend can tell the
+// operator that safety-critical operations are blocked until they're
+// fixed — see LoadPortRegistryStrict).
+func registryWarnings(result *PortRegistryResult) []string {
+	if result == nil {
+		return nil
+	}
+	return result.Warnings
+}
+
+// classifyRegistryMatch computes the reconciliation status to report for a
+// registry-declared record that HAS a currently-observed runtime endpoint
+// (container port mapping or host listener) exactly fulfilling its
+// declaration (and, for states that assert live workload identity, whose
+// owner also matches — see findRegistryMatch in ports.go), and whether that
+// observation should count toward the "matched" (ordinary active-service)
+// summary bucket as opposed to some other lifecycle-specific bucket (e.g. a
+// reservation that is, notably, currently in use).
+//
+// Lifecycle semantics (explicit, not inferred from "not reserved/planned"):
+//
+//   - active/unrecognized: MATCH — this is the ordinary "declared and
+//     running" case, and the ONLY one counted toward registryMatch.
+//   - reserved: RESERVED_IN_USE — a reservation is expected to stay UNUSED;
+//     something occupying it is drift worth surfacing distinctly, never
+//     folded into ordinary MATCH.
+//   - planned: PLANNED — informational future intent; even if something
+//     already happens to occupy that endpoint, planned records never
+//     report anything but PLANNED (see the brief's lifecycle table).
+//   - temporary: TEMPORARY_ACTIVE — running, but explicitly not ordinary
+//     permanent active state. Informational, not counted as an ordinary
+//     match NOR as drift (a temporary declaration running is expected).
+//   - deprecated: DEPRECATED_ACTIVE — still permitted to exist, flagged for
+//     migration/removal. Counted as drift (registryStatusIsDrift), never as
+//     an ordinary match — conflating "deprecated but still running" with a
+//     clean MATCH would hide exactly the migration signal this state
+//     exists to surface.
+//   - retired: RETIRED_IN_USE — should no longer exist; a live match here
+//     is real, useful drift information (registryStatusIsDrift), never an
+//     ordinary match.
+func classifyRegistryMatch(state string) (status string, countsAsOrdinaryMatch bool) {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "reserved":
+		return "RESERVED_IN_USE", false
+	case "planned":
+		return "PLANNED", false
+	case "temporary":
+		return "TEMPORARY_ACTIVE", false
+	case "deprecated":
+		return "DEPRECATED_ACTIVE", false
+	case "retired":
+		return "RETIRED_IN_USE", false
+	default: // "active" and any future/unrecognized state default to active semantics.
+		return "MATCH", true
+	}
+}
+
+// classifyRegistryMissing computes the status to report for a
+// registry-declared record with NO currently-observed runtime endpoint
+// fulfilling it, and whether that absence is an actual operational fault
+// (as opposed to expected/informational absence). Only "active" (a service
+// declared to be currently running) is a fault when missing — "reserved" is
+// handled entirely by the caller via host-occupancy (RESERVED_FREE/
+// RESERVED_IN_USE), never routed through here.
+func classifyRegistryMissing(state string) (status string, isOperationalFault bool) {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "planned":
+		return "PLANNED", false
+	case "temporary":
+		return "TEMPORARY_MISSING", false
+	case "deprecated":
+		return "DEPRECATED_MISSING", false
+	case "retired":
+		return "RETIRED_FREE", false
+	default: // "active" and any future/unrecognized state default to active semantics.
+		return "DECLARED_MISSING", true
+	}
+}
+
+// registryStateExpectsBindMatch reports whether a registry-declared
+// record's lifecycle state carries a live "this should be running with
+// exactly this bind" expectation strong enough to make a bind-address
+// mismatch (same port/protocol/service, different address) worth surfacing
+// as DECLARED_ENDPOINT_MISMATCH. Reserved/planned records make no runtime
+// bind assertion at all, and retired records are expected to be gone
+// entirely (a bind difference is the least interesting thing about them
+// still running) — mismatch reporting is scoped to states that actually
+// assert current, exact runtime configuration.
+func registryStateExpectsBindMatch(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "active", "temporary", "deprecated":
+		return true
+	default:
+		return false
+	}
+}
+
+// registryStatusIsDrift reports whether a reconciliation status
+// (PortOverviewItem.ReconciliationStatus) represents a lifecycle-aware
+// operator-visible problem worth counting toward
+// PortOverviewSummary.RegistryDrift, as opposed to an ordinary match, a
+// reservation (already tracked by RegistryDrift's sibling
+// RegistryReserved/RESERVED_IN_USE badge), or a merely-informational
+// lifecycle status (PLANNED, TEMPORARY_ACTIVE/MISSING, DEPRECATED_MISSING,
+// RETIRED_FREE — none of these assert something is currently wrong).
+//
+// Explicit and separate from "ordinary MATCH" so a deprecated/retired
+// endpoint that is still running, an endpoint whose bind differs from what
+// was declared, or one occupied by the wrong workload entirely, can never
+// be silently folded into the plain "registryMatch" metric — see
+// classifyRegistryMatch's countsAsOrdinaryMatch, which already excludes
+// these, and findRegistryOwnerMismatch/findRegistryBindMismatch in
+// ports.go, which produce OWNER_MISMATCH/OWNER_UNKNOWN/
+// DECLARED_ENDPOINT_MISMATCH.
+func registryStatusIsDrift(status string) bool {
+	switch status {
+	case "DEPRECATED_ACTIVE", "RETIRED_IN_USE", "OWNER_MISMATCH", "OWNER_UNKNOWN", "DECLARED_ENDPOINT_MISMATCH":
+		return true
+	default:
+		return false
+	}
 }

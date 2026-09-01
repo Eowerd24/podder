@@ -85,7 +85,7 @@ type inspectContainer struct {
 		Devices     []struct {
 			PathOnHost string `json:"PathOnHost"`
 		} `json:"Devices"`
-		AutoRemove bool `json:"AutoRemove"`
+		AutoRemove bool   `json:"AutoRemove"`
 		Memory     int64  `json:"Memory"`
 		NanoCpus   int64  `json:"NanoCpus"`
 		CpusetCpus string `json:"CpusetCpus"`

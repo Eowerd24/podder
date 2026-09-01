@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -98,19 +99,62 @@ func classifyLifecycle(state string) (kind string, supported bool) {
 	}
 }
 
+// validComposeServiceNamePattern is a conservative grammar for Compose
+// service identifiers Podder will safely emit as a plain, unquoted YAML
+// mapping key in generated guidance snippets — it matches the Compose
+// specification's own service-name constraint (`^[a-zA-Z0-9._-]+$`), so any
+// real, spec-valid Compose service name is accepted. A provenance-derived
+// value that falls outside this grammar is refused rather than guessed at:
+// the value can originate from external, attacker-influenceable container
+// labels, and inserting it unvalidated into a YAML mapping key could
+// otherwise inject additional YAML structure into guidance the operator is
+// expected to copy/paste as-is.
+var validComposeServiceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// validateComposeServiceIdentifier reports whether serviceName can be
+// safely represented as a plain YAML mapping key by GenerateComposeSnippet.
+func validateComposeServiceIdentifier(serviceName string) error {
+	if serviceName == "" {
+		return fmt.Errorf("compose service name is empty")
+	}
+	// Checked explicitly (not just left to the anchored regex) so the
+	// rejection reason is unambiguous regardless of regexp engine
+	// multiline/anchor subtleties around embedded newlines.
+	if strings.ContainsAny(serviceName, "\n\r\x00") {
+		return fmt.Errorf("compose service name %q contains a disallowed control character and cannot be safely represented in a generated snippet", serviceName)
+	}
+	if !validComposeServiceNamePattern.MatchString(serviceName) {
+		return fmt.Errorf("compose service name %q cannot be safely represented in a generated snippet", serviceName)
+	}
+	return nil
+}
+
 // GenerateComposeSnippet formats the proposed port mappings for a docker-compose.yml file.
 // Callers must pass the container's actual, confidently-identified Compose
 // service name — never a generic placeholder — since a snippet keyed under
 // the wrong service could be pasted into the wrong place in the compose
 // file. If the real service identity can't be determined, callers must
 // state that instead of calling this with an invented name.
-func GenerateComposeSnippet(serviceName string, ports []PortMapping) string {
+//
+// serviceName is validated (validateComposeServiceIdentifier) before it is
+// ever concatenated into the generated YAML text: it commonly originates
+// from external Compose provenance labels, which are not trusted input, and
+// must never be able to inject additional YAML structure (a fake mapping
+// key, a newline starting a new top-level key, ...) into guidance the
+// operator is expected to paste verbatim into their real compose file. A
+// name that fails validation is refused outright — never silently
+// sanitized into a different identity, which could paste correctly but
+// under the wrong service.
+func GenerateComposeSnippet(serviceName string, ports []PortMapping) (string, error) {
+	if err := validateComposeServiceIdentifier(serviceName); err != nil {
+		return "", err
+	}
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("services:\n  %s:\n    ports:\n", serviceName))
 	for _, m := range ports {
 		sb.WriteString(fmt.Sprintf("      - \"%s\"\n", FormatPublishSpec(m)))
 	}
-	return sb.String()
+	return sb.String(), nil
 }
 
 // GenerateQuadletSnippet formats the proposed port mappings for a systemd .container file.
@@ -121,6 +165,25 @@ func GenerateQuadletSnippet(ports []PortMapping) string {
 		sb.WriteString(fmt.Sprintf("PublishPort=%s\n", FormatPublishSpec(m)))
 	}
 	return sb.String()
+}
+
+// PreviewComposeSnippet is the bound method the frontend must call to
+// render a Compose ports: snippet for display/copy — including live preview
+// while an operator is still adjusting the desired port rows before
+// generating the final snippet. This exists specifically so the frontend
+// NEVER hand-formats a Podman/Compose port publish spec itself: the same
+// canonical formatter (FormatPublishSpec, via GenerateComposeSnippet) used
+// for actual mutation guidance is used here, so omitted-bind handling,
+// IPv6 bracketing, port ranges, and protocol formatting can never drift
+// between a "live preview" string built in JavaScript and the real one.
+func (p *PodmanService) PreviewComposeSnippet(serviceName string, ports []PortMapping) (string, error) {
+	return GenerateComposeSnippet(strings.TrimSpace(serviceName), ports)
+}
+
+// PreviewQuadletSnippet is the PreviewComposeSnippet counterpart for a
+// systemd Quadlet .container unit's PublishPort= lines.
+func (p *PodmanService) PreviewQuadletSnippet(ports []PortMapping) (string, error) {
+	return GenerateQuadletSnippet(ports), nil
 }
 
 func randomHex(n int) string {
@@ -141,7 +204,15 @@ func newBackupName(containerName string) string {
 }
 
 // findContainerByIdentity locates a container by ID (or ID prefix) or by
-// exact name among a slice already fetched via ListContainers.
+// exact name among a slice already fetched via ListContainers. This is a
+// convenience resolver for non-safety-critical paths (CLI-style identity
+// arguments, mutation/verify flows that already know the exact ID and are
+// merely re-locating it in a fresh listing, etc). It does NOT prove
+// uniqueness of a prefix match — it returns the first container whose ID
+// happens to start with the given string. Safety-critical callers that
+// receive their identity argument directly from the GUI (which always has
+// the full ID) must use findContainerByExactID instead; see
+// GetContainerPortEditState.
 func findContainerByIdentity(containers []Container, identity string) *Container {
 	for i := range containers {
 		c := &containers[i]
@@ -155,6 +226,84 @@ func findContainerByIdentity(containers []Container, identity string) *Container
 		}
 	}
 	return nil
+}
+
+// findContainerByExactID locates a container by EXACT ID match only — no
+// prefix resolution, no name resolution. Used by safety-critical callers
+// that already hold (or must be given) the full container ID and have no
+// legitimate reason to accept a fuzzier identity: an ID prefix could match
+// more than one container as the container list changes, and a name could
+// be reused after a container is removed and recreated, so unlike
+// findContainerByIdentity neither is treated as "unambiguous enough" here.
+func findContainerByExactID(containers []Container, id string) *Container {
+	for i := range containers {
+		if containers[i].Id == id {
+			return &containers[i]
+		}
+	}
+	return nil
+}
+
+// ContainerPortEditState is the single authoritative source a port editor
+// (container-card path or Ports-tab path — there is deliberately only ONE
+// way to open it now) must populate itself from before allowing an edit.
+// Caller-supplied cached data (e.g. from a list rendered a few seconds ago)
+// must never be trusted as the editable state: it can be stale, or — as the
+// Ports-tab path used to do — simply empty, which would make a workload
+// with real published ports look like it has none and let an operator
+// submit a replacement configuration without ever seeing what they were
+// about to remove.
+type ContainerPortEditState struct {
+	ContainerID   string             `json:"containerId"`
+	ContainerName string             `json:"containerName"`
+	Provenance    WorkloadProvenance `json:"provenance"`
+	PortMappings  []PortMapping      `json:"portMappings"`
+}
+
+// GetContainerPortEditState resolves a container by EXACT ID ONLY (see
+// findContainerByExactID — no name or ID-prefix resolution) and returns its
+// CURRENT backend-observed provenance and port mappings. This is the one
+// method the port editor must call before presenting anything editable; a
+// caller that cannot resolve the container gets an explicit error rather
+// than a same-shaped-but-empty result that could be silently treated as "no
+// ports configured".
+//
+// Identity resolution is deliberately strict here: the GUI always has the
+// full container ID by the time it opens the editor, so there is no
+// legitimate reason for this safety-critical lookup to accept a fuzzier
+// identity — an ID prefix is not proven unique, and a name can be reused
+// after the container it named is removed and recreated. Either could
+// silently point the editor at the wrong container.
+func (p *PodmanService) GetContainerPortEditState(containerID string) (*ContainerPortEditState, error) {
+	containerID = strings.TrimSpace(containerID)
+	if containerID == "" {
+		return nil, fmt.Errorf("container id cannot be empty")
+	}
+
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect local containers: %w", err)
+	}
+
+	target := findContainerByExactID(containers, containerID)
+	if target == nil {
+		return nil, fmt.Errorf("container %s not found (exact ID match required)", containerID)
+	}
+
+	name := "unnamed"
+	if len(target.Names) > 0 {
+		name = strings.TrimPrefix(target.Names[0], "/")
+	}
+
+	mappings := make([]PortMapping, len(target.PortMappings))
+	copy(mappings, target.PortMappings)
+
+	return &ContainerPortEditState{
+		ContainerID:   target.Id,
+		ContainerName: name,
+		Provenance:    target.Provenance,
+		PortMappings:  mappings,
+	}, nil
 }
 
 // findContainerByName locates a container by exact name.
@@ -239,11 +388,15 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		// The generated snippet must name the container's ACTUAL Compose
 		// service — a generic placeholder key could be pasted under the
 		// wrong service entirely. If the label evidence didn't actually
-		// include a service name, state that plainly instead of guessing.
-		if strings.TrimSpace(prov.Service) != "" {
-			result.ComposeSnippet = GenerateComposeSnippet(prov.Service, req.NewPorts)
+		// include a service name, or the reported name cannot be safely
+		// represented as a YAML mapping key (see
+		// validateComposeServiceIdentifier — the label is external,
+		// untrusted input), state that plainly instead of guessing or
+		// injecting unvalidated content into the generated snippet.
+		if snippet, err := GenerateComposeSnippet(prov.Service, req.NewPorts); err == nil {
+			result.ComposeSnippet = snippet
 		} else {
-			result.Guidance += " The Compose service identity for this container could not be safely determined, so no snippet was generated; update your compose file's ports: for the correct service manually."
+			result.Guidance += " The Compose service identity for this container could not be safely determined or represented, so no snippet was generated; update your compose file's ports: for the correct service manually."
 		}
 		result.Steps = append(result.Steps, PortMutationStepResult{
 			Step: "PREFLIGHT", Passed: false,
@@ -625,17 +778,23 @@ func pollUntil(attempts int, interval time.Duration, check func() bool) bool {
 	return false
 }
 
-// portMappingSetEqual compares two port mapping sets for exact equality
-// (as sets, ignoring order), so a mutation can prove that the removed
-// mappings are actually gone and the new ones are actually configured —
-// not merely that the container reports "running".
+// portMappingSetEqual compares two port mapping sets for exact DECLARED
+// equality (as sets, ignoring order), so a mutation can prove that the
+// removed mappings are actually gone and the new ones are actually
+// configured exactly as declared — not merely that the container reports
+// "running", and not merely that the new bind would avoid a socket
+// conflict with the old one. This is a declared-endpoint comparison
+// (CanonicalDeclaredBind), never a conflict/allocation-safety comparison
+// (AddressesConflict/NormalizeAddress/EndpointsConflict) — those answer a
+// different question ("could these collide"), not "is this the exact
+// configuration that was declared".
 func portMappingSetEqual(want, got []PortMapping) (ok bool, missing, unexpected []PortMapping) {
 	key := func(m PortMapping) string {
 		rangeSize := m.RangeSize
 		if rangeSize <= 1 {
 			rangeSize = 1
 		}
-		return fmt.Sprintf("%s|%d|%d|%d|%s", NormalizeAddress(m.HostIP), m.HostPort, m.ContainerPort, rangeSize, NormalizeProtocol(m.Protocol))
+		return fmt.Sprintf("%s|%d|%d|%d|%s", CanonicalDeclaredBind(m.HostIP), m.HostPort, m.ContainerPort, rangeSize, NormalizeProtocol(m.Protocol))
 	}
 	wantSet := make(map[string]PortMapping, len(want))
 	for _, m := range want {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +25,10 @@ func TestGenerateComposeSnippet(t *testing.T) {
 		},
 	}
 
-	snippet := GenerateComposeSnippet("web-service", ports)
+	snippet, err := GenerateComposeSnippet("web-service", ports)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !strings.Contains(snippet, "web-service:") {
 		t.Errorf("expected service name in snippet, got: %s", snippet)
 	}
@@ -35,6 +39,76 @@ func TestGenerateComposeSnippet(t *testing.T) {
 	// generated guidance, not silently canonicalized into an omitted bind.
 	if !strings.Contains(snippet, `"0.0.0.0:5353:5353/udp"`) {
 		t.Errorf("expected explicit wildcard port preserved in snippet, got: %s", snippet)
+	}
+}
+
+// --- v1.4 hardening round 2: Compose service name must be validated before
+// being emitted into generated YAML (finding 4). The identity commonly
+// originates from external, attacker-influenceable Compose provenance
+// labels and must never be able to inject additional YAML structure into
+// guidance the operator is expected to paste verbatim. ---
+
+func TestGenerateComposeSnippet_ValidServiceNamesAccepted(t *testing.T) {
+	ports := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	valid := []string{"flowise", "foo-bar", "foo_bar", "foo.bar", "Web123", "a"}
+	for _, name := range valid {
+		snippet, err := GenerateComposeSnippet(name, ports)
+		if err != nil {
+			t.Errorf("expected valid service name %q to be accepted, got error: %v", name, err)
+			continue
+		}
+		if !strings.Contains(snippet, name+":") {
+			t.Errorf("expected snippet to contain %q as a mapping key, got: %s", name+":", snippet)
+		}
+	}
+}
+
+func TestGenerateComposeSnippet_HostileServiceNamesRejected(t *testing.T) {
+	ports := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	hostile := []string{
+		"",
+		"foo:\n  evil: true",
+		"foo\nother:",
+		"foo: bar",
+		"foo\r\nbar:",
+		"foo bar",   // space
+		"foo:bar",   // colon
+		"../escape", // path-like, also has '/'
+		"foo\x00bar",
+	}
+	for _, name := range hostile {
+		snippet, err := GenerateComposeSnippet(name, ports)
+		if err == nil {
+			t.Errorf("expected hostile service name %q to be rejected, got snippet: %q", name, snippet)
+		}
+		if snippet != "" {
+			t.Errorf("expected no snippet content on rejection for %q, got: %q", name, snippet)
+		}
+	}
+}
+
+// TestGenerateComposeSnippet_HostileNameNeverInjectsYAMLStructure is a
+// stronger end-to-end check: even if a hostile name were somehow accepted,
+// the resulting text must never parse as YAML with more top-level keys
+// under "services" than the one intended service. Since hostile names are
+// rejected outright, this instead proves the rejected snippet is genuinely
+// empty (no partial/injected content leaks out).
+func TestGenerateComposeSnippet_HostileNameNeverInjectsYAMLStructure(t *testing.T) {
+	ports := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	snippet, err := GenerateComposeSnippet("foo:\n  evil: true\nservices:\n  another", ports)
+	if err == nil {
+		t.Fatalf("expected a hostile multi-line service name to be rejected")
+	}
+	if strings.Contains(snippet, "evil") || strings.Contains(snippet, "another") {
+		t.Fatalf("expected no injected structure to leak into snippet output, got: %q", snippet)
+	}
+}
+
+func TestPreviewComposeSnippet_RejectsHostileServiceName(t *testing.T) {
+	svc := &PodmanService{}
+	_, err := svc.PreviewComposeSnippet("foo:\n  evil: true", []PortMapping{{ContainerPort: 80, Protocol: "tcp"}})
+	if err == nil {
+		t.Errorf("expected PreviewComposeSnippet to reject a hostile service name")
 	}
 }
 
@@ -54,6 +128,75 @@ func TestGenerateQuadletSnippet(t *testing.T) {
 	}
 	if !strings.Contains(snippet, "PublishPort=127.0.0.1:3000:3000/tcp") {
 		t.Errorf("expected PublishPort line, got: %s", snippet)
+	}
+}
+
+// --- v1.4 hardening: RangeSize must survive into generated snippets ---
+// (item 2 requires Compose/Quadlet snippet generation to retain ranges; the
+// "one formatter rule" requires this to go through FormatPublishSpec, never
+// a hand-built JS/Go string, so a range-losing regression here would be a
+// real correctness bug, not just a display nit.)
+
+func TestGenerateComposeSnippet_RetainsPortRange(t *testing.T) {
+	ports := []PortMapping{{HostIP: "", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}}
+	snippet, err := GenerateComposeSnippet("ranged-service", ports)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(snippet, `"8000-8005:9000-9005/tcp"`) {
+		t.Errorf("expected full port range preserved in compose snippet, got: %s", snippet)
+	}
+	if strings.Contains(snippet, `"8000:9000/tcp"`) {
+		t.Errorf("range must not be silently collapsed to a single port: %s", snippet)
+	}
+}
+
+func TestGenerateQuadletSnippet_RetainsPortRange(t *testing.T) {
+	ports := []PortMapping{{HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "udp", RangeSize: 6}}
+	snippet := GenerateQuadletSnippet(ports)
+	if !strings.Contains(snippet, "PublishPort=0.0.0.0:8000-8005:9000-9005/udp") {
+		t.Errorf("expected full port range preserved in quadlet snippet, got: %s", snippet)
+	}
+}
+
+// --- v1.4 hardening: backend snippet-generation bound methods (item 4) ---
+// The frontend must never hand-format Podman/Compose/Quadlet port syntax;
+// PreviewComposeSnippet/PreviewQuadletSnippet are the bound methods it
+// calls instead, going through the same canonical FormatPublishSpec.
+
+func TestPreviewComposeSnippet_RequiresServiceName(t *testing.T) {
+	svc := &PodmanService{}
+	if _, err := svc.PreviewComposeSnippet("", []PortMapping{{ContainerPort: 80, Protocol: "tcp"}}); err == nil {
+		t.Errorf("expected an error when no compose service name is available, never a snippet keyed under an invented name")
+	}
+}
+
+func TestPreviewComposeSnippet_MatchesGenerateComposeSnippet(t *testing.T) {
+	svc := &PodmanService{}
+	ports := []PortMapping{{HostIP: "", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}}
+	got, err := svc.PreviewComposeSnippet("flowise", ports)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want, wantErr := GenerateComposeSnippet("flowise", ports)
+	if wantErr != nil {
+		t.Fatalf("unexpected error: %v", wantErr)
+	}
+	if got != want {
+		t.Errorf("PreviewComposeSnippet diverged from GenerateComposeSnippet:\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestPreviewQuadletSnippet_MatchesGenerateQuadletSnippet(t *testing.T) {
+	svc := &PodmanService{}
+	ports := []PortMapping{{HostIP: "::", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 3}}
+	got, err := svc.PreviewQuadletSnippet(ports)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := GenerateQuadletSnippet(ports)
+	if got != want {
+		t.Errorf("PreviewQuadletSnippet diverged from GenerateQuadletSnippet:\ngot:  %s\nwant: %s", got, want)
 	}
 }
 
@@ -582,6 +725,49 @@ func TestPortMappingSetEqual(t *testing.T) {
 	}
 }
 
+// TestPortMappingSetEqual_OmittedBindIsNotSameDeclarationAsExplicitWildcard
+// is the exact v1.4 regression this hardening pass closes: portMappingSetEqual
+// previously keyed on NormalizeAddress (conflict-oriented normalization),
+// which folds an omitted host bind ("") and an explicit "0.0.0.0" together.
+// That let a declared spec with an omitted bind silently "verify" against a
+// runtime mapping that was actually configured with an explicit wildcard
+// (or vice versa) — a real configuration discrepancy that must be reported,
+// not hidden by treating the two as the same set member.
+func TestPortMappingSetEqual_OmittedBindIsNotSameDeclarationAsExplicitWildcard(t *testing.T) {
+	declaredOmitted := []PortMapping{{HostIP: "", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	observedExplicitWildcard := []PortMapping{{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+
+	ok, missing, unexpected := portMappingSetEqual(declaredOmitted, observedExplicitWildcard)
+	if ok {
+		t.Fatalf("expected an omitted declared bind and an explicit 0.0.0.0 observed bind to NOT be treated as the same declaration")
+	}
+	if len(missing) != 1 || len(unexpected) != 1 {
+		t.Errorf("expected exactly one missing (declared) and one unexpected (observed) mapping, got missing=%v unexpected=%v", missing, unexpected)
+	}
+
+	// An exact match on both sides (same declared form) must still verify.
+	if ok, _, _ := portMappingSetEqual(declaredOmitted, declaredOmitted); !ok {
+		t.Errorf("expected an identical omitted-bind set to compare equal to itself")
+	}
+	explicitBoth := []PortMapping{{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	if ok, _, _ := portMappingSetEqual(observedExplicitWildcard, explicitBoth); !ok {
+		t.Errorf("expected identical explicit-wildcard sets to compare equal")
+	}
+}
+
+func TestPortMappingSetEqual_RangeSizeIsPartOfIdentity(t *testing.T) {
+	a := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}}
+	sameRange := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6}}
+	collapsedToSinglePort := []PortMapping{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp"}}
+
+	if ok, _, _ := portMappingSetEqual(a, sameRange); !ok {
+		t.Errorf("expected identical ranged mappings to compare equal")
+	}
+	if ok, _, _ := portMappingSetEqual(a, collapsedToSinglePort); ok {
+		t.Errorf("expected a range silently collapsed to a single port to be reported as a mismatch, not verified as equal")
+	}
+}
+
 func TestClassifyLifecycle(t *testing.T) {
 	if kind, ok := classifyLifecycle("running"); kind != lifecycleRunning || !ok {
 		t.Errorf("expected running to classify as supported/running")
@@ -710,5 +896,171 @@ func TestHealthStartingThenUnhealthyTriggersRollback(t *testing.T) {
 	}
 	if result.Success || result.Rollback == nil || !result.Rollback.Verified {
 		t.Fatalf("final unhealthy state must fail and rollback the transaction: %+v", result)
+	}
+}
+
+// --- v1.4 hardening: GetContainerPortEditState (item 1) ---
+//
+// This is the ONE backend method the port editor now uses to populate
+// itself, resolving fresh state by exact container ID regardless of which
+// UI entry point (container-card action or Ports-tab action) opened it.
+// The bug this closes: the container-card path used to pass its cached
+// mappings into the editor while the Ports-tab path passed `[]`, so the
+// exact same Podder-managed workload could appear to have real published
+// ports or none at all depending on which button was clicked.
+
+func TestGetContainerPortEditState_ReturnsFreshMappings(t *testing.T) {
+	ports := []PortMapping{
+		{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", RangeSize: 1},
+		{HostIP: "0.0.0.0", HostPort: 8000, ContainerPort: 9000, Protocol: "tcp", RangeSize: 6},
+	}
+	psJSON := `[{"Id":"deadbeefcafe0000000000000000000000000001","Names":["web-app"],"Image":"nginx:latest","ImageID":"sha256:abc","State":"running","Ports":[` +
+		`{"host_ip":"127.0.0.1","host_port":8080,"container_port":80,"protocol":"tcp","range":1},` +
+		`{"host_ip":"0.0.0.0","host_port":8000,"container_port":9000,"protocol":"tcp","range":6}` +
+		`],"Labels":{"io.podder.managed":"true","io.podder.service":"web-app","io.podder.schema-version":"2"}}]`
+
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	svc := &PodmanService{runner: runner}
+
+	state, err := svc.GetContainerPortEditState("deadbeefcafe0000000000000000000000000001")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if state.ContainerName != "web-app" {
+		t.Errorf("expected container name web-app, got %q", state.ContainerName)
+	}
+	if state.Provenance.Type != "podder" {
+		t.Errorf("expected podder provenance, got %+v", state.Provenance)
+	}
+	if !reflect.DeepEqual(state.PortMappings, ports) {
+		t.Fatalf("expected fresh backend-observed port mappings %+v, got %+v", ports, state.PortMappings)
+	}
+	// A second call must not return a mapping slice that aliases the first
+	// call's backing array (defensive copy, not a shared cache reference).
+	state.PortMappings[0].HostPort = 1
+	state2, err := svc.GetContainerPortEditState("deadbeefcafe0000000000000000000000000001")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if state2.PortMappings[0].HostPort != 8080 {
+		t.Errorf("expected mutating a previously returned edit state to not affect a fresh fetch, got %+v", state2.PortMappings[0])
+	}
+}
+
+func TestGetContainerPortEditState_UnknownContainerFailsVisibly(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return "[]", "", nil })
+	svc := &PodmanService{runner: runner}
+
+	if _, err := svc.GetContainerPortEditState("does-not-exist"); err == nil {
+		t.Fatalf("expected an error for an unresolvable container, never a same-shaped empty result the UI could mistake for 'no ports configured'")
+	}
+}
+
+func TestGetContainerPortEditState_EmptyIDRejected(t *testing.T) {
+	svc := &PodmanService{runner: newFakeCommandRunner()}
+	if _, err := svc.GetContainerPortEditState(""); err == nil {
+		t.Fatalf("expected an empty container id to be rejected")
+	}
+}
+
+func TestGetContainerPortEditState_InspectFailureFailsRatherThanBlank(t *testing.T) {
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) {
+		return "", "podman: connection refused", fmt.Errorf("exit status 1")
+	})
+	svc := &PodmanService{runner: runner}
+
+	if _, err := svc.GetContainerPortEditState("some-container"); err == nil {
+		t.Fatalf("expected a failed backend inspection to surface as an error, not a blank editable state")
+	}
+}
+
+// --- v1.4 hardening round 2: GetContainerPortEditState requires an EXACT
+// container ID, never a prefix or a name (finding 5) ---
+
+func newFullIDPortEditFixture() (*fakeCommandRunner, string) {
+	const fullID = "deadbeefcafe0000000000000000000000000001"
+	psJSON := `[{"Id":"` + fullID + `","Names":["web-app"],"Image":"nginx:latest","ImageID":"sha256:abc","State":"running","Ports":[` +
+		`{"host_ip":"127.0.0.1","host_port":8080,"container_port":80,"protocol":"tcp","range":1}` +
+		`],"Labels":{"io.podder.managed":"true","io.podder.service":"web-app","io.podder.schema-version":"2"}}]`
+	runner := newFakeCommandRunner()
+	runner.On("podman ps", func(n string, args []string) (string, string, error) { return psJSON, "", nil })
+	return runner, fullID
+}
+
+func TestGetContainerPortEditState_ExactFullIDSucceeds(t *testing.T) {
+	runner, fullID := newFullIDPortEditFixture()
+	svc := &PodmanService{runner: runner}
+
+	state, err := svc.GetContainerPortEditState(fullID)
+	if err != nil {
+		t.Fatalf("expected the exact full container ID to resolve, got: %v", err)
+	}
+	if state.ContainerID != fullID {
+		t.Errorf("expected ContainerID %q, got %q", fullID, state.ContainerID)
+	}
+}
+
+func TestGetContainerPortEditState_IDPrefixRejected(t *testing.T) {
+	runner, fullID := newFullIDPortEditFixture()
+	svc := &PodmanService{runner: runner}
+
+	prefix := fullID[:12] // a valid, non-empty, unambiguous-looking short prefix
+	if _, err := svc.GetContainerPortEditState(prefix); err == nil {
+		t.Fatalf("expected an ID prefix to be rejected by this safety-critical lookup, which requires an exact ID")
+	}
+}
+
+func TestGetContainerPortEditState_NameRejected(t *testing.T) {
+	runner, _ := newFullIDPortEditFixture()
+	svc := &PodmanService{runner: runner}
+
+	if _, err := svc.GetContainerPortEditState("web-app"); err == nil {
+		t.Fatalf("expected a container NAME to be rejected by this safety-critical lookup, which requires an exact ID")
+	}
+}
+
+func TestGetContainerPortEditState_UnknownExactIDRejected(t *testing.T) {
+	runner, _ := newFullIDPortEditFixture()
+	svc := &PodmanService{runner: runner}
+
+	if _, err := svc.GetContainerPortEditState("0000000000000000000000000000000000009999"); err == nil {
+		t.Fatalf("expected an unknown exact ID to be rejected")
+	}
+}
+
+// findContainerByIdentity (the fuzzier, non-safety-critical resolver) must
+// still accept a prefix/name for its other, non-safety-critical callers —
+// this pins its unchanged behavior so it isn't accidentally tightened (or
+// loosened) alongside the GetContainerPortEditState fix.
+func TestFindContainerByIdentity_StillAcceptsPrefixAndName(t *testing.T) {
+	containers := []Container{
+		{Id: "deadbeefcafe0000000000000000000000000001", Names: []string{"/web-app"}},
+	}
+	if c := findContainerByIdentity(containers, "deadbeefcafe0000000000000000000000000001"); c == nil {
+		t.Errorf("expected exact ID to resolve")
+	}
+	if c := findContainerByIdentity(containers, "deadbeefcafe"); c == nil {
+		t.Errorf("expected ID prefix to still resolve via findContainerByIdentity")
+	}
+	if c := findContainerByIdentity(containers, "web-app"); c == nil {
+		t.Errorf("expected name to still resolve via findContainerByIdentity")
+	}
+}
+
+func TestFindContainerByExactID_RejectsPrefixAndName(t *testing.T) {
+	containers := []Container{
+		{Id: "deadbeefcafe0000000000000000000000000001", Names: []string{"/web-app"}},
+	}
+	if c := findContainerByExactID(containers, "deadbeefcafe0000000000000000000000000001"); c == nil {
+		t.Errorf("expected exact ID to resolve")
+	}
+	if c := findContainerByExactID(containers, "deadbeefcafe"); c != nil {
+		t.Errorf("expected a prefix to be rejected by findContainerByExactID, got %+v", c)
+	}
+	if c := findContainerByExactID(containers, "web-app"); c != nil {
+		t.Errorf("expected a name to be rejected by findContainerByExactID, got %+v", c)
 	}
 }

@@ -359,7 +359,75 @@ func AnalyzeExposureTransition(oldAddress, newAddress string) ExposureTransition
 // only bound 127.0.0.1:3000 (and vice versa) — the two would conflict at the
 // socket layer if both tried to bind, but they are not the same declaration,
 // and treating them as a match would hide a real "the service is bound more
-// narrowly/broadly than the registry says" discrepancy.
+// narrowly/broadly than the registry says" discrepancy. This is a thin,
+// semantically-named wrapper over DeclaredEndpointsEquivalent — see that
+// function for the actual canonicalization rule, which (unlike
+// NormalizeAddress) never collapses an omitted host address into an
+// explicit "0.0.0.0".
 func EndpointsEquivalentForReconciliation(addrA, addrB string) bool {
-	return strings.EqualFold(NormalizeAddress(addrA), NormalizeAddress(addrB))
+	return DeclaredEndpointsEquivalent(addrA, addrB)
+}
+
+// CanonicalDeclaredBind returns a canonical string form of a declared bind
+// address for EXACT declared-endpoint comparison — the counterpart of
+// NormalizeAddress, which is deliberately built for the opposite job
+// (conflict/allocation-safety detection, where an omitted bind, "0.0.0.0",
+// and "*" all mean "collides with everything" and are folded together on
+// purpose).
+//
+// CanonicalDeclaredBind only folds together representations that are
+// textually/syntactically the SAME address: case, IPv6 brackets/zone IDs,
+// and the "*"/"localhost" shorthands some internal sources (host-listener
+// parsing, CLI convention) use for a real address. It never folds together
+// representations that are conceptually DISTINCT declarations:
+//
+//   - an omitted host address ("")  -- distinct from an explicit wildcard
+//   - "0.0.0.0"  (IPv4 wildcard)    -- distinct from omitted and from "::"
+//   - "::"       (IPv6 wildcard)    -- distinct from "0.0.0.0"
+//   - "127.0.0.1" (IPv4 loopback)   -- distinct from "::1"
+//   - "::1"      (IPv6 loopback)    -- distinct from "127.0.0.1"
+//   - any other specific address    -- distinct from every other address
+//
+// Whether two of these actually behave identically on a real Podman host
+// (e.g. whether an omitted bind is reported back by `podman inspect` as ""
+// or as "0.0.0.0") is exactly the kind of runtime fact this pre-integration
+// hardening pass does not assume — see the real rootless-Podman integration
+// campaign this pass gates. Until proven otherwise, they are kept distinct
+// here so no comparison silently discards the operator's declared intent.
+func CanonicalDeclaredBind(addr string) string {
+	cleaned := strings.TrimSpace(addr)
+	cleaned = strings.Trim(cleaned, "[]")
+	if idx := strings.Index(cleaned, "%"); idx != -1 {
+		cleaned = cleaned[:idx]
+	}
+	if cleaned == "" {
+		// Omitted/default — distinct from every explicit address, including
+		// an explicit wildcard.
+		return ""
+	}
+	if cleaned == "*" {
+		// Internal shorthand used by host-listener (ss) parsing for "all
+		// interfaces"; ss itself never distinguishes an omitted bind from an
+		// explicit one, so this always means the IPv4 wildcard form.
+		return "0.0.0.0"
+	}
+	if strings.EqualFold(cleaned, "localhost") {
+		return "127.0.0.1"
+	}
+	if ip := net.ParseIP(cleaned); ip != nil {
+		return ip.String()
+	}
+	return strings.ToLower(cleaned)
+}
+
+// DeclaredEndpointsEquivalent reports whether two bind-address declarations
+// express EXACTLY the same intent. Use this (never AddressesConflict/
+// EndpointsConflict) wherever the question is "are these two
+// configurations/declarations the same" rather than "would these two
+// sockets collide if both tried to bind" — e.g. comparing a candidate spec
+// against Podman's runtime-observed configuration, or one declared endpoint
+// against another. See CanonicalDeclaredBind for exactly which
+// representations are folded together.
+func DeclaredEndpointsEquivalent(a, b string) bool {
+	return CanonicalDeclaredBind(a) == CanonicalDeclaredBind(b)
 }

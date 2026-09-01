@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.4.2] - 2026-09-01
 
 Podder v1.4 — pre-integration hardening pass. This pass closes a set of
 remaining static correctness, safety, trust-boundary, and UX-contract
@@ -192,11 +192,12 @@ Deliberately deferred, unrelated to the integration gate:
 - Production-readiness validation (beyond this static hardening series) has
   not been performed.
 
-### Earlier in this Unreleased series: v1.3.0 post-audit corrective pass
+### Also included in this release: v1.3.0 post-audit corrective pass
 
-The following changes were made in an earlier, still-unreleased corrective
-pass on the v1.3.0 hardening work (this is the `46f8325` baseline the v1.4
-pre-integration hardening pass above builds on):
+The following changes were made in an earlier corrective pass on the
+v1.3.0 hardening work (this is the `46f8325` baseline the v1.4
+pre-integration hardening pass above builds on), previously unreleased and
+now shipping together with the v1.4 work above as part of 1.4.2:
 
 - Normal image deletion (`RemoveImage`) no longer passes `podman rmi --force`: it refuses when the image is in use by a container instead of silently deleting that container.
 - Adoption blocks containers using `--rm`/`AutoRemove` (stopping the original to adopt it would destroy the rollback source).

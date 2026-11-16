@@ -2,7 +2,7 @@
 
 Notable product changes are listed by version. Historical entries describe the scope of that version; see the README for current behavior and limitations.
 
-## [Unreleased]
+## [1.5.7] - 2026-11-16 — Newer Podman compatibility
 
 - Accept narrowly checked neutral Podman inspect defaults during adoption while continuing to reject unsupported workload settings.
 - Accept exposed-port metadata only when exact published mappings represent every declared port.

@@ -1,0 +1,4 @@
+# Maintainer PUBLIC SSH signing keys; private keys never belong here.
+# Verify fingerprints before adding or replacing trusted release identities.
+# SHA256:iRmO9OJ8uiIi+IuSQepGXVksZrQ0uivmokOrk7ZX9r0
+Eowerd24 namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGQ7SZuAIcqpQbbCdy+HhHveRPSg2TvxUPCN1WW4RtMc

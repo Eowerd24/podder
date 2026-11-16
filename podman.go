@@ -1,0 +1,1162 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+)
+
+// PodmanService handles execution of Podman CLI commands and parsing of JSON outputs.
+type PodmanService struct {
+	// runner executes external commands. The zero value (nil) falls back to
+	// the real host executor in production; tests inject a scripted fake so
+	// every failure point of a transaction can be exercised deterministically.
+	runner      CommandRunner
+	transaction *managedJournal
+	managedLock *os.File
+	// Launcher integrations are injectable; tests never open a browser or contact a host.
+	browserOpen   func(string) error
+	terminalStart func(string, ...string) error
+	tunnelStart   func(context.Context, string, ...string) (<-chan error, error)
+	tunnelReady   func(context.Context, string, RemoteProfile) error
+	webProbe      func(context.Context, string) error
+	// lookPath resolves which compose provider binary is on PATH. The zero
+	// value (nil) falls back to exec.LookPath in production; tests inject a
+	// scripted fake so Compose mutation is exercisable without a real
+	// podman-compose/docker-compose install.
+	lookPath lookPathFunc
+	// commitSpec is injectable so commit-failure cleanup is testable.
+	commitSpec func(candidatePath string, spec ContainerSpec) error
+	// Deterministic assurance hooks. Production leaves these nil.
+	sessionMountsPinnedHook     func()
+	sessionRunResultHook        func(string, error)
+	imageCleanupVerifiedHook    func()
+	mountHandoffReadyPath       string
+	mountHandoffContinuePath    string
+	sessionWorkspaceCleanupHook func()
+	// hostNetworks is injectable so CreateNetwork's host-route/LAN overlap
+	// check (see networks.go) is testable without depending on this
+	// machine's actual network interfaces. The zero value (nil) falls back
+	// to defaultHostNetworks in production.
+	hostNetworks hostNetworksFunc
+}
+
+// cmdRunner returns the configured CommandRunner, falling back to the real
+// host executor when none was injected.
+func (p *PodmanService) cmdRunner() CommandRunner {
+	if p.runner != nil {
+		return p.runner
+	}
+	return defaultCommandRunner
+}
+
+// lookPathFn returns the configured lookPathFunc, falling back to the real
+// exec.LookPath when none was injected.
+func (p *PodmanService) lookPathFn() lookPathFunc {
+	if p.lookPath != nil {
+		return p.lookPath
+	}
+	return exec.LookPath
+}
+
+// hostNetworksFn returns the configured hostNetworksFunc, falling back to
+// defaultHostNetworks (this host's real interface addresses) when none was
+// injected.
+func (p *PodmanService) hostNetworksFn() hostNetworksFunc {
+	if p.hostNetworks != nil {
+		return p.hostNetworks
+	}
+	return defaultHostNetworks
+}
+
+func (p *PodmanService) commitCandidate(candidatePath string, spec ContainerSpec) error {
+	var err error
+	if p.transaction != nil {
+		// The journal candidate is the descriptor-read, durable in-memory copy
+		// used throughout recovery. Preserve its receipt IDs and timestamps while
+		// committing freshly serialized verified state.
+		spec = p.transaction.Candidate
+	}
+	if p.commitSpec != nil {
+		err = p.commitSpec(candidatePath, spec)
+	} else {
+		err = commitCandidateSpec(candidatePath, spec)
+	}
+	if err == nil && p.transaction != nil {
+		p.transaction.Committed = true
+		err = p.transaction.save()
+	}
+	if err != nil && p.transaction != nil {
+		p.transaction.Committed = false
+		restoreErr := restoreManagedAuthority(p.transaction)
+		if restoreErr != nil {
+			p.transaction.CommitUncertain = true
+			_ = p.transaction.save()
+			return fmt.Errorf("candidate commit failed and authoritative spec restoration could not be verified; recovery journal retained: %v (restore: %w)", err, restoreErr)
+		}
+		p.transaction.CommitUncertain = false
+		_ = p.transaction.save()
+	}
+	return err
+}
+
+func restoreManagedAuthority(j *managedJournal) error {
+	final, err := getSpecFilePath(j.Service)
+	if err != nil {
+		return err
+	}
+	if j.OldSpecExists {
+		return writePrivateFileAtomic(final, j.OldSpec)
+	}
+	root, err := privateRoot(filepath.Dir(final))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.Remove(filepath.Base(final)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncRootDirectory(root)
+}
+
+var supportedImageExtensions = map[string]struct{}{
+	".avif": {},
+	".bmp":  {},
+	".gif":  {},
+	".jpeg": {},
+	".jpg":  {},
+	".png":  {},
+	".svg":  {},
+	".tif":  {},
+	".tiff": {},
+	".webp": {},
+}
+
+// rawPodmanPort represents port structure in raw Podman JSON.
+type rawPodmanPort struct {
+	HostIP        string `json:"host_ip"`
+	ContainerPort uint16 `json:"container_port"`
+	HostPort      uint16 `json:"host_port"`
+	Range         int    `json:"range"`
+	Protocol      string `json:"protocol"`
+}
+
+// rawContainer represents a raw container from Podman JSON.
+type rawContainer struct {
+	Id         string            `json:"Id"`
+	Names      []string          `json:"Names"`
+	Image      string            `json:"Image"`
+	ImageID    string            `json:"ImageID"`
+	State      string            `json:"State"`
+	Status     string            `json:"Status"`
+	Created    int64             `json:"Created"`
+	ExitCode   int               `json:"ExitCode"`
+	Command    []string          `json:"Command"`
+	AutoRemove bool              `json:"AutoRemove"`
+	Ports      []rawPodmanPort   `json:"Ports"`
+	Pod        string            `json:"Pod"`
+	PodName    string            `json:"PodName"`
+	Labels     map[string]string `json:"Labels"`
+}
+
+// Container represents a Podman container with structured port mappings and provenance.
+type Container struct {
+	Id           string             `json:"Id"`
+	Names        []string           `json:"Names"`
+	Image        string             `json:"Image"`
+	ImageID      string             `json:"ImageID"`
+	State        string             `json:"State"`
+	Status       string             `json:"Status"`
+	Created      int64              `json:"Created"`
+	ExitCode     int                `json:"ExitCode"`
+	Command      []string           `json:"Command"`
+	AutoRemove   bool               `json:"AutoRemove"`
+	PortMappings []PortMapping      `json:"PortMappings"`
+	Ports        []PortMapping      `json:"Ports"`
+	Pod          string             `json:"Pod,omitempty"`
+	PodName      string             `json:"PodName,omitempty"`
+	Labels       map[string]string  `json:"Labels,omitempty"`
+	Provenance   WorkloadProvenance `json:"provenance"`
+}
+
+// Image represents a Podman image.
+type Image struct {
+	Id         string   `json:"Id"`
+	Names      []string `json:"Names"`
+	Digest     string   `json:"Digest"`
+	Size       int64    `json:"Size"`
+	CreatedAt  string   `json:"CreatedAt"`
+	Containers int      `json:"Containers"`
+}
+
+// SystemInfo represents high-level host and store statistics.
+type SystemInfo struct {
+	PodmanVersion     string `json:"podmanVersion"`
+	OS                string `json:"os"`
+	Kernel            string `json:"kernel"`
+	Distribution      string `json:"distribution"`
+	CPUs              int    `json:"cpus"`
+	MemTotal          int64  `json:"memTotal"`
+	MemFree           int64  `json:"memFree"`
+	TotalContainers   int    `json:"totalContainers"`
+	RunningContainers int    `json:"runningContainers"`
+	StoppedContainers int    `json:"stoppedContainers"`
+	TotalImages       int    `json:"totalImages"`
+	Uptime            string `json:"uptime"`
+}
+
+// runCommand runs a Podman command with arguments.
+func (p *PodmanService) runCommand(args ...string) (string, string, error) {
+	if p.transaction != nil {
+		return p.transaction.command(p.cmdRunner(), args...)
+	}
+
+	return p.cmdRunner().Run("podman", args...)
+}
+
+func (p *PodmanService) runCommandWithFiles(files []*os.File, args ...string) (string, string, error) {
+	if p.transaction != nil {
+		return p.transaction.commandWithFiles(p.cmdRunner(), files, args...)
+	}
+	runner, ok := p.cmdRunner().(CommandRunnerWithFiles)
+	if !ok {
+		return "", "", fmt.Errorf("command runner cannot inherit pinned filesystem descriptors")
+	}
+	return runner.RunWithFiles("podman", files, args...)
+}
+
+// GetSystemInfo fetches information about the Podman host and storage.
+func (p *PodmanService) GetSystemInfo() (*SystemInfo, error) {
+	stdout, stderr, err := p.runCommand("info", "--format", "json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to run podman info: %v, stderr: %s", err, stderr)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse podman info json: %v", err)
+	}
+
+	info := &SystemInfo{}
+
+	// Safely parse host details
+	if host, ok := raw["host"].(map[string]interface{}); ok {
+		if osVal, ok := host["os"].(string); ok {
+			info.OS = osVal
+		}
+		if kernelVal, ok := host["kernel"].(string); ok {
+			info.Kernel = kernelVal
+		}
+		if cpusVal, ok := host["cpus"].(float64); ok {
+			info.CPUs = int(cpusVal)
+		}
+		if memTotalVal, ok := host["memTotal"].(float64); ok {
+			info.MemTotal = int64(memTotalVal)
+		}
+		if memFreeVal, ok := host["memFree"].(float64); ok {
+			info.MemFree = int64(memFreeVal)
+		}
+		if uptimeVal, ok := host["uptime"].(string); ok {
+			info.Uptime = uptimeVal
+		}
+		if dist, ok := host["distribution"].(map[string]interface{}); ok {
+			distName, _ := dist["distribution"].(string)
+			distVer, _ := dist["version"].(string)
+			info.Distribution = fmt.Sprintf("%s %s", distName, distVer)
+		}
+	}
+
+	// Safely parse store details
+	if store, ok := raw["store"].(map[string]interface{}); ok {
+		if cStore, ok := store["containerStore"].(map[string]interface{}); ok {
+			if num, ok := cStore["number"].(float64); ok {
+				info.TotalContainers = int(num)
+			}
+			if run, ok := cStore["running"].(float64); ok {
+				info.RunningContainers = int(run)
+			}
+			if stopped, ok := cStore["stopped"].(float64); ok {
+				info.StoppedContainers = int(stopped)
+			}
+		}
+		if iStore, ok := store["imageStore"].(map[string]interface{}); ok {
+			if num, ok := iStore["number"].(float64); ok {
+				info.TotalImages = int(num)
+			}
+		}
+	}
+
+	// Safely parse version
+	if version, ok := raw["version"].(map[string]interface{}); ok {
+		if ver, ok := version["Version"].(string); ok {
+			info.PodmanVersion = ver
+		}
+	}
+
+	return info, nil
+}
+
+// parseContainersJSON parses JSON from `podman ps --format json`.
+func parseContainersJSON(data []byte) ([]Container, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "[]" {
+		return []Container{}, nil
+	}
+
+	var rawList []rawContainer
+	if err := json.Unmarshal(data, &rawList); err != nil {
+		// Fallback: try unmarshaling directly into []Container
+		var fallbackList []Container
+		if errFallback := json.Unmarshal(data, &fallbackList); errFallback == nil {
+			for i := range fallbackList {
+				if len(fallbackList[i].PortMappings) == 0 && len(fallbackList[i].Ports) > 0 {
+					fallbackList[i].PortMappings = fallbackList[i].Ports
+				} else if len(fallbackList[i].Ports) == 0 && len(fallbackList[i].PortMappings) > 0 {
+					fallbackList[i].Ports = fallbackList[i].PortMappings
+				}
+			}
+			return fallbackList, nil
+		}
+		return nil, fmt.Errorf("failed to parse containers json: %w", err)
+	}
+
+	containers := make([]Container, len(rawList))
+	for i, rc := range rawList {
+		var mappings []PortMapping
+		for _, rp := range rc.Ports {
+			proto := strings.ToLower(rp.Protocol)
+			if proto == "" {
+				proto = "tcp"
+			}
+			mappings = append(mappings, PortMapping{
+				HostIP:        rp.HostIP,
+				HostPort:      rp.HostPort,
+				ContainerPort: rp.ContainerPort,
+				Protocol:      proto,
+				RangeSize:     rp.Range,
+			})
+		}
+
+		podName := rc.PodName
+		if podName == "" {
+			podName = rc.Pod
+		}
+
+		provenance := ClassifyProvenance(rc.Labels, rc.Pod, rc.PodName)
+
+		containers[i] = Container{
+			Id:           rc.Id,
+			Names:        rc.Names,
+			Image:        rc.Image,
+			ImageID:      rc.ImageID,
+			State:        rc.State,
+			Status:       rc.Status,
+			Created:      rc.Created,
+			ExitCode:     rc.ExitCode,
+			Command:      rc.Command,
+			AutoRemove:   rc.AutoRemove,
+			PortMappings: mappings,
+			Ports:        mappings,
+			Pod:          rc.Pod,
+			PodName:      podName,
+			Labels:       rc.Labels,
+			Provenance:   provenance,
+		}
+	}
+
+	return containers, nil
+}
+
+// ListContainers lists all containers (running and stopped if all=true).
+func (p *PodmanService) ListContainers(all bool) ([]Container, error) {
+	args := []string{"ps", "--format", "json"}
+	if all {
+		args = append(args, "-a")
+	}
+
+	stdout, stderr, err := p.runCommand(args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %v, stderr: %s", err, stderr)
+	}
+
+	return parseContainersJSON([]byte(stdout))
+}
+
+// ListImages lists local images.
+func (p *PodmanService) ListImages() ([]Image, error) {
+	stdout, stderr, err := p.runCommand("images", "--format", "json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list images: %v, stderr: %s", err, stderr)
+	}
+
+	var images []Image
+	if strings.TrimSpace(stdout) == "" || strings.TrimSpace(stdout) == "[]" {
+		return images, nil
+	}
+
+	if err := json.Unmarshal([]byte(stdout), &images); err != nil {
+		return nil, fmt.Errorf("failed to parse images json: %v", err)
+	}
+
+	return images, nil
+}
+
+// StartContainer starts a container by exact full ID.
+func (p *PodmanService) StartContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateFullContainerID(id); err != nil {
+		return err
+	}
+	if _, secureRunner := p.cmdRunner().(pinnedMountNamespaceRunner); secureRunner {
+		containers, err := p.ListContainers(true)
+		if err != nil {
+			return err
+		}
+		container := findContainerByExactID(containers, id)
+		if container == nil {
+			return fmt.Errorf("container not found")
+		}
+		hasBind, inspectErr := p.containerHasBindMount(id)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if !hasBind {
+			_, stderr, err := p.runCommand("start", "--", id)
+			if err != nil {
+				return fmt.Errorf("%s", strings.TrimSpace(stderr))
+			}
+			return nil
+		}
+		if container.Labels["io.podder.managed"] != "true" {
+			return fmt.Errorf("starting an unmanaged bind-mounted container is refused because no persisted filesystem-object approval exists; recreate it after reviewing the current source")
+		}
+		service := strings.TrimSpace(container.Labels["io.podder.service"])
+		spec, specErr := p.GetSpec(service)
+		if specErr != nil {
+			return fmt.Errorf("managed container spec unavailable: %w", specErr)
+		}
+		if !containerMatchesSpecLabels(container, *spec) {
+			return fmt.Errorf("managed container ownership does not match its authoritative spec")
+		}
+		if len(spec.Binds) == 0 {
+			return fmt.Errorf("managed container has bind mounts that are absent from its authoritative spec")
+		}
+		if err := requirePersistedBindObjectWitnesses(spec); err != nil {
+			return err
+		}
+		if err := approveContainerSpecBinds(spec); err != nil {
+			return err
+		}
+		pinned, closePinned, err := pinApprovedContainerBinds(spec.Binds)
+		if err != nil {
+			return err
+		}
+		defer closePinned()
+		_, plan, err := p.preparePinnedMountPlan("start-"+newSessionID(), pinned)
+		if err != nil {
+			return err
+		}
+		if len(plan.pairs) == 0 {
+			return fmt.Errorf("managed bind-mounted container produced no verified mount handoff")
+		}
+		actual := pinnedPodmanOuterArgs(plan, []string{"start", "--", id})
+		_, stderr, err := p.runCommandWithFiles(plan.files, actual...)
+		if err != nil {
+			return fmt.Errorf("%s", strings.TrimSpace(stderr))
+		}
+		return nil
+	}
+	_, stderr, err := p.runCommand("start", "--", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// StopContainer stops a container by exact full ID.
+func (p *PodmanService) StopContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateFullContainerID(id); err != nil {
+		return err
+	}
+	_, stderr, err := p.runCommand("stop", "--", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// RestartContainer restarts a container by exact full ID.
+func (p *PodmanService) RestartContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateFullContainerID(id); err != nil {
+		return err
+	}
+	if _, secureRunner := p.cmdRunner().(pinnedMountNamespaceRunner); secureRunner {
+		containers, err := p.ListContainers(true)
+		if err != nil {
+			return err
+		}
+		container := findContainerByExactID(containers, id)
+		if container == nil {
+			return fmt.Errorf("container not found")
+		}
+		hasBind, inspectErr := p.containerHasBindMount(id)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if !hasBind {
+			_, stderr, err := p.runCommand("restart", "--", id)
+			if err != nil {
+				return fmt.Errorf("%s", strings.TrimSpace(stderr))
+			}
+			return nil
+		}
+		if container.Labels["io.podder.managed"] != "true" {
+			return fmt.Errorf("restarting an unmanaged bind-mounted container is refused because no persisted filesystem-object approval exists; recreate it after reviewing the current source")
+		}
+		service := strings.TrimSpace(container.Labels["io.podder.service"])
+		spec, specErr := p.GetSpec(service)
+		if specErr != nil {
+			return fmt.Errorf("managed container spec unavailable: %w", specErr)
+		}
+		if !containerMatchesSpecLabels(container, *spec) {
+			return fmt.Errorf("managed container ownership does not match its authoritative spec")
+		}
+		if len(spec.Binds) == 0 {
+			return fmt.Errorf("managed container has bind mounts that are absent from its authoritative spec")
+		}
+		if err := p.StopContainer(id); err != nil {
+			return err
+		}
+		return p.StartContainer(id)
+	}
+	_, stderr, err := p.runCommand("restart", "--", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+func (p *PodmanService) containerHasBindMount(id string) (bool, error) {
+	stdout, stderr, err := p.runCommand("inspect", "--format", "json", "--", id)
+	if err != nil {
+		return false, fmt.Errorf("could not inspect container bind controls: %v (stderr: %s)", err, strings.TrimSpace(stderr))
+	}
+	current, err := parseSingleInspect(stdout)
+	if err != nil {
+		return false, err
+	}
+	for _, mount := range current.Mounts {
+		if mount.Type == "bind" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// RemoveContainer is the safe, ordinary user-facing removal path: it
+// refuses a running container rather than forcibly killing it out from
+// under whatever it's doing. Callers that need to remove a running
+// container should stop it first — see StopAndRemoveContainer for the
+// one-step graceful equivalent. Internal transaction cleanup (rollback,
+// candidate-container cleanup, recovery) that legitimately needs to force
+// through a removal regardless of state uses the unexported
+// forceRemoveContainer instead; that force semantic is deliberately never
+// exposed as the ordinary path.
+func (p *PodmanService) RemoveContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateFullContainerID(id); err != nil {
+		return err
+	}
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return fmt.Errorf("refusing to remove container %s: local containers could not be inspected: %w", id, err)
+	}
+	target := findContainerByExactID(containers, id)
+	if target == nil {
+		return fmt.Errorf("exact container ID is absent; removal refused")
+	}
+	if target != nil {
+		if lifecycle, ok := classifyLifecycle(target.State); ok && lifecycle == lifecycleRunning {
+			return fmt.Errorf("container %s is running; stop it first (or use StopAndRemoveContainer) rather than force-removing a running container", id)
+		}
+	}
+	_, stderr, err := p.runCommand("rm", "--", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// StopAndRemoveContainer gracefully stops a container (if running) and then
+// removes it — the one-step, non-forceful equivalent of "remove this
+// container regardless of its current state" for user-facing callers that
+// don't want to make two separate calls.
+func (p *PodmanService) StopAndRemoveContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateFullContainerID(id); err != nil {
+		return err
+	}
+	if err := p.StopContainer(id); err != nil {
+		return fmt.Errorf("failed to stop container %s before removal: %w", id, err)
+	}
+	_, stderr, err := p.runCommand("rm", "--", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// forceRemoveContainer is the internal-only force-removal primitive used by
+// rollback, candidate-container cleanup, and recovery machinery, which
+// legitimately need to remove a container regardless of its lifecycle
+// state (e.g. cleaning up a just-created, still-running candidate after a
+// failed managed transaction). It is deliberately unexported: user-facing
+// removal must go through RemoveContainer/StopAndRemoveContainer instead,
+// never this.
+func (p *PodmanService) forceRemoveContainer(id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateFullContainerID(id); err != nil {
+		return err
+	}
+	_, stderr, err := p.runCommand("rm", "-f", "--", id)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// RemoveImage removes an image by ID without forcing removal of containers
+// that depend on it. This is the ordinary, user-facing image deletion path:
+// the GUI presents it as ordinary image removal, and podman's --force
+// behavior can silently delete containers using the image before deleting
+// the image itself, which would be a destructive mismatch between the
+// disclosed action and what actually happens. If Podman refuses because
+// dependent containers exist, that refusal is surfaced to the caller as-is
+// rather than escalated into container deletion. A separately named,
+// explicitly destructive force-delete path may be added later, but it must
+// never be this method.
+func (p *PodmanService) RemoveImage(id string) error {
+	exactID, err := exactFullImageID(id)
+	if err != nil {
+		return err
+	}
+	_, stderr, err := p.runCommand("rmi", "--", exactID)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// GetContainerLogs returns logs for a container (last 200 lines).
+func (p *PodmanService) GetContainerLogs(id string) (string, error) {
+	if err := validatePodmanOperand(id); err != nil {
+		return "", err
+	}
+
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", fmt.Errorf("container id cannot be empty")
+	}
+	stdout, stderr, err := p.runCommand("logs", "--tail", "200", "--", id)
+	if err != nil {
+		// Sometimes logs might write to stderr, so if we get a standard exit code we can combine or return stderr.
+		return stdout, fmt.Errorf("failed to get logs: %v, stderr: %s", err, stderr)
+	}
+	// Return both stdout and stderr since logs might write to either.
+	return stdout + stderr, nil
+}
+
+// PullImage pulls an image from a registry.
+func (p *PodmanService) PullImage(name string) error {
+	if err := validatePodmanOperand(name); err != nil {
+		return err
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("image name cannot be empty")
+	}
+	_, stderr, err := p.runCommand("pull", "--", name)
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// ContainerCreateRequest is the full request for creating a new container.
+// Managed explicitly controls whether the workload becomes Podder-managed —
+// it is never inferred from the presence of port mappings or any other
+// field.
+type ContainerCreateRequest struct {
+	Image        string            `json:"image"`
+	Name         string            `json:"name"`
+	Managed      bool              `json:"managed"`
+	PortMappings []PortMapping     `json:"portMappings"`
+	Binds        []BindMountSpec   `json:"binds"`
+	Env          map[string]string `json:"env"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	// Command accepts either a JSON array (preferred) or a single
+	// shell-style string (tokenized via SplitShellCommand, e.g. from a
+	// free-text "Command" field in the Run Container UI) — see
+	// CommandArgv's UnmarshalJSON.
+	Command    CommandArgv `json:"command"`
+	Entrypoint []string    `json:"entrypoint"`
+}
+
+// ContainerCreateResult reports the outcome of a container creation request.
+type ContainerCreateResult struct {
+	Success                bool   `json:"success"`
+	ContainerID            string `json:"containerId"`
+	ContainerName          string `json:"containerName,omitempty"`
+	Managed                bool   `json:"managed"`
+	Message                string `json:"message,omitempty"`
+	ManualRecoveryRequired bool   `json:"manualRecoveryRequired,omitempty"`
+	CandidateSpecPath      string `json:"candidateSpecPath,omitempty"`
+}
+
+// CreateContainer creates a new container from an explicit request. It is
+// the single entry point for both managed and unmanaged creation:
+//
+//  1. validate the requested spec (pure, local checks)
+//  2. run final backend validation on every port mapping (registry/runtime
+//     collisions cannot be bypassed by calling this method directly, and
+//     mappings are checked against each other within the same request)
+//  3. build the exact run arguments via BuildRunArgsFromSpec
+//  4. if Managed, persist a candidate spec BEFORE creating the container
+//  5. create the container
+//  6. verify it exists with the expected identity
+//  7. commit the candidate spec (rename into place) — a container is never
+//     left labeled io.podder.managed=true without a matching authoritative
+//     spec on disk, and a spec is never committed for a container that
+//     doesn't exist
+//
+// Unmanaged creation remains fully supported: Managed=false simply skips
+// steps 4 and 7, and no io.podder.managed label is ever applied.
+func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerCreateResult, error) {
+	operation, release, lockErr := p.managedOperation()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+	p = operation
+
+	if req.Managed {
+		if err := checkManagedRecovery(strings.TrimSpace(req.Name)); err != nil {
+			return nil, err
+		}
+	}
+	spec := ContainerSpec{
+		SchemaVersion: CurrentSpecSchemaVersion,
+		Name:          strings.TrimSpace(req.Name),
+		Image:         strings.TrimSpace(req.Image),
+		Managed:       req.Managed,
+		PortMappings:  req.PortMappings,
+		Binds:         req.Binds,
+		Env:           req.Env,
+		Labels:        req.Labels,
+		Command:       req.Command,
+		Entrypoint:    req.Entrypoint,
+	}
+	if err := approveContainerSpecBinds(&spec); err != nil {
+		return nil, fmt.Errorf("invalid container bind: %w", err)
+	}
+
+	if spec.Managed {
+		resolved, resolveErr := p.resolveImageID(spec.Image)
+		if resolveErr != nil {
+			// `podman image inspect` never pulls, unlike `podman run`,
+			// which would auto-pull an image not yet present locally.
+			// Reproduce that for managed creates too instead of failing
+			// outright on the ordinary "first managed container from this
+			// image" flow — pull once, then retry resolution.
+			if pullErr := p.PullImage(spec.Image); pullErr != nil {
+				return nil, fmt.Errorf("managed creation requires an immutable image identity, and the image could not be pulled: %v (original inspect error: %v)", pullErr, resolveErr)
+			}
+			resolved, resolveErr = p.resolveImageID(spec.Image)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("managed creation requires an immutable image identity: %w", resolveErr)
+			}
+		}
+		spec.ResolvedImage = resolved
+		spec.ReplayComplete = true
+	}
+
+	if errs := ValidateSpec(spec); len(errs) > 0 {
+		return nil, fmt.Errorf("invalid container spec: %s", strings.Join(errs, "; "))
+	}
+
+	if err := p.validateMappingsForCreate(spec.PortMappings, spec.Managed); err != nil {
+		return nil, err
+	}
+
+	args, err := BuildRunArgsFromSpec(spec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build run arguments: %w", err)
+	}
+
+	var candidatePath string
+	if spec.Managed {
+		candidatePath, spec, err = writeCandidateSpecPrepared(spec)
+		if err != nil {
+			return nil, fmt.Errorf("failed to persist candidate spec: %w", err)
+		}
+	}
+
+	result := &ContainerCreateResult{Managed: spec.Managed, ContainerName: spec.Name}
+	cleanupFailedManagedCreate := func(reason string) (*ContainerCreateResult, error) {
+		removeErr := p.exactTransactionContainer(result.ContainerID, spec.Name, nil, &spec)
+		if removeErr == nil {
+			removeErr = p.forceRemoveContainer(result.ContainerID)
+		}
+		removed := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			return p.containerAbsent(result.ContainerID, spec.Name)
+		})
+		if removed {
+			if err := p.restoreManagedRollbackSpec(); err != nil {
+				result.ManualRecoveryRequired = true
+				result.CandidateSpecPath = candidatePath
+				result.Message = fmt.Sprintf("%s The failed container was verified removed, but the authoritative spec could not be durably restored; managed recovery retained: %v.", reason, err)
+				return result, nil
+			}
+			discardCandidateSpec(candidatePath)
+			result.Message = reason + " The failed container was verified removed and the previous authoritative spec state was restored."
+			return result, nil
+		}
+		result.ManualRecoveryRequired = true
+		result.CandidateSpecPath = candidatePath
+		result.Message = fmt.Sprintf("%s ROLLBACK FAILED / MANUAL RECOVERY REQUIRED: the managed-labeled container may still exist and the valid candidate spec was retained at %s (remove error: %v).", reason, candidatePath, removeErr)
+		return result, nil
+	}
+
+	if spec.Managed {
+		cs, err := p.ListContainers(true)
+		if err != nil {
+			discardCandidateSpec(candidatePath)
+			return nil, err
+		}
+		if findContainerByName(cs, spec.Name) != nil {
+			discardCandidateSpec(candidatePath)
+			return nil, fmt.Errorf("container name is already in use; no workload changed")
+		}
+		journal, err := p.beginManagedJournal(spec.Name, "create", "", candidatePath, nil, spec)
+		if err != nil {
+			discardCandidateSpec(candidatePath)
+			return nil, err
+		}
+		defer p.finishManagedJournal(journal)
+	}
+	stdout, stderr, err := p.runSpecCommand(spec, args...)
+	result.ContainerID = strings.TrimSpace(stdout)
+	if spec.Managed {
+		var discoverErr error
+		result.ContainerID, _, discoverErr = p.transactionCandidateIdentity(stdout, spec)
+		if discoverErr != nil {
+			result.ManualRecoveryRequired = true
+			result.CandidateSpecPath = candidatePath
+			result.Message = discoverErr.Error()
+			return result, nil
+		}
+	}
+	if err != nil {
+		if !spec.Managed || !p.containerExistsByIdentity(result.ContainerID) {
+			discardCandidateSpec(candidatePath)
+			return nil, fmt.Errorf("failed to create container: %v (stderr: %s)", err, strings.TrimSpace(stderr))
+		}
+		return cleanupFailedManagedCreate(fmt.Sprintf("Podman reported creation failure after a container became observable: %v (stderr: %s).", err, strings.TrimSpace(stderr)))
+	}
+
+	if spec.Managed {
+		// Bounded-poll this exactly like every other equivalent
+		// post-create verification in this codebase (DeploySpec,
+		// MutateContainerPorts, AdoptContainer, and even the removal
+		// check in cleanupFailedManagedCreate below) — a single immediate
+		// snapshot risks losing a race against Podman settling the new
+		// container's lifecycle/port state and destroying a container
+		// that was actually created successfully.
+		verified := pollUntil(mutationPollAttempts, mutationPollInterval, func() bool {
+			return p.verifyCreatedManagedContainer(result.ContainerID, spec)
+		})
+		if !verified {
+			return cleanupFailedManagedCreate("Container failed post-create verification: exact ID, name, lifecycle, image identity, managed labels, or configured ports did not match the candidate spec.")
+		}
+		if err := p.commitCandidate(candidatePath, spec); err != nil {
+			return cleanupFailedManagedCreate(fmt.Sprintf("Failed to commit managed spec: %v.", err))
+		}
+	}
+
+	result.Success = true
+	result.Managed = spec.Managed
+	result.Message = "Container created successfully."
+	return result, nil
+}
+
+// resolveImageID pins a managed spec to the immutable local image object.
+// Replaying a mutable tag would not reproduce the bytes that were verified.
+func (p *PodmanService) resolveImageID(image string) (string, error) {
+	if err := validatePodmanOperand(image); err != nil {
+		return "", err
+	}
+
+	stdout, stderr, err := p.runCommand("image", "inspect", "--format", "json", "--", image)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect image %q: %v (stderr: %s)", image, err, strings.TrimSpace(stderr))
+	}
+	var images []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &images); err != nil || len(images) == 0 || strings.TrimSpace(images[0].ID) == "" {
+		return "", fmt.Errorf("image %q did not return a usable immutable ID", image)
+	}
+	return strings.TrimSpace(images[0].ID), nil
+}
+
+// containerExistsByIdentity verifies a just-created container is visible to
+// Podman under the exact returned ID, used as the "verify" step before
+// committing managed state.
+func (p *PodmanService) containerExistsByIdentity(containerID string) bool {
+	if containerID == "" {
+		return false
+	}
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return false
+	}
+	return findContainerByExactID(containers, containerID) != nil
+}
+
+func (p *PodmanService) verifyCreatedManagedContainer(containerID string, spec ContainerSpec) bool {
+	if strings.TrimSpace(containerID) == "" {
+		return false
+	}
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return false
+	}
+	c := findContainerByExactID(containers, containerID)
+	if c == nil || strings.TrimSpace(c.ImageID) != strings.TrimSpace(spec.ResolvedImage) {
+		return false
+	}
+	if lifecycle, ok := classifyLifecycle(c.State); !ok || lifecycle != lifecycleRunning {
+		return false
+	}
+	if named := findContainerByName(containers, spec.Name); named == nil || named.Id != c.Id {
+		return false
+	}
+	if !containerMatchesSpecLabels(c, spec) {
+		return false
+	}
+	ok, _, _ := portMappingSetEqual(spec.PortMappings, c.PortMappings)
+	return ok
+}
+
+func containerMatchesSpecLabels(c *Container, spec ContainerSpec) bool {
+	if c == nil || c.Labels["io.podder.managed"] != "true" || c.Labels["io.podder.service"] != spec.Name || c.Labels["io.podder.schema-version"] != fmt.Sprintf("%d", spec.SchemaVersion) {
+		return false
+	}
+	for key, value := range spec.Labels {
+		if c.Labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *PodmanService) containerAbsent(containerID, name string) bool {
+	containers, err := p.ListContainers(true)
+	if err != nil {
+		return false
+	}
+	return findContainerByExactID(containers, containerID) == nil && findContainerByName(containers, name) == nil
+}
+
+// validateMappingsForCreate performs the final, mandatory backend validation
+// of every requested port mapping immediately before it is ever handed to
+// Podman: each mapping must independently pass ValidatePortMapping (which
+// checks registry reservations and live runtime collisions), and mappings
+// must not conflict with one another within the same request. This cannot
+// be bypassed by calling CreateContainer directly through the Wails bridge —
+// frontend validation is advisory only.
+//
+// managed controls HostPort==0 policy: a Podder-managed workload must name
+// an explicit, stable host port (ValidatePortMapping rejects HostPort==0
+// when managed is true); unmanaged/ad-hoc creation may leave it 0 to let
+// Podman auto-assign one.
+func (p *PodmanService) validateMappingsForCreate(mappings []PortMapping, managed bool) error {
+	var seen []PortClaim
+	for _, m := range mappings {
+		req := PortMappingRequest{
+			HostIP:        m.HostIP,
+			HostPort:      m.HostPort,
+			ContainerPort: m.ContainerPort,
+			Protocol:      m.Protocol,
+			RangeSize:     m.RangeSize,
+			Managed:       managed,
+		}
+		valResult, err := p.ValidatePortMapping(req)
+		if err != nil {
+			return fmt.Errorf("failed to validate port mapping %s: %w", m.DisplayString(), err)
+		}
+		if valResult == nil || !valResult.Valid {
+			msg := "invalid port mapping"
+			if valResult != nil {
+				for _, c := range valResult.Checks {
+					if !c.Passed {
+						msg = c.Message
+						break
+					}
+				}
+			}
+			return fmt.Errorf("port mapping %s rejected: %s", m.DisplayString(), msg)
+		}
+
+		if m.HostPort != 0 {
+			candidate := PortClaim{Address: m.HostIP, Port: m.HostPort, Protocol: m.Protocol, RangeSize: m.RangeSize}
+			if conflict := FindConflict(seen, candidate, ""); conflict != nil {
+				return fmt.Errorf("port mapping %s conflicts with another mapping in this same request", m.DisplayString())
+			}
+			seen = append(seen, candidate)
+		}
+	}
+	return nil
+}
+
+func isSupportedImageFile(path string) bool {
+	extension := strings.ToLower(filepath.Ext(strings.TrimSpace(path)))
+	_, ok := supportedImageExtensions[extension]
+	return ok
+}
+
+// SelectHostPath prompts the user to select a host folder or image file for a bind mount.
+func (p *PodmanService) SelectHostPath(kind string) (string, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+
+	dialog := application.Get().Dialog.OpenFile()
+	switch kind {
+	case "folder":
+		dialog = dialog.SetTitle("Select Host Folder").CanChooseDirectories(true).CanChooseFiles(false)
+	case "image":
+		dialog = dialog.SetTitle("Select Host Image File").CanChooseDirectories(false).CanChooseFiles(true)
+	default:
+		return "", fmt.Errorf("unsupported selection kind: %s", kind)
+	}
+
+	path, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("failed to open dialog: %v", err)
+	}
+	if path == "" {
+		return "", nil
+	}
+
+	if kind == "image" && !isSupportedImageFile(path) {
+		return "", fmt.Errorf("selected file must be an image (png, jpg, jpeg, gif, webp, bmp, svg, tif, tiff, avif)")
+	}
+
+	return path, nil
+}
+
+// resolveComposeSelection determines the working directory and explicit
+// compose file (if any) implied by a user's file-dialog selection. When the
+// user selected a specific file, that exact file must be the one actually
+// executed — reducing the selection to its parent directory and letting the
+// provider fall back to default filename discovery (compose.yml) can
+// silently run a different file than the one the user picked, in a
+// directory holding several compose files (compose.yml, compose-test.yml,
+// compose-gpu.yml, ...). Selecting a directory instead leaves composeFile
+// empty, exactly like today, so the provider's own default discovery
+// applies. Pure and independent of the OS dialog so it can be unit tested.
+func resolveComposeSelection(path string, stat func(string) (os.FileInfo, error)) (dir, composeFile string, err error) {
+	info, err := stat(path)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to stat path: %v", err)
+	}
+	if info.IsDir() {
+		return path, "", nil
+	}
+	return filepath.Dir(path), path, nil
+}
+
+// SelectAndRunCompose triggers a native OS file dialog to select a folder or compose file,
+// and then executes docker/podman compose in that directory.
+func (p *PodmanService) SelectAndRunCompose(action string) (string, error) {
+	dialog := application.Get().Dialog.OpenFile().
+		SetTitle("Select Compose File or Directory").
+		CanChooseDirectories(true).
+		CanChooseFiles(true)
+
+	path, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("failed to open dialog: %v", err)
+	}
+	if path == "" {
+		return "Cancelled by user.", nil
+	}
+
+	dir, composeFile, err := resolveComposeSelection(path, os.Stat)
+	if err != nil {
+		return "", err
+	}
+
+	// Reuse the exact same provider resolution and readiness preflight as
+	// CLI passthrough and Compose mutation, instead of a third hand-rolled
+	// implementation with its own (previously buggy) argv construction.
+	provider, err := resolveComposeProviderWithLookPath(action, p.lookPathFn())
+	if err != nil {
+		return "", err
+	}
+	if err := ensureComposeProviderReady(provider); err != nil {
+		return "", err
+	}
+
+	verb, extra, err := composeVerbAndArgs(action)
+	if err != nil {
+		return "", err
+	}
+
+	composeCmd := exec.Command(provider.path, provider.BuildArgs(composeFile, verb, extra, "")...)
+	composeCmd.Dir = dir
+
+	output, err := composeCmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("compose error: %v\noutput: %s", err, string(output))
+	}
+
+	return string(output), nil
+}
+
+// BuildImageFromDirectory prompts the user for a directory, and runs podman build inside it.
+func (p *PodmanService) BuildImageFromDirectory(tag string) (string, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return "", fmt.Errorf("image tag cannot be empty")
+	}
+
+	dialog := application.Get().Dialog.OpenFile().
+		SetTitle("Select Directory containing Dockerfile").
+		CanChooseDirectories(true).
+		CanChooseFiles(false)
+
+	path, err := dialog.PromptForSingleSelection()
+	if err != nil {
+		return "", fmt.Errorf("failed to open dialog: %v", err)
+	}
+	if path == "" {
+		return "Cancelled by user.", nil
+	}
+
+	cmd := exec.Command("podman", "build", "-t", tag, path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("build error: %v\noutput: %s", err, string(output))
+	}
+	return string(output), nil
+}

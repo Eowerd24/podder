@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Podder
+Comment=A lightweight desktop GUI and CLI for managing local Podman containers, images, and Compose/Quadlet workloads
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/podder %u
+Terminal=false
+Type=Application
+Icon=podder
+Categories=Utility;
+StartupWMClass=podder
+
+ 

@@ -1,0 +1,215 @@
+package main
+
+import (
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"github.com/wailsapp/wails/v3/pkg/application"
+	"net"
+	"net/http"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+)
+
+//go:embed bootstrap-policy.js
+var bootstrapPolicy string
+
+//go:embed scenario.js
+var scenarioJS string
+
+var fixture = newState()
+var expectedCalls = map[string]int{"trustedjson": 1, "trustedchunk": 1}
+var expectedCodes = map[int]int{200: 3, 415: 1, 405: 4, 403: 6}
+var expectedDone = map[string]int{"trusted": 1, "remote/top": 1, "remote/frame-after": 1, "remote/sandbox-after": 1}
+
+type state struct {
+	sync.Mutex
+	Calls          map[string]int `json:"calls"`
+	Codes          map[int]int    `json:"codes"`
+	Scenarios      map[string]int `json:"scenarios"`
+	Bootstrap      map[string]int `json:"bootstrap"`
+	Forbidden      int            `json:"forbidden"`
+	ForbiddenLoads int            `json:"forbiddenLoads"`
+	RemoteTop      int            `json:"remoteTop"`
+	Failure        string         `json:"failure,omitempty"`
+	Passed         bool           `json:"passed"`
+	done           chan struct{}
+	signalled      bool
+}
+
+func newState() *state {
+	return &state{Calls: map[string]int{}, Codes: map[int]int{}, Scenarios: map[string]int{}, Bootstrap: map[string]int{}, done: make(chan struct{})}
+}
+func (s *state) update(fn func()) {
+	s.Lock()
+	defer s.Unlock()
+	fn()
+	for label, count := range s.Calls {
+		if count > expectedCalls[label] {
+			s.Failure = "unexpected binding dispatch: " + label
+		}
+	}
+	for code, count := range s.Codes {
+		if count > expectedCodes[code] {
+			s.Failure = fmt.Sprintf("unexpected runtime response: %d", code)
+		}
+	}
+	if s.ForbiddenLoads > 0 {
+		s.Failure = "forbidden frame reached HTTP server"
+	}
+	if s.Failure == "" && reflect.DeepEqual(s.Calls, expectedCalls) && reflect.DeepEqual(s.Codes, expectedCodes) && reflect.DeepEqual(s.Scenarios, expectedDone) && s.Bootstrap["top"] == 1 && s.Bootstrap["child"] == 1 && s.Forbidden == 2 && s.RemoteTop == 1 {
+		s.Passed = true
+	}
+	if (s.Passed || s.Failure != "") && !s.signalled {
+		s.signalled = true
+		close(s.done)
+	}
+}
+func (s *state) report(raw string) {
+	var r struct {
+		Label     string `json:"label"`
+		Done      bool   `json:"done"`
+		Bootstrap *bool  `json:"bootstrap"`
+		Top       bool   `json:"top"`
+		Forbidden int    `json:"forbiddenFramesBlocked"`
+		Fatal     string `json:"fatal"`
+	}
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		s.update(func() { s.Failure = err.Error() })
+		return
+	}
+	s.update(func() {
+		if r.Done {
+			s.Scenarios[r.Label]++
+		}
+		if r.Bootstrap != nil {
+			if *r.Bootstrap != r.Top {
+				s.Failure = "bootstrap result does not match frame identity"
+			}
+			if *r.Bootstrap {
+				s.Bootstrap["top"]++
+			} else {
+				s.Bootstrap["child"]++
+			}
+		}
+		s.Forbidden += r.Forbidden
+		if r.Fatal != "" {
+			s.Failure = r.Fatal
+		}
+	})
+}
+
+type capture struct {
+	http.ResponseWriter
+	status int
+}
+
+func (c *capture) WriteHeader(code int) {
+	if c.status == 0 {
+		c.status = code
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+func (c *capture) Write(b []byte) (int, error) {
+	if c.status == 0 {
+		c.WriteHeader(200)
+	}
+	return c.ResponseWriter.Write(b)
+}
+
+type Probe struct{}
+
+func (*Probe) Ping(label string) string {
+	fmt.Printf("PING %q\n", label)
+	fixture.update(func() { fixture.Calls[label]++ })
+	return label
+}
+func script(target, remote, label string) string {
+	return fmt.Sprintf("const target=%q,remote=%q,label=%q;\n", target, remote, label) + scenarioJS
+}
+func page(s string) string {
+	return "<!doctype html><html><head><meta charset=utf-8></head><body><script>" + s + "</script></body></html>"
+}
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+	remote := "http://" + ln.Addr().String()
+	fmt.Println("REMOTE", remote)
+	if os.Getenv("HARNESS_DEV") == "1" {
+		os.Setenv("FRONTEND_DEVSERVER_URL", remote)
+	}
+	target := webviewOrigin()
+	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("REMOTE_REQ", r.Method, r.URL.String())
+		fixture.update(func() {
+			if r.URL.Path == "/top" {
+				fixture.RemoteTop++
+			}
+			if r.URL.Path == "/frame" || r.URL.Path == "/sandbox" {
+				fixture.ForbiddenLoads++
+			}
+		})
+		w.Header().Set("Content-Type", "text/html")
+		s := script(target, remote, "remote"+r.URL.Path) + `(async()=>{try{await exercise();report({label,done:true});if(label==='remote/top')foreignFrames();}catch(error){report({label,fatal:String(error)});}})();`
+		fmt.Fprint(w, page(s))
+	}))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bootstrap-policy.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			fmt.Fprint(w, bootstrapPolicy)
+		case "/trusted.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			s := `import {startPodder} from '/bootstrap-policy.js';` + script(target, remote, "trusted") + `try{const started=await startPodder(window,document,async()=>{await exercise();await forbiddenFrames();});report({bootstrap:started,top:window===top,href:location.href});if(started){report({label,done:true});location.href=remote+'/top';}}catch(error){report({label,fatal:String(error)});}`
+			fmt.Fprint(w, s)
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<!doctype html><html><head></head><body><script type="module" src="/trusted.js"></script></body></html>`)
+		}
+	})
+	app := application.New(application.Options{Name: "Podder boundary scratch", Services: []application.Service{application.NewService(&Probe{})}, Assets: application.AssetOptions{Handler: handler, Middleware: func(next http.Handler) http.Handler {
+		next = webviewSecurityMiddleware(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h, _ := json.Marshal(r.Header)
+			fmt.Printf("ASSET %s %s host=%q headers=%s\n", r.Method, r.URL.String(), r.Host, h)
+			c := &capture{ResponseWriter: w}
+			next.ServeHTTP(c, r)
+			fmt.Printf("RESULT %s %s status=%d CSP=%q\n", r.Method, r.URL.String(), c.status, c.Header().Get("Content-Security-Policy"))
+			if r.URL.Path == "/wails/runtime" {
+				fixture.update(func() { fixture.Codes[c.status]++ })
+			}
+		})
+	}}, RawMessageHandler: func(_ application.Window, m string, o *application.OriginInfo) {
+		if strings.HasPrefix(m, "REPORT ") {
+			b, _ := json.Marshal(o)
+			fmt.Printf("%s nativeOrigin=%s\n", m, b)
+			fixture.report(strings.TrimPrefix(m, "REPORT "))
+		}
+	}})
+	app.Window.NewWithOptions(application.WebviewWindowOptions{Name: "probe", URL: "/", Width: 640, Height: 480})
+	go func() {
+		select {
+		case <-fixture.done:
+		case <-time.After(30 * time.Second):
+			fixture.update(func() { fixture.Failure = "watchdog expired before all barriers completed" })
+		}
+		app.Quit()
+	}()
+	if err := app.Run(); err != nil {
+		panic(err)
+	}
+	fixture.Lock()
+	summary, _ := json.Marshal(fixture)
+	passed := fixture.Passed && fixture.Failure == ""
+	fixture.Unlock()
+	fmt.Printf("FIXTURE_RESULT %s\n", summary)
+	if !passed {
+		os.Exit(1)
+	}
+}

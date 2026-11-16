@@ -1,0 +1,19 @@
+{
+  "name": "frontend",
+  "private": true,
+  "version": "1.5.5",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:dev": "vite build --minify false --mode development",
+    "build": "vite build --mode production",
+    "preview": "vite preview",
+    "test": "node --test src/*.test.js"
+  },
+  "dependencies": {
+    "@wailsio/runtime": "3.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.4.6"
+  }
+}

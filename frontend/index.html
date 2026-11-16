@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <!-- Scripts and event listeners are bundled same-origin modules. Inline
+         styles remain necessary for dynamic layout; inline script is forbidden.
+         The native asset middleware also sends this policy as an HTTP header. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; child-src 'none';"/>
+    <link rel="icon" type="image/svg+xml" href="/wails.png"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+    <link rel="stylesheet" href="/style.css"/>
+    <title>Podder - Podman Control Center</title>
+</head>
+<body>
+
+    <!-- Header bar -->
+    <header class="app-header">
+        <div class="logo-section">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+                <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+                <line x1="6" y1="6" x2="6.01" y2="6"/>
+                <line x1="6" y1="18" x2="6.01" y2="18"/>
+            </svg>
+            <span class="app-title">Podder</span>
+        </div>
+        <nav class="nav-tabs">
+            <button class="tab-btn active" data-click="switchTab" data-click-args="[&quot;dashboard&quot;]">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+                Dashboard
+            </button>
+            <button class="tab-btn" data-click="switchTab" data-click-args="[&quot;containers&quot;]">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                Containers
+            </button>
+            <button class="tab-btn" data-click="switchTab" data-click-args="[&quot;images&quot;]">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                Images
+            </button>
+            <button class="tab-btn" data-click="switchTab" data-click-args="[&quot;ports&quot;]">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                Ports
+            </button>
+            <button class="tab-btn" data-click="switchTab" data-click-args="[&quot;networks&quot;]">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="6" height="6" rx="1"/><rect x="16" y="2" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="12" y1="13" x2="12" y2="16"/></svg>
+                Networks
+            </button>
+            <button class="tab-btn" data-click="switchTab" data-click-args="[&quot;sessions&quot;]">Sessions</button>
+            <button class="tab-btn" data-click="switchTab" data-click-args="[&quot;remote&quot;]">Remote</button>
+            <button class="tab-btn" data-click="openSettingsModal" data-click-args="[]" title="Settings & External Registry">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                Settings
+            </button>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main class="app-content">
+
+        <!-- DASHBOARD TAB -->
+        <section id="tab-dashboard" class="tab-content active">
+            <div class="stats-grid">
+                <button type="button" class="stat-card stat-card-button" data-click="navigateAndFilterContainers" data-click-args="[&quot;all&quot;]" title="View All Containers">
+                    <div class="stat-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Containers</span>
+                        <span id="stat-containers-total" class="stat-num">0</span>
+                    </div>
+                </button>
+                <button type="button" class="stat-card stat-card-button" data-click="navigateAndFilterContainers" data-click-args="[&quot;running&quot;]" title="View Running Containers">
+                    <div class="stat-icon emerald">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Running</span>
+                        <span id="stat-containers-running" class="stat-num">0</span>
+                    </div>
+                </button>
+                <button type="button" class="stat-card stat-card-button" data-click="navigateAndFilterContainers" data-click-args="[&quot;stopped&quot;]" title="View Stopped Containers">
+                    <div class="stat-icon rose">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Stopped</span>
+                        <span id="stat-containers-stopped" class="stat-num">0</span>
+                    </div>
+                </button>
+                <button type="button" class="stat-card stat-card-button" data-click="switchTab" data-click-args="[&quot;images&quot;]" title="View Images">
+                    <div class="stat-icon cyan">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Images</span>
+                        <span id="stat-images-total" class="stat-num">0</span>
+                    </div>
+                </button>
+            </div>
+
+            <div class="dashboard-grid">
+                <div class="info-card">
+                    <h2>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                        Podman Host Information
+                    </h2>
+                    <table class="info-table">
+                        <tr>
+                            <td class="label">OS / Distribution</td>
+                            <td id="info-os" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Kernel Version</td>
+                            <td id="info-kernel" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Available CPUs</td>
+                            <td id="info-cpus" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">System Memory</td>
+                            <td id="info-memory" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">System Uptime</td>
+                            <td id="info-uptime" class="value">-</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Podman Version</td>
+                            <td id="info-version" class="value">-</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="info-card">
+                    <h2>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+                        Environment Info
+                    </h2>
+                    <table class="info-table">
+                        <tr>
+                            <td class="label">Mode</td>
+                            <td class="value">Rootless (User session)</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Log Driver</td>
+                            <td class="value">journald</td>
+                        </tr>
+                        <tr>
+                            <td class="label">Storage Driver</td>
+                            <td class="value">overlay</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <!-- Compose Action Card -->
+                <div class="info-card">
+                    <h2>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 22h14a2 2 0 0 0 2-2V7.5L14.5 2H6a2 2 0 0 0-2 2v4"/><polyline points="14 2 14 8 20 8"/><path d="M2 15h10"/><path d="M2 18h10"/></svg>
+                        Compose Actions
+                    </h2>
+                    <p style="color: var(--text-muted); font-size: 13px; margin-top: 8px;">Select a directory or compose file to execute.</p>
+                    <div style="margin-top: 15px; display: flex; gap: 10px;">
+                        <button class="btn btn-primary" data-click="runComposeDialog" data-click-args="[&quot;up&quot;]">Compose Up</button>
+                        <button class="btn btn-secondary" data-click="runComposeDialog" data-click-args="[&quot;down&quot;]">Compose Down</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- CONTAINERS TAB -->
+        <section id="tab-containers" class="tab-content">
+            <div class="section-header">
+                <div>
+                    <div id="container-view-title" class="section-title">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="2" width="20" height="20" rx="2" ry="2"/><line x1="12" y1="2" x2="12" y2="22"/></svg>
+                        Containers
+                    </div>
+                    <p id="container-view-subtitle" class="section-subtitle">Browse every local container or narrow the list to running or stopped instances.</p>
+                </div>
+                <div style="display: flex; gap: 16px; align-items: center;">
+                    <select id="container-filter" class="form-input" style="width: 175px; padding: 6px 10px; font-size: 13px; cursor: pointer;" data-change="handleContainerFilterChange" data-change-args="[]">
+                        <option value="all">All Containers</option>
+                        <option value="running">Running Only</option>
+                        <option value="stopped">Stopped Only</option>
+                        <option value="prov-compose">Compose Only</option>
+                        <option value="prov-quadlet">Quadlet Only</option>
+                        <option value="prov-podder">Podder Only</option>
+                        <option value="prov-pod">Pod Members Only</option>
+                        <option value="prov-adhoc">Ad-Hoc Only</option>
+                    </select>
+                    <button class="btn btn-primary" data-click="openRunModal" data-click-args="[&quot;&quot;]">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        Run Container
+                    </button>
+                </div>
+            </div>
+
+            <div id="containers-list" class="container-grid">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+        <!-- IMAGES TAB -->
+        <section id="tab-images" class="tab-content">
+            <div class="section-header">
+                <div class="section-title">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                    Local Images
+                </div>
+                <div style="display: flex; gap: 8px; width: 480px;">
+                    <input type="text" id="pull-image-name" class="form-input" placeholder="e.g. docker.io/library/nginx:alpine" style="padding: 6px 12px; font-size: 13px;"/>
+                    <button class="btn btn-primary" id="btn-pull-image" data-click="pullImage" data-click-args="[]" style="flex-shrink: 0;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 15v4c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2v-4M17 9l-5 5-5-5M12 12.8V2.5"/></svg>
+                        Pull
+                    </button>
+                    <button class="btn btn-secondary" data-click="openBuildModal" data-click-args="[]" style="flex-shrink: 0;">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+                        Build
+                    </button>
+                </div>
+            </div>
+
+            <div id="images-list" class="image-grid">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+        <!-- PORTS TAB -->
+        <section id="tab-ports" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon cyan">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Published Mappings</span>
+                        <span id="stat-ports-published" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon emerald">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Host Listeners</span>
+                        <span id="stat-ports-listeners" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Unique Ports</span>
+                        <span id="stat-ports-unique" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon rose">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Conflicts</span>
+                        <span id="stat-ports-conflicts" class="stat-num">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-header">
+                <div>
+                    <div class="section-title">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                        Port Administration & Host Reality
+                    </div>
+                    <p class="section-subtitle">Live inspection of container published ports and host listening sockets.</p>
+                </div>
+                <div style="display: flex; gap: 12px; align-items: center;">
+                    <div class="filter-btn-group">
+                        <button class="filter-btn active" id="port-filter-all" data-click="setPortFilter" data-click-args="[&quot;all&quot;]">All</button>
+                        <button class="filter-btn" id="port-filter-podman" data-click="setPortFilter" data-click-args="[&quot;podman&quot;]">Podman</button>
+                        <button class="filter-btn" id="port-filter-host" data-click="setPortFilter" data-click-args="[&quot;host&quot;]">Host Listeners</button>
+                        <button class="filter-btn" id="port-filter-registry" data-click="setPortFilter" data-click-args="[&quot;registry&quot;]">Registry</button>
+                        <button class="filter-btn" id="port-filter-conflicts" data-click="setPortFilter" data-click-args="[&quot;conflicts&quot;]">Conflicts</button>
+                    </div>
+                    <input type="text" id="port-search-input" class="form-input" placeholder="Filter ports, IP, owner, service..." style="width: 210px; padding: 6px 12px; font-size: 13px;" data-input="handlePortSearch" data-input-args="[]"/>
+                    <button class="btn btn-secondary" data-click="loadPorts" data-click-args="[]" title="Refresh Ports">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                        Refresh
+                    </button>
+                </div>
+            </div>
+
+            <div id="registry-status-bar" class="registry-summary-bar" style="display: none;">
+                <!-- Dynamically rendered registry info -->
+            </div>
+
+            <div id="ports-list" class="ports-container">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+        <!-- NETWORKS TAB -->
+        <section id="tab-networks" class="tab-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon cyan">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="6" height="6" rx="1"/><rect x="16" y="2" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 8v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="12" y1="13" x2="12" y2="16"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Total Networks</span>
+                        <span id="stat-networks-total" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon emerald">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Bridge Driver</span>
+                        <span id="stat-networks-bridge" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon violet">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Isolated (Internal)</span>
+                        <span id="stat-networks-internal" class="stat-num">0</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon amber">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/></svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-label">Connected Endpoints</span>
+                        <span id="stat-networks-endpoints" class="stat-num">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-header">
+                <h2 class="section-title">Podman Networks & IPAM</h2>
+                <div class="section-actions">
+                    <input type="text" id="network-search-input" class="form-input" placeholder="Filter networks, subnet, driver..." style="width: 210px; padding: 6px 12px; font-size: 13px;" data-input="handleNetworkSearch" data-input-args="[]"/>
+                    <button class="btn btn-primary" data-click="openCreateNetworkModal" data-click-args="[]">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        Create Network
+                    </button>
+                    <button class="btn btn-secondary" data-click="loadNetworks" data-click-args="[]" title="Refresh Networks">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                        Refresh
+                    </button>
+                </div>
+            </div>
+
+            <div id="networks-list" class="cards-grid">
+                <!-- Loaded dynamically -->
+            </div>
+        </section>
+
+
+    <section id="tab-sessions" class="tab-content">
+        <div class="section-header"><h2>Disposable Sessions</h2><button id="session-new" class="btn btn-primary">New Disposable Session</button></div>
+        <p>Session containers auto-remove on exit. Images, caches and explicitly retained resources can remain.</p>
+        <div id="session-list" class="container-grid"></div>
+        <h3>Reusable recipes &amp; starters</h3><div id="session-recipes"></div>
+        <details><summary>Import / export recipe</summary><textarea id="session-transfer" class="form-input" rows="6" aria-label="Recipe JSON"></textarea><button id="session-import" class="btn btn-secondary">Review import</button></details>
+    </section>
+    <section id="tab-remote" class="tab-content">
+        <h2>Remote connections</h2><p>Explicit SSH profiles for pre-provisioned rootless Podman. No remote setup, service installation, or host configuration changes. Workload declarations remain authoritative. Remote loopback is reached through a visible workstation loopback tunnel.</p>
+        <details><summary>Add / replace SSH profile</summary>
+            <label class="form-label" for="remote-name">Profile name</label><input id="remote-name" class="form-input">
+            <label class="form-label" for="remote-host">SSH host / IP</label><input id="remote-host" class="form-input">
+            <label class="form-label" for="remote-user">Non-root SSH user</label><input id="remote-user" class="form-input">
+            <label class="form-label" for="remote-port">SSH port</label><input id="remote-port" class="form-input" type="number" value="22">
+            <label class="form-label" for="remote-socket">Rootless Podman socket path</label><input id="remote-socket" class="form-input" placeholder="/run/user/1000/podman/podman.sock">
+            <label class="form-label" for="remote-identity">Optional local identity-file path (keys are never stored)</label><input id="remote-identity" class="form-input">
+            <label class="form-label" for="remote-known-hosts">Optional existing known-hosts file path (host-key checking stays strict)</label><input id="remote-known-hosts" class="form-input">
+            <button id="remote-save" class="btn btn-secondary">Save profile</button>
+        </details>
+        <select id="remote-profiles" class="form-input" aria-label="Remote profile"></select><button id="remote-observe" class="btn btn-primary">Observe remote containers</button>
+        <div id="remote-containers" class="container-grid"></div><h3>Visible SSH forwarding helpers</h3><div id="remote-tunnels"></div>
+    </section>
+    </main>
+
+    <!-- Modals -->
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Settings & Port Registry</h3>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;settings-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="checkbox-row" style="margin-bottom: 8px;">
+                        <input type="checkbox" id="setting-registry-enabled" data-change="toggleRegistrySettings" data-change-args="[]" data-change-field="checked"/>
+                        <span style="font-weight: 600;">Enable External Port Registry (ports.yaml)</span>
+                    </label>
+                    <p class="form-hint">Reconcile observed local container and host ports against an intended Git-managed homelab inventory.</p>
+                </div>
+                <div id="registry-config-fields" style="display: none;">
+                    <div class="form-group">
+                        <label class="form-label">Registry File Path (.yaml / .yml)</label>
+                        <div class="picker-group">
+                            <input type="text" id="setting-registry-path" class="form-input" placeholder="/path/to/inventory/network/ports.yaml"/>
+                            <div class="picker-actions">
+                                <button type="button" class="btn btn-secondary" data-click="pickRegistryFile" data-click-args="[]">Browse...</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="registry-test-result" class="registry-status-banner" style="display: none;"></div>
+                </div>
+
+                <div class="form-group" style="margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+                    <label class="form-label" style="margin-bottom: 4px;">Compose Trusted Roots</label>
+                    <p class="form-hint">
+                        A container's own labels (working directory, config file) are discovery hints only — Podder will
+                        never automatically read a reported Compose file unless it resolves inside one of these
+                        operator-approved roots. Leave empty to disable automatic Compose file reading entirely (the
+                        claimed path is still shown as unverified metadata).
+                    </p>
+                    <div id="compose-trusted-roots-list" class="port-rows-container" style="margin-top: 8px;">
+                        <!-- Dynamically managed trusted-root rows -->
+                    </div>
+                    <div class="picker-actions" style="margin-top: 8px;">
+                        <button type="button" class="btn btn-secondary" data-click="addComposeTrustedRootRow" data-click-args="[]">+ Add Root Manually</button>
+                        <button type="button" class="btn btn-secondary" data-click="pickComposeTrustedRoot" data-click-args="[]">Browse...</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="testRegistryFile" data-click-args="[]">Test / Reload</button>
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;settings-modal&quot;]">Cancel</button>
+                <button class="btn btn-primary" data-click="saveAppSettings" data-click-args="[]">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logs Modal -->
+    <div id="logs-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <h3 class="modal-title" id="logs-modal-title">Container Logs</h3>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;logs-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 12px; height: 100%; overflow: hidden;">
+                <pre id="logs-text" class="logs-output"></pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="refreshLogs" data-click-args="[]">Refresh</button>
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;logs-modal&quot;]">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="session-modal" class="modal"><div class="modal-content large">
+        <div class="modal-header"><h3 class="modal-title">Disposable Session</h3><button class="modal-close" data-click="closeModal" data-click-args="[&quot;session-modal&quot;]">&times;</button></div>
+        <div class="modal-body"><div id="session-form">
+            <div class="form-group"><label class="form-label" for="session-source">Source</label><select id="session-source" class="form-input"><option value="image">OCI image</option><option value="github">Public GitHub repository</option></select></div>
+            <div class="form-group"><label class="form-label" for="session-name">Recipe / session name</label><input id="session-name" class="form-input" value="session"></div>
+            <div class="form-group"><label class="form-label" for="session-image">Image reference</label><input id="session-image" class="form-input" placeholder="docker.io/library/nginx:alpine"></div>
+            <div id="session-github-fields" hidden>
+                <label class="form-label" for="session-repo">Public HTTPS GitHub URL</label><input id="session-repo" class="form-input" placeholder="https://github.com/owner/repository">
+                <label class="form-label" for="session-commit">Immutable commit SHA (40 characters)</label><input id="session-commit" class="form-input">
+                <label class="form-label" for="session-subdir">Build subdirectory (optional)</label><input id="session-subdir" class="form-input">
+                <label class="form-label" for="session-containerfile">Containerfile / Dockerfile (optional)</label><input id="session-containerfile" class="form-input">
+            </div>
+            <div class="form-group"><label class="form-label" for="session-policy">Persistence</label><select id="session-policy" class="form-input"><option value="temporary">Temporary</option><option value="configuration">Keep configuration</option><option value="data">Keep configuration + data</option></select></div>
+            <p>Published ports: host address, host port, container port, protocol. Defaults use loopback and a free high port. Select a row's radio button for the web endpoint.</p>
+            <div id="session-ports"></div><button id="session-add-port" class="btn btn-secondary" type="button">Add published port</button>
+            <p><label><input type="checkbox" id="session-exposure"> I explicitly approve the selected LAN / wildcard bindings</label></p>
+            <p><label><input id="session-keep-id" type="checkbox"> Map my user ID into this rootless session (keep-id), for apps that need access as a non-root user</label></p>
+            <label class="form-label" for="session-config-target">Explicit app config mount target (optional)</label><input id="session-config-target" class="form-input" placeholder="/config"><label><input id="session-config-rw" type="checkbox"> Allow config writes (read-only by default)</label>
+            <label class="form-label" for="session-data-target">Explicit app data mount target (optional)</label><input id="session-data-target" class="form-input" placeholder="/data">
+            <details><summary>External directories (never deleted; renew approval after reopening)</summary><label class="form-label" for="session-external-host">Host directory</label><input id="session-external-host" class="form-input"><label class="form-label" for="session-external-target">Container target</label><input id="session-external-target" class="form-input"><label><input id="session-external-rw" type="checkbox"> Allow writes</label><div id="session-external-saved"></div><p><label><input id="session-external-approve" type="checkbox"> I approve access to the listed external directories</label></p></details>
+            <label class="form-label" for="session-command">Command argv (optional JSON array of strings)</label><textarea id="session-command" class="form-input" rows="2" placeholder='["sleep", "300"]'></textarea>
+            <label><input id="session-save-command" type="checkbox"> Save these command arguments in the recipe; I confirm they contain no secrets</label>
+            <label class="form-label" for="session-env">Environment (KEY=value, one per line; values are never saved)</label><textarea id="session-env" class="form-input" rows="3"></textarea><p id="session-required"></p>
+            <p><label><input id="session-web" type="checkbox"> This session serves a web application</label></p><select id="session-scheme" class="form-input" aria-label="Web scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select><input id="session-web-path" class="form-input" value="/" aria-label="Web application path">
+        </div>
+        <pre id="session-preview-output" class="session-output"></pre>
+        <div id="session-build-controls" hidden><p><label><input id="session-build-approve" type="checkbox"> I reviewed this source, commit and build definition and approve executing its untrusted build instructions</label></p><p><label><input id="session-build-network" type="checkbox"> Approve RUN networking, including host networking (required by current builder; image pulls, remote ADD and other builder fetches are separate)</label></p><button id="session-build" class="btn btn-primary">Build reviewed source</button></div>
+        </div>
+        <div class="modal-footer"><button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;session-modal&quot;]">Cancel</button><button id="session-save-recipe" class="btn btn-secondary">Save recipe</button><button id="session-preview" class="btn btn-secondary">Preview / review source</button><button id="session-launch" class="btn btn-primary" hidden>Launch reviewed session</button></div>
+    </div></div>
+    <div id="session-cleanup-modal" class="modal"><div class="modal-content">
+        <div class="modal-header"><h3 class="modal-title">Session cleanup preview</h3><button class="modal-close" data-click="closeModal" data-click-args="[&quot;session-cleanup-modal&quot;]">&times;</button></div>
+        <div class="modal-body"><pre id="session-cleanup-output" class="session-output"></pre><p><label><input id="session-cleanup-image" type="checkbox"> Also remove the proven session-owned build image if unused</label></p><p id="session-cleanup-launch-row" hidden><label><input id="session-cleanup-launch" type="checkbox"> I verified all interrupted launch commands have exited and cannot start a container later</label></p><p id="session-cleanup-build-row" hidden><label><input id="session-cleanup-build" type="checkbox"> I verified no interrupted build process is still using this workspace</label></p><p><label><input id="session-cleanup-confirm" type="checkbox"> I confirm stopping this session and deleting only the listed owned temporary resources</label></p></div>
+        <div class="modal-footer"><button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;session-cleanup-modal&quot;]">Cancel</button><button id="session-cleanup-apply" class="btn btn-danger">Stop / cleanup</button></div>
+    </div></div>
+
+    <div id="remote-application-modal" class="modal"><div class="modal-content">
+        <div class="modal-header"><h3 class="modal-title">Remote Application</h3><button class="modal-close" data-click="closeModal" data-click-args="[&quot;remote-application-modal&quot;]">&times;</button></div>
+        <div class="modal-body"><p id="remote-endpoint-status"></p>
+            <label class="form-label" for="remote-kind">Application kind</label><select id="remote-kind" class="form-input"><option value="none">None</option><option value="web">Web</option><option value="gui">Provisioned Xpra HTML5 viewer</option></select>
+            <label class="form-label" for="remote-mapping">Remote published TCP mapping (confirm HTTP)</label><select id="remote-mapping" class="form-input"></select>
+            <select id="remote-scheme" class="form-input" aria-label="Remote web scheme"><option value="http">HTTP inside encrypted SSH</option><option value="https">HTTPS (certificate must validate on forwarded URL)</option></select><input id="remote-path" class="form-input" value="/" aria-label="Remote application path">
+            <label class="form-label" for="remote-gui-id">Xpra session identity (GUI only)</label><input id="remote-gui-id" class="form-input"><label><input id="remote-gui-auth" type="checkbox"> I verified this Xpra viewer requires authentication</label>
+            <p>Known host keys and non-interactive SSH credentials must already be provisioned. Forwarding never disables TLS checks or opens a LAN listener.</p>
+            <input id="remote-copy-url" class="form-input" readonly aria-label="Forwarded URL (select to copy)">
+        </div><div class="modal-footer"><button id="remote-application-save" class="btn btn-secondary">Save settings</button><button id="remote-open" class="btn btn-primary">Open via SSH tunnel</button></div>
+    </div></div>
+
+    <!-- Run Container Modal -->
+    <div id="run-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Run New Container</h3>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;run-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Image Name *</label>
+                    <input type="text" id="run-image" class="form-input" placeholder="e.g. docker.io/library/alpine:latest" required/>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Container Name (Optional)</label>
+                    <input type="text" id="run-name" class="form-input" placeholder="e.g. my-app"/>
+                </div>
+                <div class="form-group">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <label class="form-label" style="margin-bottom: 0;">Port Mappings (Optional)</label>
+                        <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" data-click="addRunPortRow" data-click-args="[]">+ Add Port</button>
+                    </div>
+                    <div id="run-ports-container" class="port-rows-container">
+                        <!-- Dynamically managed port rows -->
+                    </div>
+                    <div id="run-exposure-warning" class="exposure-warning-banner" style="display: none;"></div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Host Content (Optional)</label>
+                    <div class="picker-group">
+                        <input type="text" id="run-host-path" class="form-input" placeholder="Choose a host folder or image file" readonly/>
+                        <div class="picker-actions">
+                            <button type="button" class="btn btn-secondary" data-click="pickRunHostPath" data-click-args="[&quot;folder&quot;]">Pick Folder</button>
+                            <button type="button" class="btn btn-secondary" data-click="pickRunHostPath" data-click-args="[&quot;image&quot;]">Pick Image</button>
+                        </div>
+                    </div>
+                    <p class="form-hint">Use a native file explorer to mount a folder or single image file into the container.</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Container Mount Path (Optional)</label>
+                    <input type="text" id="run-container-path" class="form-input" placeholder="e.g. /app/host or /usr/share/nginx/html/image.png"/>
+                </div>
+                <label class="checkbox-row">
+                    <input type="checkbox" id="run-mount-readonly" checked/>
+                    <span>Mount selected host content as read-only</span>
+                </label>
+                <div class="form-group">
+                    <label class="form-label">Command (Optional)</label>
+                    <input type="text" id="run-command" class="form-input" placeholder="e.g. sleep 1000"/>
+                </div>
+                <label class="checkbox-row" style="margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+                    <input type="checkbox" id="run-save-spec" checked data-change="renderRunPortRows" data-change-args="[]"/>
+                    <span style="font-weight: 550;">Save as Podder-Managed Workload (Persistent Declarative Spec)</span>
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;run-modal&quot;]">Cancel</button>
+                <button class="btn btn-primary" data-click="submitRunContainer" data-click-args="[]">Run Container</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Spec Viewer Modal -->
+    <div id="spec-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <h3 class="modal-title" id="spec-modal-title">Container Specification</h3>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;spec-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 12px; height: 100%; overflow: hidden;">
+                <div id="spec-environment"></div>
+                <pre id="spec-text" class="logs-output" style="color: #a5b4fc; font-family: var(--font-mono);"></pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;spec-modal&quot;]">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Ports / Mutation Modal -->
+    <div id="edit-ports-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <h3 class="modal-title" id="edit-ports-title">Edit Container Ports</h3>
+                    <div id="edit-ports-provenance" style="margin-top: 4px;"></div>
+                </div>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;edit-ports-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="edit-ports-container-id" />
+                <input type="hidden" id="edit-ports-service-name" />
+                <input type="hidden" id="edit-ports-unit-name" />
+
+                <!-- Fail-closed load error: shown instead of any editable
+                     state when fresh backend inspection could not be
+                     confirmed. Never present a possibly-stale or blank
+                     editor when this is showing. -->
+                <div id="edit-ports-load-error" style="display: none; margin-bottom: 15px;">
+                    <div class="exposure-warning-banner" id="edit-ports-load-error-text"></div>
+                </div>
+
+                <!-- External Orchestrator Guidance (Compose / Quadlet / Pod /
+                     not-safely-reproducible). For Compose/Quadlet this is
+                     INSPECTION + GUIDANCE ONLY -- Podder never mutates or
+                     restarts these workloads automatically; see the backend
+                     MutateComposePorts/MutateQuadletPorts read-only guards. -->
+                <div id="edit-ports-guidance-box" style="display: none; margin-bottom: 15px;">
+                    <div class="exposure-warning-banner" id="edit-ports-guidance-text"></div>
+                    <div id="edit-ports-file-info" style="display: none; font-size: 11px; color: var(--text-muted); margin: 8px 0; font-family: var(--font-mono);"></div>
+                    <div id="edit-ports-snippet-wrapper" style="margin-top: 10px; display: none;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <span class="field-mini-label">Configuration Snippet:</span>
+                            <button type="button" class="btn btn-secondary btn-xs" data-click="copyEditPortsSnippet" data-click-args="[]">Copy Snippet</button>
+                        </div>
+                        <pre id="edit-ports-snippet-text" class="logs-output" style="max-height: 140px; font-family: var(--font-mono); color: #93c5fd;"></pre>
+                    </div>
+                </div>
+
+                <!-- Direct Port Editing Area. For a Podder-managed
+                     workload this is the real mutation editor. For
+                     Compose/Quadlet this is ONLY used to specify the
+                     desired ports so a snippet can be generated -- it never
+                     submits a mutation. -->
+                <div id="edit-ports-interactive-area">
+                    <div class="form-group">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <label class="form-label" style="margin-bottom: 0;">Published Ports</label>
+                            <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" data-click="addEditPortRow" data-click-args="[]">+ Add Port</button>
+                        </div>
+                        <div id="edit-ports-rows-container" class="port-rows-container">
+                            <!-- Dynamically managed port rows -->
+                        </div>
+                        <div id="edit-ports-exposure-warning" class="exposure-warning-banner" style="display: none;"></div>
+                    </div>
+
+                    <!-- Mutation Transaction Steps Log -->
+                    <div id="edit-ports-steps-box" style="display: none; margin-top: 15px;">
+                        <span class="field-mini-label">Transaction Log:</span>
+                        <div id="edit-ports-steps-list" style="margin-top: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 4px;"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;edit-ports-modal&quot;]">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-port-mutation" data-click="submitPortMutation" data-click-args="[]">Mutate Ports (Atomic Transaction)</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Workload Adoption Modal -->
+    <div id="adopt-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <div>
+                    <h3 class="modal-title" id="adopt-modal-title">Adopt Workload into Podder</h3>
+                    <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Convert this ad-hoc container into a declarative Podder-managed service</div>
+                </div>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;adopt-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="adopt-container-id" />
+                <div id="adopt-assessment-loading" style="text-align: center; padding: 20px; color: var(--text-muted);">
+                    Analyzing container configuration...
+                </div>
+                <div id="adopt-assessment-content" style="display: none;">
+                    <div class="form-group">
+                        <label class="form-label">Service Name *</label>
+                        <input type="text" id="adopt-service-name" class="form-input" placeholder="e.g. web-app"/>
+                        <p class="form-hint">Declarative spec will be stored under <code>~/.config/podder/services/&lt;name&gt;.json</code></p>
+                    </div>
+                    
+                    <div id="adopt-warnings-box" style="display: none; margin-bottom: 12px;"></div>
+
+                    <div class="form-group">
+                        <label class="form-label">Extracted Declarative Spec Preview</label>
+                        <pre id="adopt-spec-preview" class="logs-output" style="max-height: 220px; font-family: var(--font-mono); color: #6ee7b7;"></pre>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;adopt-modal&quot;]">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-adopt" data-click="submitAdoption" data-click-args="[]">Adopt Workload</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Network Modal -->
+    <div id="create-network-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Create Podman Network</h3>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;create-network-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Network Name *</label>
+                    <input type="text" id="net-create-name" class="form-input" placeholder="e.g. custom-bridge" required/>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Driver</label>
+                    <select id="net-create-driver" class="form-input">
+                        <option value="bridge" selected>bridge (Default container bridge)</option>
+                        <option value="macvlan">macvlan (Direct MAC address on host interface)</option>
+                        <option value="ipvlan">ipvlan (L2/L3 host interface)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Subnet CIDR (Optional)</label>
+                    <input type="text" id="net-create-subnet" class="form-input" placeholder="e.g. 10.89.5.0/24"/>
+                    <p class="form-hint">Leave blank to auto-allocate an available subnet.</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Gateway IP (Optional)</label>
+                    <input type="text" id="net-create-gateway" class="form-input" placeholder="e.g. 10.89.5.1"/>
+                </div>
+                <div class="form-group" style="margin-top: 15px; display: flex; flex-direction: column; gap: 8px;">
+                    <label class="checkbox-row" style="margin-bottom: 0;">
+                        <input type="checkbox" id="net-create-dns" checked/>
+                        <span style="font-weight: 500;">Enable Container Name DNS Resolution</span>
+                    </label>
+                    <label class="checkbox-row" style="margin-bottom: 0;">
+                        <input type="checkbox" id="net-create-internal"/>
+                        <span style="font-weight: 500;">Internal / Isolated (Block external internet access)</span>
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;create-network-modal&quot;]">Cancel</button>
+                <button class="btn btn-primary" id="btn-submit-create-network" data-click="submitCreateNetwork" data-click-args="[]">Create Network</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Build Image Modal -->
+    <div id="build-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Build Image from Folder</h3>
+                <button class="modal-close" data-click="closeModal" data-click-args="[&quot;build-modal&quot;]">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Image Tag *</label>
+                    <input type="text" id="build-tag" class="form-input" placeholder="e.g. my-app:latest" required/>
+                </div>
+                <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 15px;">After clicking Build, you will be prompted to select the directory containing your Dockerfile.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;build-modal&quot;]">Cancel</button>
+                <button class="btn btn-primary" data-click="submitBuildImage" data-click-args="[]">Select Folder & Build</button>
+            </div>
+        </div>
+    </div>
+
+
+    <div id="launcher-modal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header"><h3 class="modal-title">Configure Application — <span id="launcher-name"></span></h3><button class="modal-close" data-click="closeModal" data-click-args="[&quot;launcher-modal&quot;]">&times;</button></div>
+            <div class="modal-body">
+                <p id="launcher-message"></p><div id="launcher-stale"></div>
+                <p>Local Podman host only. Select TCP mappings you know serve HTTP(S). These preferences do not change workload ownership or published ports. Host networking, remote hosts, and tunnels are not supported yet.</p>
+                <label class="form-label" for="launcher-kind">Application kind</label>
+                <select id="launcher-kind" class="form-select"><option value="none">None / background service</option><option value="web">Web (HTTP / HTTPS)</option><option value="gui">Provisioned Xpra HTML5 viewer</option><option value="terminal">Explicit terminal command</option></select>
+                <div id="launcher-gui-fields" hidden><p>Provision and authenticate Xpra separately. Podder opens its published HTML5 viewer and does not forward host display sockets or own the provider. Session containers use normal scoped session cleanup.</p><label class="form-label" for="launcher-gui-identity">Provisioned session identity</label><input id="launcher-gui-identity" class="form-input"><p><label><input id="launcher-gui-auth" type="checkbox"> I verified this viewer requires authentication and belongs to the named session</label></p></div>
+                <div id="launcher-terminal-fields" hidden><label class="form-label" for="launcher-terminal-program">Terminal program</label><select id="launcher-terminal-program" class="form-input"><option>x-terminal-emulator</option><option>konsole</option><option>gnome-terminal</option><option>wt.exe</option></select><label class="form-label" for="launcher-terminal-command">Explicit container command argv (no host shell interpolation)</label><textarea id="launcher-terminal-command" class="form-input" rows="2">["/bin/sh"]</textarea><p>Every launch requires consent. macOS native terminal integration is unavailable.</p></div>
+                <div id="launcher-web-fields" hidden>
+                    <p>Each row selects a published mapping, scheme, path, and optional preferred endpoint. Wildcard bindings use this computer's loopback address. Do not include credentials; query strings are not saved.</p>
+                    <div id="launcher-endpoints"></div>
+                    <button id="launcher-add-endpoint" class="btn btn-secondary">Add web endpoint</button>
+                    <button id="launcher-clear-preferred" class="btn btn-secondary">Always choose endpoint</button>
+                    <p><label><input type="checkbox" id="launcher-after-start"> Offer Start &amp; Open (wait up to 15 seconds for HTTP/S)</label></p>
+                </div>
+            </div>
+            <div class="modal-footer"><button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;launcher-modal&quot;]">Cancel</button><button id="launcher-save" class="btn btn-primary">Save</button></div>
+        </div>
+    </div>
+    <div id="launcher-choose-modal" class="modal"><div class="modal-content">
+        <div class="modal-header"><h3 class="modal-title">Choose Endpoint</h3><button class="modal-close" data-click="closeModal" data-click-args="[&quot;launcher-choose-modal&quot;]">&times;</button></div>
+        <div class="modal-body"><select id="launcher-choice" class="form-select" aria-label="Web endpoint"></select><p><label><input type="checkbox" id="launcher-remember"> Remember this endpoint</label></p></div>
+        <div class="modal-footer"><button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;launcher-choose-modal&quot;]">Cancel</button><button id="launcher-choose-open" class="btn btn-primary">Continue</button></div>
+    </div></div>
+    <div id="launcher-result-modal" class="modal"><div class="modal-content">
+        <div class="modal-header"><h3 class="modal-title">Web URL</h3><button class="modal-close" data-click="closeModal" data-click-args="[&quot;launcher-result-modal&quot;]">&times;</button></div>
+        <div class="modal-body"><p id="launcher-result-message"></p><input id="launcher-result-url" class="form-input" readonly aria-label="Configured web URL"></div>
+        <div class="modal-footer"><button class="btn btn-secondary" data-click="closeModal" data-click-args="[&quot;launcher-result-modal&quot;]">Close</button><button id="launcher-copy-url" class="btn btn-primary">Copy URL</button></div>
+    </div></div>
+
+    <!-- Toast Notification Banner -->
+    <div id="notification" class="notification-banner" role="status" aria-live="polite">
+        <div id="notification-icon" class="notification-icon">
+            <!-- Icon is injected dynamically -->
+        </div>
+        <div id="notification-text" class="notification-msg"></div>
+        <button id="notification-close" class="notification-close" type="button" aria-label="Dismiss notification">&times;</button>
+    </div>
+
+    <script type="module" src="/src/bootstrap.js"></script>
+</body>
+</html>

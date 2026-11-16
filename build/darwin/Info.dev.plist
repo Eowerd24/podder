@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>CFBundlePackageType</key>
+            <string>APPL</string>
+        <key>CFBundleName</key>
+            <string>Podder</string>
+        <key>CFBundleExecutable</key>
+            <string>podder</string>
+        <key>CFBundleIdentifier</key>
+            <string>io.github.eowerd24.podder</string>
+        <key>CFBundleVersion</key>
+            <string>1.5.5</string>
+        <key>CFBundleGetInfoString</key>
+            <string>Podman GUI Control Panel and CLI Compose Helper</string>
+        <key>CFBundleShortVersionString</key>
+            <string>1.5.5</string>
+        <key>CFBundleIconFile</key>
+            <string>icons</string>
+        <key>CFBundleIconName</key>
+            <string>appicon</string>
+        <key>LSMinimumSystemVersion</key>
+            <string>12.0.0</string>
+        <key>NSHighResolutionCapable</key>
+            <string>true</string>
+        <key>NSHumanReadableCopyright</key>
+            <string>(c) 2026, Podder Contributors</string>
+        <key>NSAppTransportSecurity</key>
+        <dict>
+            <key>NSAllowsLocalNetworking</key>
+            <true/>
+        </dict>
+    </dict>
+</plist>

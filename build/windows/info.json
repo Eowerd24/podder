@@ -1,0 +1,15 @@
+{
+	"fixed": {
+		"file_version": "1.5.5"
+	},
+	"info": {
+		"0000": {
+			"ProductVersion": "1.5.5",
+			"CompanyName": "Podder",
+			"FileDescription": "A lightweight desktop GUI and CLI for managing local Podman containers, images, and Compose/Quadlet workloads",
+			"LegalCopyright": "(c) 2026, Podder Contributors",
+			"ProductName": "Podder",
+			"Comments": "Podman GUI Control Panel and CLI Compose Helper"
+		}
+	}
+}

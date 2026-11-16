@@ -1,0 +1,97 @@
+# Wails specific
+bin/
+.task/
+frontend/dist/
+frontend/node_modules/
+frontend/bindings/
+build/linux/appimage/build/
+build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+build/ios/xcode/overlay.json
+build/ios/xcode/gen/
+build/android/overlay.json
+build/android/gen/
+
+# Go compile/test outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+app.test
+test.out
+
+# IDEs/Editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+
+# Local agent notes
+AGENTS.md
+AGY.md
+PLAN.md
+PROGRESS.md
+
+# Local documentation and planning material
+/docs/
+/podder-networking-port-admin-primer-roadmap.md
+
+# Local compiler cache
+/.cache/
+
+# Provenance signing tool dependencies
+/scripts/provenance/node_modules/
+
+# Local agent state and tooling
+.agents/
+.claude/
+.codex/
+.codebase-memory/
+.aws/
+
+# Private security reviews, audit output, and operational evidence
+/security-reviews/
+/assurance-*/
+/REVIEW_FINDINGS.md
+/podder_audit_report.md
+/podder_provenance_check.py
+/evidence/
+/artifacts/
+/receipts/
+*.log
+
+# Local secrets; keep explicitly named example configurations publishable
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*_ed25519
+
+# Disposable VM images and local state
+*.qcow2
+*.vmdk
+*.vdi
+*.iso
+*.sock
+*.pid
+
+# Dependency caches and Python outputs
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/

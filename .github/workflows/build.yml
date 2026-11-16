@@ -1,0 +1,230 @@
+name: Build Linux Native Binary
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main" ]
+
+# Build/test jobs only need to read the repository. contents: write is
+# granted only to the release-publishing job, and only for a tag push.
+permissions:
+  contents: read
+
+env:
+  # Keep the Wails v3 CLI pinned to the exact same version as the library
+  # dependency in go.mod, instead of `wails3@latest` — installing a
+  # different CLI version than the library it drives is how generated
+  # bindings/build config can silently drift out of sync with the code.
+  WAILS_VERSION: v3.0.0
+
+jobs:
+  test:
+    name: Test & Build
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        # Check out the event commit directly. Passing ref+commit implicitly lets
+        # checkout overwrite an annotated tag with its peeled commit on retry.
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Release verification regressions
+      run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_verify_release.py
+
+    - name: Verify signed release tag and version ordering
+      if: startsWith(github.ref, 'refs/tags/v')
+      run: python3 scripts/verify-release.py
+
+    - name: Setup Go
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      with:
+          go-version: '1.26.11'
+          cache: true
+
+    - name: Setup Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install and audit provenance dependencies
+      run: |
+        npm ci --ignore-scripts --prefix scripts/provenance
+        npm audit --audit-level=low --prefix scripts/provenance
+
+    - name: Public provenance policy regressions
+      run: node --test scripts/provenance/*.test.mjs
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev build-essential pkg-config
+
+    - name: Install Wails v3 CLI
+      run: go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}
+
+    - name: Prepare clean-tree embed input
+      run: mkdir -p frontend/dist && touch frontend/dist/.build-placeholder
+
+    - name: Install Frontend NPM Dependencies
+      working-directory: ./frontend
+      run: npm ci
+
+    - name: Frontend vulnerability check
+      working-directory: ./frontend
+      run: npm audit --audit-level=low
+
+    - name: Frontend Unit Tests (trust-boundary escaping)
+      working-directory: ./frontend
+      run: npm test
+
+    - name: Generate Wails bindings
+      run: |
+        export PATH="$PATH:$(go env GOPATH)/bin"
+        wails3 generate bindings -clean=true -time-type=Date
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: npm run build
+
+    # go vet/test must run AFTER the frontend build: main.go's
+    # `//go:embed all:frontend/dist` directive fails to even compile the
+    # package if frontend/dist doesn't exist yet.
+    - name: go vet
+      run: go vet ./...
+
+    - name: Reachable vulnerability check
+      # Source/symbol analysis exits nonzero on reachable findings; no continue-on-error.
+      run: |
+        go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+        "$(go env GOPATH)/bin/govulncheck" -mode=source -scan=symbol ./...
+
+    - name: go test
+      run: go test ./...
+
+    - name: Compile opt-in integration tests
+      # Compile without executing live-engine/browser campaigns in CI.
+      run: go test -tags integration -run '^$' ./...
+
+    - name: Server transport origin regressions
+      run: go test -tags server -run '^TestServerRuntimeKeepsUpstreamOriginPolicy$' .
+
+    - name: go test -race
+      # Race detector on the pure Go application/test code (the build/ios
+      # and build/android helper packages are platform-scaffolding, not
+      # part of the tested application).
+      run: go test -race .
+
+    - name: Build Application Binary
+      run: |
+        export PATH="$PATH:$(go env GOPATH)/bin"
+        wails3 build
+
+    - name: Upload Linux Binary Artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: podder-linux-amd64
+        path: bin/podder
+
+  release:
+    name: Publish Release
+    environment: release
+    concurrency:
+      group: podder-publish-${{ github.ref_name }}
+      cancel-in-progress: false
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+    - name: Checkout release policy and signed source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Verify signed source release
+      run: |
+        python3 scripts/verify-release.py
+        echo "SOURCE_TAG_OBJECT=$(git rev-parse "$GITHUB_REF")" >> "$GITHUB_ENV"
+
+    - name: Setup provenance Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: '24'
+
+    - name: Install pinned provenance signing dependencies
+      run: |
+        npm ci --ignore-scripts --prefix scripts/provenance
+        npm audit --audit-level=low --prefix scripts/provenance
+
+    - name: Download Linux Binary Artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: podder-linux-amd64
+        path: bin
+
+    - name: Sign and verify public binary provenance
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_REPO: ${{ github.repository }}
+        EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+        REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        SOURCE_REF: ${{ github.ref }}
+        SOURCE_SHA: ${{ github.sha }}
+        POLICY_WORKFLOW: .github/workflows/build.yml
+      run: |
+        node scripts/provenance/sign.mjs bin/podder bin/podder.sigstore.json
+        gh attestation verify bin/podder --bundle bin/podder.sigstore.json \
+          --repo "$GITHUB_REPOSITORY" --source-digest "$GITHUB_SHA" \
+          --source-ref "$GITHUB_REF" --signer-digest "$GITHUB_SHA" \
+          --signer-workflow "$GITHUB_REPOSITORY/$POLICY_WORKFLOW" \
+          --deny-self-hosted-runners \
+          --predicate-type https://slsa.dev/provenance/v1 --format json > bin/provenance-verification.json
+        node scripts/provenance/verify.mjs bin/podder bin/provenance-verification.json \
+          "$SOURCE_REF" "$SOURCE_SHA" "$SOURCE_TAG_OBJECT"
+        chmod +x bin/podder
+        (cd bin && sha256sum podder podder.sigstore.json > SHA256SUMS)
+
+    # Upload while still a draft: immutable releases reject asset changes after
+    # publication. The final step publishes only the complete attested artifact.
+    - name: Prepare GitHub Release
+      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      with:
+        files: |
+          bin/podder
+          bin/podder.sigstore.json
+          bin/SHA256SUMS
+        fail_on_unmatched_files: true
+        body: |
+          This release includes a public Sigstore provenance bundle, verified before publication against Fulcio and Rekor.
+          Signing policy: `.github/workflows/build.yml` at `${{ github.sha }}` / `${{ github.ref }}`.
+          Application source: `${{ github.sha }}` / `${{ github.ref }}`; its SSH-signed tag is verified independently.
+          The policy identity and application source identity are both bound in the signed SLSA statement.
+          Verification instructions: https://github.com/Eowerd24/podder/tree/${{ github.sha }}/scripts/provenance
+        generate_release_notes: true
+        draft: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Publish and verify immutable release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        RELEASE_TAG: ${{ github.ref_name }}
+      run: |
+        gh release edit "$RELEASE_TAG" --draft=false --latest
+        immutable="$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .immutable)"
+        test "$immutable" = true

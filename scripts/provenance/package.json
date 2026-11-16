@@ -1,0 +1,14 @@
+{
+  "name": "podder-release-provenance",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test policy.test.mjs" },
+  "dependencies": { "@actions/attest": "1.6.0" },
+  "overrides": {
+    "@sigstore/core": "3.2.1",
+    "undici": "6.29.1",
+    "glob": "14.0.6"
+  }
+}

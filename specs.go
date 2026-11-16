@@ -15,13 +15,17 @@ import (
 // Podder. A spec is only considered safely replayable when its
 // SchemaVersion is <= this value; a spec written by a newer, unknown schema
 // must never be guessed at or partially replayed.
-const CurrentSpecSchemaVersion = 3
+const CurrentSpecSchemaVersion = 4
 
 // BindMountSpec models a host-to-container filesystem mount.
 type BindMountSpec struct {
-	HostPath        string `json:"hostPath"`
-	ContainerPath   string `json:"containerPath"`
-	ReadOnly        bool   `json:"readOnly"`
+	HostPath      string `json:"hostPath"`
+	ContainerPath string `json:"containerPath"`
+	ReadOnly      bool   `json:"readOnly"`
+	// Restrictive bind flags require schema 4 so older builds cannot silently
+	// drop them during replay. Disposable session schema 1 does not support them.
+	NoSuid          bool   `json:"noSuid,omitempty"`
+	NoDev           bool   `json:"noDev,omitempty"`
 	ObjectIdentity  string `json:"objectIdentity,omitempty"`
 	sourceIdentity  string
 	sourceFile      *os.File
@@ -78,6 +82,9 @@ type ContainerSpec struct {
 // immediately before applying any create or mutation.
 func ValidateSpec(spec ContainerSpec) []string {
 	var errs []string
+	if err := validateBindRestrictionSchema(spec); err != nil {
+		errs = append(errs, err.Error())
+	}
 	if err := validatePodmanOperand(spec.Image); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -303,6 +310,9 @@ func saveSpec(spec ContainerSpec) error {
 	if spec.SchemaVersion == 0 {
 		spec.SchemaVersion = CurrentSpecSchemaVersion
 	}
+	if err := validateBindRestrictionSchema(spec); err != nil {
+		return err
+	}
 	if err := approveContainerSpecBinds(&spec); err != nil {
 		return fmt.Errorf("invalid container bind: %w", err)
 	}
@@ -360,6 +370,9 @@ func writeCandidateSpecPrepared(spec ContainerSpec) (string, ContainerSpec, erro
 	}
 	if spec.SchemaVersion == 0 {
 		spec.SchemaVersion = CurrentSpecSchemaVersion
+	}
+	if err := validateBindRestrictionSchema(spec); err != nil {
+		return "", spec, err
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -754,7 +767,7 @@ func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
 				return false
 			}
 			kind, ok := classifyLifecycle(created.State)
-			return ok && kind == lifecycleRunning && strings.TrimSpace(created.ImageID) == strings.TrimSpace(spec.ResolvedImage) && containerMatchesSpecLabels(created, *spec) && mappingsExactlyEqual(spec.PortMappings, created.PortMappings)
+			return ok && kind == lifecycleRunning && strings.TrimSpace(created.ImageID) == strings.TrimSpace(spec.ResolvedImage) && containerMatchesSpecLabels(created, *spec) && mappingsExactlyEqual(spec.PortMappings, created.PortMappings) && p.verifyContainerBindRestrictions(created.Id, spec.Binds) == nil
 		})
 		if !verified {
 			removeErr := p.exactTransactionContainer(result.NewContainerID, spec.Name, nil, spec)
@@ -786,6 +799,9 @@ func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
 	}
 	if strings.TrimSpace(target.ImageID) != strings.TrimSpace(spec.ResolvedImage) || !mappingsExactlyEqual(spec.PortMappings, target.PortMappings) {
 		return result, fmt.Errorf("deploy blocked: existing workload %q has drifted from its authoritative image or port configuration", spec.Name)
+	}
+	if err := p.verifyContainerBindRestrictions(target.Id, spec.Binds); err != nil {
+		return result, fmt.Errorf("deploy blocked: existing workload bind restrictions have drifted: %w", err)
 	}
 	originalLifecycle, ok := classifyLifecycle(target.State)
 	if !ok {
@@ -872,7 +888,7 @@ func (p *PodmanService) DeploySpec(name string) (*DeploySpecResult, error) {
 			return false
 		}
 		kind, supported := classifyLifecycle(replacement.State)
-		return supported && kind == originalLifecycle && strings.TrimSpace(replacement.ImageID) == strings.TrimSpace(spec.ResolvedImage) && containerMatchesSpecLabels(replacement, *spec) && mappingsExactlyEqual(spec.PortMappings, replacement.PortMappings)
+		return supported && kind == originalLifecycle && strings.TrimSpace(replacement.ImageID) == strings.TrimSpace(spec.ResolvedImage) && containerMatchesSpecLabels(replacement, *spec) && mappingsExactlyEqual(spec.PortMappings, replacement.PortMappings) && p.verifyContainerBindRestrictions(replacement.Id, spec.Binds) == nil
 	})
 	if !verified {
 		return rollback("Deployment failed: replacement identity, lifecycle, image, labels, or ports did not verify.", true)

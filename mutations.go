@@ -511,6 +511,10 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: fmt.Sprintf("Podder-managed metadata inconsistent: current runtime ports differ from the known-good spec (missing: %v, unexpected: %v). Mutation blocked.", missing, unexpected)})
 		return result, nil
 	}
+	if err := p.verifyContainerBindRestrictions(target.Id, oldSpec.Binds); err != nil {
+		result.Steps = append(result.Steps, PortMutationStepResult{Step: "PREFLIGHT", Passed: false, Message: fmt.Sprintf("Stored bind restrictions do not match the current workload, mutation blocked: %v", err)})
+		return result, nil
+	}
 
 	// 2c. Capture original lifecycle; refuse anything we cannot safely
 	// reproduce (paused, restarting, unknown...).
@@ -727,6 +731,9 @@ func (p *PodmanService) MutateContainerPorts(req PortMutationRequest) (*PortMuta
 	}
 	if ok, missing, unexpected := portMappingSetEqual(candidateSpec.PortMappings, newContainer.PortMappings); !ok {
 		return fail("PORT_VERIFY", fmt.Sprintf("Configured port mappings do not match the candidate spec (missing: %v, unexpected: %v).", missing, unexpected), true)
+	}
+	if err := p.verifyContainerBindRestrictions(newContainerID, candidateSpec.Binds); err != nil {
+		return fail("PORT_VERIFY", fmt.Sprintf("Replacement bind restrictions did not verify: %v", err), true)
 	}
 	result.ConfigurationVerified = true
 

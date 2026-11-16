@@ -159,6 +159,11 @@ func validateSessionSpec(s DisposableSessionSpec) error {
 	return nil
 }
 func validateSessionSource(s DisposableSessionSpec) error {
+	for _, bind := range s.ExternalBinds {
+		if bind.NoSuid || bind.NoDev {
+			return fmt.Errorf("nosuid/nodev bind restrictions require managed spec schema 4; session schema 1 cannot preserve them")
+		}
+	}
 	if s.GitHub != nil {
 		return validateGitHubSource(*s.GitHub)
 	}

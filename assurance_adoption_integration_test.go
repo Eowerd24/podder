@@ -2,20 +2,65 @@
 
 package main
 
-// Adapted from completion_v0151_adoption_cf_vm_test.go.txt. This deliberately
-// removes only seven fields unknown to the reviewed allow-list, emulating an
-// older inspect schema; enforced controls and original CreateCommand stay real.
+// Adoption counterfactuals use the engine's unmodified inspect schema. The
+// runner can deliberately drop a replayed ulimit to verify drift detection.
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-var assuranceOmittedFields = []string{"Config.HealthLogDestination", "Config.HealthcheckMaxLogCount", "Config.HealthcheckMaxLogSize", "HostConfig.AutoRemoveImage", "HostConfig.HostsFile", "UseImageHostname", "UseImageHosts"}
+// Bind fixtures must be readable by confined containers without requesting
+// runtime relabel options or weakening SELinux. Only new campaign-owned
+// sources are labeled, before filesystem identity approval or path-swap hooks.
+func labelAssuranceBindSources(t *testing.T, sources ...string) {
+	t.Helper()
+	if _, err := os.Stat("/sys/fs/selinux/enforce"); os.IsNotExist(err) {
+		return
+	} else if err != nil {
+		t.Fatalf("check fixture SELinux availability: %v", err)
+	}
+	base := os.Getenv("PODDER_R3_BASE")
+	if !filepath.IsAbs(base) {
+		t.Fatal("SELinux fixture labeling requires an explicit campaign root")
+	}
+	out := filepath.Join(filepath.Clean(base), "out")
+	for _, source := range sources {
+		physical, err := filepath.EvalSymlinks(source)
+		if err != nil || physical != filepath.Clean(source) || physical == out || !pathContains(out, physical) {
+			t.Fatalf("refuse SELinux labeling outside a new fixture source: %q (%v)", source, err)
+		}
+		paths := []string{}
+		if err := filepath.WalkDir(physical, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && !info.Mode().IsRegular() {
+				return fmt.Errorf("fixture source contains a symlink or special file: %s", path)
+			}
+			paths = append(paths, path)
+			return nil
+		}); err != nil {
+			t.Fatalf("validate SELinux fixture source: %v", err)
+		}
+		for _, path := range paths {
+			output, err := exec.Command("/usr/bin/chcon", "--no-dereference", "--type=container_file_t", "--", path).CombinedOutput()
+			if err != nil {
+				t.Fatalf("label new bind fixture %q container_file_t: %s (%v)", path, strings.TrimSpace(string(output)), err)
+			}
+		}
+	}
+}
 
 type assuranceAdoptionRunner struct {
 	*round2Runner
@@ -24,6 +69,20 @@ type assuranceAdoptionRunner struct {
 }
 
 func (r *assuranceAdoptionRunner) Run(name string, args ...string) (string, string, error) {
+	return r.RunContextWithFiles(context.Background(), name, nil, args...)
+}
+
+func (r *assuranceAdoptionRunner) RunContext(ctx context.Context, name string, args ...string) (string, string, error) {
+	return r.RunContextWithFiles(ctx, name, nil, args...)
+}
+
+func (r *assuranceAdoptionRunner) RunWithFiles(name string, files []*os.File, args ...string) (string, string, error) {
+	return r.RunContextWithFiles(context.Background(), name, files, args...)
+}
+
+// All managed execution paths must observe the fault, including the
+// descriptor-backed mount handoff. Inspect output is always passed through.
+func (r *assuranceAdoptionRunner) RunContextWithFiles(ctx context.Context, name string, files []*os.File, args ...string) (string, string, error) {
 	if r.dropUlimit && name == "podman" && len(args) > 0 && (args[0] == "run" || args[0] == "create") {
 		filtered := []string{}
 		for i := 0; i < len(args); i++ {
@@ -40,31 +99,16 @@ func (r *assuranceAdoptionRunner) Run(name string, args ...string) (string, stri
 		}
 		args = filtered
 	}
-	out, stderr, err := r.round2Runner.Run(name, args...)
-	if err == nil && name == "podman" && len(args) > 0 && args[0] == "inspect" {
-		var list []map[string]any
-		if err := json.Unmarshal([]byte(out), &list); err != nil {
-			return "", "", err
-		}
-		for _, c := range list {
-			for _, path := range assuranceOmittedFields {
-				section, key, ok := strings.Cut(path, ".")
-				if ok {
-					if m, ok := c[section].(map[string]any); ok {
-						delete(m, key)
-					}
-				} else {
-					delete(c, path)
-				}
-			}
-		}
-		b, e := json.Marshal(list)
-		if e != nil {
-			return "", "", e
-		}
-		out = string(b)
+	if name == "podman" {
+		return r.round2Runner.RunContextWithFiles(ctx, name, files, args...)
 	}
-	return out, stderr, err
+	if len(files) != 0 {
+		return "", "", fmt.Errorf("unexpected inherited files for %s", name)
+	}
+	if name == "ss" {
+		return (execCommandRunner{}).RunContext(ctx, "/usr/bin/ss", args...)
+	}
+	return "", "", fmt.Errorf("unexpected executable %s", name)
 }
 func TestAssuranceAdoptionCounterfactual(t *testing.T) {
 	raw, r, image := assuranceStore(t)
@@ -188,8 +232,9 @@ func TestAssuranceAdoptionBindPositiveControl(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixture, "sentinel"), []byte("adopted-bind"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, fixture)
 	name := "adoption-bind"
-	mount := "type=bind,src=" + fixture + ",target=/external,readonly"
+	mount := "type=bind,src=" + fixture + ",target=/external,readonly,nosuid,nodev"
 	out, stderr, err := r.Run("podman", "run", "-d", "--name", name, "--label", "org.podder.assurance=round2", "--mount", mount, "--", image, "sleep")
 	if err != nil {
 		t.Fatalf("fixture: %s %v", stderr, err)
@@ -217,6 +262,45 @@ func TestAssuranceAdoptionBindPositiveControl(t *testing.T) {
 	if err != nil || contents != "adopted-bind" {
 		t.Fatalf("adopted bind positive control failed: %q %s %v", contents, stderr, err)
 	}
+	stored, err := p.GetSpec(name)
+	if err != nil || stored == nil || stored.SchemaVersion != 4 || len(stored.Binds) != 1 || !stored.Binds[0].ReadOnly || !stored.Binds[0].NoSuid || !stored.Binds[0].NoDev {
+		t.Fatalf("restrictive bind did not persist as schema 4: %+v %v", stored, err)
+	}
+	// Exercise the persisted spec with no existing managed container. This
+	// must reproduce restrictions without the original assessment in memory.
+	if err := p.StopContainer(replacement.Id); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.forceRemoveContainer(replacement.Id); err != nil {
+		t.Fatal(err)
+	}
+	deployed, err := p.DeploySpec(name)
+	if err != nil || deployed == nil || !deployed.Success || deployed.NewContainerID == replacement.Id {
+		t.Fatalf("cold restricted-bind deployment failed: %+v %v", deployed, err)
+	}
+	verify := func(stage string) {
+		t.Helper()
+		data, stderr, err := r.Run("podman", "inspect", "--format", "json", "--", deployed.NewContainerID)
+		if err != nil {
+			t.Fatalf("%s inspect failed: %s %v", stage, stderr, err)
+		}
+		current, err := parseSingleInspect(data)
+		if err != nil || current.Id != deployed.NewContainerID {
+			t.Fatalf("%s container identity did not verify: %v", stage, err)
+		}
+		if err := verifyRequestedBindRestrictions(current, stored.Binds); err != nil {
+			t.Fatalf("%s lost persisted bind restrictions: %v", stage, err)
+		}
+		contents, stderr, err := r.Run("podman", "exec", "--", deployed.NewContainerID, "/fixture", "read", "/external/sentinel")
+		if err != nil || contents != "adopted-bind" {
+			t.Fatalf("%s bind contents changed: %q %s %v", stage, contents, stderr, err)
+		}
+	}
+	verify("cold deploy")
+	if err := p.RestartContainer(deployed.NewContainerID); err != nil {
+		t.Fatalf("ordinary restricted-bind restart failed: %v", err)
+	}
+	verify("ordinary restart")
 }
 
 func TestAssuranceManagedBindUsesVerifiedStartHandoff(t *testing.T) {
@@ -228,6 +312,7 @@ func TestAssuranceManagedBindUsesVerifiedStartHandoff(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixture, "sentinel"), []byte("managed-bind-restart"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, fixture)
 	name := "managed-bind-restart"
 	created, err := p.CreateContainer(ContainerCreateRequest{
 		Image: image, Name: name, Managed: true,
@@ -259,6 +344,7 @@ func TestAssuranceManagedBindUsesVerifiedStartHandoff(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(replacement, "sentinel"), []byte("managed-replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, replacement)
 	if err := os.Rename(fixture, moved); err != nil {
 		t.Fatal(err)
 	}
@@ -297,6 +383,7 @@ func TestAssuranceAdoptionBindSourceReplacementRefused(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(replacement, "sentinel"), []byte("replacement-object"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, approved, replacement)
 	name := "adoption-bind-replaced"
 	mount := "type=bind,src=" + approved + ",target=/external,readonly"
 	out, stderr, err := r.Run("podman", "run", "-d", "--name", name, "--label", "org.podder.assurance=round2", "--mount", mount, "--", image, "sleep")
@@ -412,6 +499,7 @@ func TestAssurancePinnedMountSurvivesPathReplacement(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outside, "sentinel"), []byte("replacement-object"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, approved, outside)
 	spec := DisposableSessionSpec{SchemaVersion: sessionSchema, Name: "pinned-mount", Image: image, Policy: "temporary", Command: []string{"sleep", "-d"}, AllowExternalBinds: true, ExternalBinds: []BindMountSpec{{HostPath: approved, ContainerPath: "/external", ReadOnly: true}}}
 	preview, err := p.PreviewDisposableSession(spec)
 	if err != nil {
@@ -485,6 +573,7 @@ func TestAssurancePinnedMountRejectsSecondPathReplacementBeforeStart(t *testing.
 	if err := os.WriteFile(filepath.Join(replacement, "sentinel"), []byte("replacement-second-window"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, approved, replacement)
 	spec := DisposableSessionSpec{
 		SchemaVersion: sessionSchema, Name: "second-window", Image: image, Policy: "temporary",
 		AllowExternalBinds: true,
@@ -560,6 +649,7 @@ func TestAssuranceManagedBindSurvivesPathReplacement(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(replacement, "sentinel"), []byte("replacement-managed-object"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, approved, replacement)
 	p.sessionMountsPinnedHook = func() {
 		if err := os.Rename(approved, moved); err != nil {
 			t.Fatal(err)
@@ -608,6 +698,7 @@ func TestAssuranceManagedFileBindSurvivesPathReplacement(t *testing.T) {
 	if err := os.WriteFile(replacement, []byte("replacement-file-object"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, approved, replacement)
 	p.sessionMountsPinnedHook = func() {
 		if err := os.Rename(approved, moved); err != nil {
 			t.Fatal(err)
@@ -659,6 +750,7 @@ func TestAssuranceUnmanagedBindRestartRefusesMissingApprovalWitness(t *testing.T
 	if err := os.WriteFile(filepath.Join(replacement, "sentinel"), []byte("unmanaged-replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	labelAssuranceBindSources(t, approved, replacement)
 	name := "unmanaged-bind-restart"
 	created, err := p.CreateContainer(ContainerCreateRequest{
 		Image: image, Name: name, Managed: false,

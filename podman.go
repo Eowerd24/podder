@@ -471,6 +471,13 @@ func (p *PodmanService) StartContainer(id string) error {
 		if err != nil {
 			return fmt.Errorf("%s", strings.TrimSpace(stderr))
 		}
+		if err := p.verifyContainerBindRestrictions(id, spec.Binds); err != nil {
+			_, _, stopErr := p.runCommand("stop", "--", id)
+			if stopErr != nil {
+				return fmt.Errorf("%w; container stop after failed mount verification also failed: %v", err, stopErr)
+			}
+			return err
+		}
 		return nil
 	}
 	_, stderr, err := p.runCommand("start", "--", id)
@@ -742,6 +749,13 @@ type ContainerCreateResult struct {
 // Unmanaged creation remains fully supported: Managed=false simply skips
 // steps 4 and 7, and no io.podder.managed label is ever applied.
 func (p *PodmanService) CreateContainer(req ContainerCreateRequest) (*ContainerCreateResult, error) {
+	if !req.Managed {
+		for _, bind := range req.Binds {
+			if bind.NoSuid || bind.NoDev {
+				return nil, fmt.Errorf("nosuid/nodev bind restrictions require managed creation with a replayable schema 4 spec")
+			}
+		}
+	}
 	operation, release, lockErr := p.managedOperation()
 	if lockErr != nil {
 		return nil, lockErr
@@ -955,7 +969,7 @@ func (p *PodmanService) verifyCreatedManagedContainer(containerID string, spec C
 		return false
 	}
 	ok, _, _ := portMappingSetEqual(spec.PortMappings, c.PortMappings)
-	return ok
+	return ok && p.verifyContainerBindRestrictions(containerID, spec.Binds) == nil
 }
 
 func containerMatchesSpecLabels(c *Container, spec ContainerSpec) bool {

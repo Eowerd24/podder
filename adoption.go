@@ -270,7 +270,7 @@ func assessRepresentability(raw inspectContainer) []string {
 			}
 			for _, option := range m.Options {
 				switch strings.ToLower(strings.TrimSpace(option)) {
-				case "", "rw", "ro", "rbind", "private", "rprivate":
+				case "", "rw", "ro", "rbind", "private", "rprivate", "nosuid", "nodev":
 				default:
 					add("bind mount at %q uses non-default option %q, which Podder cannot reproduce", m.Destination, option)
 				}
@@ -365,11 +365,20 @@ func ParseInspectToAssessment(inspectJSON []byte) (*AdoptionAssessment, error) {
 				assessment.CanAdopt = false
 				assessment.Blockers = append(assessment.Blockers, "Container bind mount "+err.Error()+". Adoption is blocked before mutation.")
 			}
-			binds = append(binds, BindMountSpec{
+			bind := BindMountSpec{
 				HostPath:      m.Source,
 				ContainerPath: m.Destination,
 				ReadOnly:      !m.RW,
-			})
+			}
+			for _, option := range m.Options {
+				switch strings.ToLower(strings.TrimSpace(option)) {
+				case "nosuid":
+					bind.NoSuid = true
+				case "nodev":
+					bind.NoDev = true
+				}
+			}
+			binds = append(binds, bind)
 		}
 	}
 

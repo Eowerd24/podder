@@ -2,6 +2,15 @@
 
 Notable product changes are listed by version. Historical entries describe the scope of that version; see the README for current behavior and limitations.
 
+## [Unreleased]
+
+- Accept narrowly checked neutral Podman inspect defaults during adoption while continuing to reject unsupported workload settings.
+- Accept exposed-port metadata only when exact published mappings represent every declared port.
+- Preserve adopted bind-mount `nosuid`/`nodev` restrictions through managed schema 4 and verify their effective settings after replay. Existing schema 2/3 specs retain their identities without new flags; older builds reject schema 4 and disposable session schema 1 rejects these flags.
+- Exercise descriptor-backed persistence failures in managed rollback regression tests.
+- Add a disposable-VM compatibility runner and manually dispatched CI targets for Debian 13, Fedora 45 and pinned upstream Podman 6.2.0, recording engine identity and separating default-stack coverage from isolated VFS fixtures.
+- Validate selected backend integration cases locally on 2026-11-16 with Podman 5.4.2, 6.1.3 and 6.2.0: each passes 16 required top-level cases and 25 child cases without failures, skips or missing cases. Fedora runs retain SELinux enforcement; native UI and physical power-loss testing remain outside this matrix.
+
 ## [1.5.6] - 2026-11-16 — Public distribution and release provenance
 
 - Prepare a clean public source distribution, excluding internal audit reports, investigation evidence, local configuration, and build artifacts while retaining application source and regression coverage.

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -22,12 +23,21 @@ import (
 )
 
 type round2Runner struct {
-	base   string
-	before func([]string)
+	base          string
+	storageDriver string
+	cgroupManager string
+	before        func([]string)
 }
 
 func (r *round2Runner) prefix() []string {
-	return []string{"--remote=false", "--root", r.base + "/root", "--runroot", r.base + "/runroot", "--storage-driver", "vfs", "--cgroup-manager", "cgroupfs", "--events-backend", "file"}
+	driver, manager := r.storageDriver, r.cgroupManager
+	if driver == "" {
+		driver = "vfs"
+	}
+	if manager == "" {
+		manager = "cgroupfs"
+	}
+	return []string{"--remote=false", "--root", r.base + "/root", "--runroot", r.base + "/runroot", "--storage-driver", driver, "--cgroup-manager", manager, "--events-backend", "file"}
 }
 func (r *round2Runner) podmanInnerPrefix() []string { return append([]string{}, r.prefix()...) }
 func (r *round2Runner) RunWithFiles(name string, files []*os.File, args ...string) (string, string, error) {
@@ -356,20 +366,55 @@ type r2PortGrab struct {
 }
 
 func (g *r2PortGrab) Run(name string, args ...string) (string, string, error) {
+	return g.RunContextWithFiles(context.Background(), name, nil, args...)
+}
+
+func (g *r2PortGrab) RunContext(ctx context.Context, name string, args ...string) (string, string, error) {
+	return g.RunContextWithFiles(ctx, name, nil, args...)
+}
+
+func (g *r2PortGrab) RunWithFiles(name string, files []*os.File, args ...string) (string, string, error) {
+	return g.RunContextWithFiles(context.Background(), name, files, args...)
+}
+
+// Managed starts use descriptor-backed execution. Intercept that path as well
+// as ordinary Run so the test proves a real engine failure rather than an
+// unrelated refusal before the controlled port collision.
+func (g *r2PortGrab) RunContextWithFiles(ctx context.Context, name string, files []*os.File, args ...string) (string, string, error) {
 	if name == "podman" && len(args) > 0 && args[0] == "run" && !g.grabbed {
-		l, e := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", g.port))
-		if e != nil {
-			return "", "", e
+		// pasta can release its forwarding listener shortly after Podman stop
+		// returns. Wait for that listener to go away before installing our
+		// competitor; otherwise a fixture bind error can masquerade as the
+		// intended engine start failure.
+		deadline := time.Now().Add(5 * time.Second)
+		var l net.Listener
+		var e error
+		for {
+			l, e = net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", g.port))
+			if e == nil {
+				break
+			}
+			if !errors.Is(e, syscall.EADDRINUSE) || !time.Now().Before(deadline) {
+				g.engineFailure = "controlled competitor did not acquire the released port: " + e.Error()
+				return "", g.engineFailure, e
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 		g.listener = l
 		g.grabbed = true
-		a, b, e := g.round2Runner.Run(name, args...)
+		a, b, e := g.round2Runner.RunContextWithFiles(ctx, name, files, args...)
 		g.emptyStdout = strings.TrimSpace(a) == ""
 		g.engineFailure = b
 		if !g.keep {
 			g.listener.Close()
 		}
 		return a, b, e
+	}
+	if name == "podman" {
+		return g.round2Runner.RunContextWithFiles(ctx, name, files, args...)
+	}
+	if len(files) != 0 {
+		return "", "", fmt.Errorf("unexpected inherited files for %s", name)
 	}
 	return g.round2Runner.Run(name, args...)
 }
@@ -396,7 +441,7 @@ func TestRound2N3StartFailure(t *testing.T) {
 			}
 		}
 		if !g.grabbed || !g.emptyStdout {
-			t.Fatalf("genuine no-stdout start failure was not observed: grabbed=%v empty=%v", g.grabbed, g.emptyStdout)
+			t.Fatalf("genuine no-stdout start failure was not observed: grabbed=%v empty=%v error=%s", g.grabbed, g.emptyStdout, g.engineFailure)
 		}
 		t.Logf("%s: actual start failure, empty stdout=%v, stderr=%s", op, g.emptyStdout, g.engineFailure)
 		cs, e := p.ListContainers(true)

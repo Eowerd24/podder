@@ -38,6 +38,15 @@ Podder treats a workload differently depending on who actually owns its configur
 | **Pod member** | Ownership is pod-level. Podder never recreates an individual pod member as if it were a standalone container. |
 | **Ad-hoc** | Ordinary start/stop/restart/remove controls apply. Destructive, replay-based operations (port mutation, `DeploySpec`) are only available after explicitly adopting the container into a Podder-managed spec. |
 
+### Managed specification compatibility
+
+Adoption preserves existing bind-mount `nosuid` and `nodev` restrictions in
+managed schema 4 specifications. Replay retains them and verifies the effective
+mount restrictions after startup. Schema 2 and 3 specifications remain readable,
+preserve their ownership identities and gain no new mount flags. Older Podder
+builds reject schema 4 rather than silently losing these restrictions. Disposable
+session schema 1 does not accept the new flags.
+
 ---
 
 ## Open Web / Configure Application
@@ -250,6 +259,78 @@ To compile a native release binary, run `wails3 build`. Source packaging metadat
    Visit [v3.wails.io](https://v3.wails.io/) for Wails v3 guides, API references, and templates.
 
    ---
+
+### Rootless Podman compatibility tests
+
+The optional [compatibility workflow](.github/workflows/podman-compatibility.yml)
+runs three configured targets: `debian13`, `fedora45` and
+`fedora45-upstream6.2`. The first two install their distribution's Podman package;
+the third builds the pinned upstream 6.2.0 source inside Fedora 45. A configured
+target is not a validated version: use each run's result JSON for its actual
+Podman version, runtime configuration, required test outcomes and cleanup status.
+
+Local VM validation on **2026-11-16** passed all **16 required top-level cases
+and 25 child cases per target**, with zero failures, skips or missing cases:
+
+| Guest target | Podman | crun | Netavark / aardvark-dns | SELinux |
+|---|---|---|---|---|
+| Debian 13 | 5.4.2 | 1.21 | 1.14 / 1.14 | Not present |
+| Fedora 45 package | 6.1.3 | 1.29.1 | 2.1.0 / 2.1.0 | Enforcing |
+| Fedora 45 upstream build | 6.2.0 | 1.29.1 | 2.1.0 / 2.1.0 | Enforcing |
+
+All three used the same compiled test executable. The upstream row built the
+full engine and matching helpers from [commit 055de04](https://github.com/podman-container-tools/podman/commit/055de046937d29450f310fce0fe3071485d8bed9)
+inside the guest. Debian used kernel `6.12.116+deb13-cloud-amd64`; Fedora used
+`7.2.11-300.fc45`. The default-stack case exercised rootless overlay storage,
+systemd, cgroup v2 and pasta networking; other cases used the isolated fixtures
+described below. These are local backend integration results; the manually
+dispatched hosted workflow has not been validated by these runs.
+
+Local runs require Linux amd64 with accessible KVM (`/dev/kvm`), Python 3,
+`qemu-system-x86_64`, `qemu-img`, `genisoimage`, `ssh` and `scp`, plus Go 1.26.11
+and the GTK 4/WebKitGTK 6 development headers used to compile the test executable.
+Guests download packages during provisioning. Each guest defaults to 4 GiB RAM;
+run targets sequentially on hosts with limited memory.
+
+Run the lightweight runner boundary tests, then compile the backend integration
+suite. The temporary frontend asset placeholder satisfies embedding requirements;
+this suite does not exercise the UI.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_podman_compat.py
+PODDER_COMPAT_WORK=$(mktemp -d)
+mkdir -p frontend/dist
+touch frontend/dist/.build-placeholder
+go test -c -tags integration -o "$PODDER_COMPAT_WORK/podder.test" .
+rm frontend/dist/.build-placeholder
+
+# Repeat with fedora45 and fedora45-upstream6.2, one target at a time.
+PODDER_COMPAT_TARGET=debian13
+python3 scripts/podman-compat.py \
+  --target "$PODDER_COMPAT_TARGET" \
+  --test-binary "$PODDER_COMPAT_WORK/podder.test" \
+  --go-dir "$(go env GOROOT)" \
+  --output "$PODDER_COMPAT_WORK/$PODDER_COMPAT_TARGET.json"
+```
+
+Keep result files outside the source tree. The runner boots disposable VMs and
+never uses the host Podman executable or container store. It records source and
+test-executable snapshot digests, and normally stops guests and removes their
+disks and SSH keys. For local diagnosis, `--keep-vm` retains the private VM
+workspace and prints an explicit `--cleanup` command; run that command afterward.
+
+The default suite requires 16 top-level cases; missing cases or unexpected skips
+fail the run. `TestPodmanCompatibility` exercises overlay storage, systemd,
+cgroup v2, Netavark and pasta with HTTP checks across adoption, port mutation and
+redeployment, including closure of the old port and bridge attachment discovery.
+The remaining cases use isolated VFS/cgroupfs fixtures and file events for
+adoption rejection, private environment transport, filesystem identity, rollback
+and process lifetime coverage. These fixture results do not substitute for the
+default-stack case, native UI checks or physical power-loss testing.
+
+The manually dispatched CI matrix uploads only compact result JSON. VM disks,
+keys and private diagnostic logs are not published. The normal build workflow
+also runs the Python boundary tests without booting a VM.
 
 ### Alternative: Install Go via Bash Script
 

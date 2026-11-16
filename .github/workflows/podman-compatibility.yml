@@ -1,0 +1,63 @@
+name: Rootless Podman Compatibility
+
+# These jobs boot dedicated VMs. Keep expensive engine acceptance runs explicit;
+# the normal release workflow continues to compile the opt-in integration suite.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: Rootless ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [debian13, fedora45, fedora45-upstream6.2]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.11'
+          cache: true
+
+      - name: Install VM and native compile dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage openssh-client acl libgtk-4-dev libwebkitgtk-6.0-dev build-essential pkg-config
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+
+      - name: Test runner boundaries
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_podman_compat.py
+
+      - name: Compile integration test executable
+        run: |
+          mkdir -p frontend/dist "$RUNNER_TEMP/podder-results"
+          touch frontend/dist/.build-placeholder
+          go test -c -tags integration -o "$RUNNER_TEMP/podder-compat.test" .
+
+      - name: Run isolated rootless engine coverage
+        run: |
+          python3 scripts/podman-compat.py \
+            --target '${{ matrix.target }}' \
+            --test-binary "$RUNNER_TEMP/podder-compat.test" \
+            --go-dir "$(go env GOROOT)" \
+            --output "$RUNNER_TEMP/podder-results/${{ matrix.target }}.json"
+
+      - name: Upload compact compatibility result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: podman-compatibility-${{ matrix.target }}
+          path: ${{ runner.temp }}/podder-results/${{ matrix.target }}.json
+          if-no-files-found: warn
+          retention-days: 14

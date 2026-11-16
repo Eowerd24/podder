@@ -86,6 +86,42 @@ func oneOf(v any, values ...any) bool {
 	return false
 }
 
+// Podman's ExposedPorts is the union of image/--expose metadata and published
+// container ports (libpod/container_inspect.go). Only entries already recreated
+// by the exact published mappings are supported; expose-only ports need their
+// own spec representation and must not be silently dropped.
+func adoptionExposedPortsReplayed(raw inspectContainer, value any) bool {
+	if value == nil {
+		return true
+	}
+	ports, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	for key, metadata := range ports {
+		object, ok := metadata.(map[string]any)
+		if !ok || len(object) != 0 {
+			return false
+		}
+		port, protocol, ok := strings.Cut(key, "/")
+		containerPort, err := strconv.ParseUint(port, 10, 16)
+		if !ok || err != nil || containerPort == 0 || strconv.FormatUint(containerPort, 10) != port || (protocol != "tcp" && protocol != "udp") {
+			return false
+		}
+		bindings := raw.HostConfig.PortBindings[key]
+		if len(bindings) == 0 {
+			return false
+		}
+		for _, binding := range bindings {
+			hostPort, err := strconv.ParseUint(binding.HostPort, 10, 16)
+			if err != nil || hostPort == 0 || strconv.FormatUint(hostPort, 10) != binding.HostPort {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // Only named replayed fields and explicitly enumerated defaults are accepted.
 // New engine fields block adoption until their semantics have been classified.
 // Accepted default variants are compared again after replay, so a host default
@@ -108,6 +144,11 @@ func inspectPolicyBlockers(raw inspectContainer) []string {
 	}
 	cfgZero := strings.Fields("Domainname AttachStdin AttachStdout AttachStderr Tty OpenStdin StdinOnce Volumes OnBuild Timeout Systemd ReadOnlyTmpfs Secrets HealthcheckStartup HealthcheckStartupCommand HealthcheckStartupInterval HealthcheckStartupTimeout HealthcheckStartupRetries HealthcheckStartupSuccesses")
 	hcZero := strings.Fields("ContainerIDFile VolumeDriver VolumesFrom DnsOptions GroupAdd Cgroup Links OomScoreAdj ReadonlyRootfs Tmpfs Sysctls CpuShares BlkioWeight BlkioWeightDevice BlkioDeviceReadBps BlkioDeviceWriteBps BlkioDeviceReadIOps BlkioDeviceWriteIOps CpuPeriod CpuQuota CpuRealtimePeriod CpuRealtimeRuntime CpusetMems DiskQuota KernelMemory MemoryReservation MemorySwap MemorySwappiness OomKillDisable CpuCount CpuPercent IOMaximumIOps IOMaximumBandwidth CgroupConf DeviceCgroupRules PublishAllPorts Isolation ReadOnlyTmpfs")
+	// Podman 5.4 and 6.2 report these health-log defaults even when no
+	// healthcheck exists (libpod/define/healthchecks.go). They are not replayed
+	// healthcheck controls: accept only the documented defaults with no check,
+	// and retain their exact values in the post-replay comparison below.
+	noHealthcheck := emptyInspectValue(raw.configFields["Healthcheck"]) && emptyInspectValue(raw.configFields["HealthcheckStartup"])
 	annotations := func(v any) bool {
 		if v == nil {
 			return true
@@ -148,6 +189,14 @@ func inspectPolicyBlockers(raw inspectContainer) []string {
 			good = v == true
 		case "HealthcheckOnFailureAction":
 			good = oneOf(v, "", "none")
+		case "HealthLogDestination":
+			good = noHealthcheck && oneOf(v, "", "local")
+		case "HealthcheckMaxLogCount":
+			good = noHealthcheck && v == float64(5)
+		case "HealthcheckMaxLogSize":
+			good = noHealthcheck && v == float64(500)
+		case "ExposedPorts":
+			good = adoptionExposedPortsReplayed(raw, v)
 		case "sdNotifyMode":
 			good = oneOf(v, "", "container")
 		case "Annotations":
@@ -165,6 +214,10 @@ func inspectPolicyBlockers(raw inspectContainer) []string {
 		switch k {
 		case "PidsLimit":
 			good = oneOf(v, float64(0), float64(2048))
+		case "AutoRemoveImage":
+			good = v == false
+		case "HostsFile":
+			good = v == ""
 		case "ShmSize":
 			good = oneOf(v, float64(0), float64(65536000))
 		case "UTSMode", "CgroupnsMode", "CgroupMode":
@@ -214,6 +267,14 @@ func inspectPolicyBlockers(raw inspectContainer) []string {
 		if (k == "Dependencies" || k == "IsInfra" || k == "IsService") && emptyInspectValue(v) {
 			continue
 		}
+		// These are real lifecycle and hosts-file controls, not arbitrary new
+		// metadata. Only their explicit inactive values are representable.
+		if (k == "UseImageHosts" || k == "UseImageHostname" || k == "IsInitCtr") && v == false {
+			continue
+		}
+		if k == "InitContainerType" && v == "" {
+			continue
+		}
 		block(k)
 	}
 	if command, ok := raw.configFields["CreateCommand"].([]any); ok {
@@ -258,7 +319,17 @@ func normalizedAdoptionInspect(raw inspectContainer) map[string]any {
 		}
 		hc[k] = v
 	}
-	return map[string]any{"Config": cfg, "HostConfig": hc, "Mounts": raw.Mounts, "AppArmorProfile": raw.rootFields["AppArmorProfile"], "EffectiveCaps": raw.rootFields["EffectiveCaps"], "BoundingCaps": raw.rootFields["BoundingCaps"], "OCIRuntime": raw.rootFields["OCIRuntime"]}
+	return map[string]any{
+		"Config": cfg, "HostConfig": hc, "Mounts": raw.Mounts,
+		"AppArmorProfile":   raw.rootFields["AppArmorProfile"],
+		"EffectiveCaps":     raw.rootFields["EffectiveCaps"],
+		"BoundingCaps":      raw.rootFields["BoundingCaps"],
+		"OCIRuntime":        raw.rootFields["OCIRuntime"],
+		"UseImageHosts":     raw.rootFields["UseImageHosts"],
+		"UseImageHostname":  raw.rootFields["UseImageHostname"],
+		"IsInitCtr":         raw.rootFields["IsInitCtr"],
+		"InitContainerType": raw.rootFields["InitContainerType"],
+	}
 }
 func adoptionReplayEquivalent(before, after inspectContainer) bool {
 	return reflect.DeepEqual(normalizedAdoptionInspect(before), normalizedAdoptionInspect(after))

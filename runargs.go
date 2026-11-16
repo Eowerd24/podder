@@ -97,6 +97,12 @@ func buildRunArgsFromSpec(spec ContainerSpec, checkPaths bool) ([]string, error)
 		if b.ReadOnly {
 			mountSpec += ",readonly"
 		}
+		if b.NoSuid {
+			mountSpec += ",nosuid"
+		}
+		if b.NoDev {
+			mountSpec += ",nodev"
+		}
 		args = append(args, "--mount", mountSpec)
 	}
 

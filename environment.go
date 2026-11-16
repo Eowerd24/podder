@@ -192,6 +192,13 @@ func (p *PodmanService) runSpecCommand(s ContainerSpec, args ...string) (string,
 	} else {
 		out, stderr, err = p.runCommand(actual...)
 	}
+	if err == nil && validateFullContainerID(strings.TrimSpace(out)) == nil {
+		if verifyErr := p.verifyContainerBindRestrictions(strings.TrimSpace(out), s.Binds); verifyErr != nil {
+			// Keep the returned identity so transaction callers can remove the
+			// failed candidate and restore the original through their rollback.
+			err = verifyErr
+		}
+	}
 	if validateFullContainerID(strings.TrimSpace(out)) == nil {
 		return out, redactEnvironment(stderr, env), redactEnvironmentError(err, env)
 	}

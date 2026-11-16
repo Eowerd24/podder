@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -68,8 +69,37 @@ func assuranceOperands(args []string) error {
 }
 func assuranceStore(t *testing.T) (*PodmanService, *round2Runner, string) {
 	t.Helper()
+	return assuranceStoreWithRuntime(t, "vfs", "cgroupfs")
+}
+
+// The compatibility lane also exercises the usual modern rootless runtime.
+// Both profiles still use a newly allocated explicit store; neither can select
+// the caller's normal Podman storage.
+func assuranceStoreWithRuntime(t *testing.T, driver, manager string) (*PodmanService, *round2Runner, string) {
+	t.Helper()
 	if os.Getenv("PODDER_ASSURANCE_INTEGRATION") != "1" {
 		t.Skip("set PODDER_ASSURANCE_INTEGRATION=1 to provision a fresh isolated rootless store")
+	}
+	if !(driver == "vfs" && manager == "cgroupfs") && !(driver == "overlay" && manager == "systemd") {
+		t.Fatal("unsupported isolated runtime profile")
+	}
+	// systemd-run and netavark's DNS helper use the real per-user runtime
+	// directory, not just DBUS_SESSION_BUS_ADDRESS. Preserve it in the modern
+	// profile while keeping application configuration and both stores isolated.
+	systemRuntime := ""
+	if manager == "systemd" {
+		systemRuntime = os.Getenv("XDG_RUNTIME_DIR")
+		if systemRuntime != fmt.Sprintf("/run/user/%d", os.Getuid()) {
+			t.Fatal("systemd profile requires the real per-user runtime directory")
+		}
+		info, err := os.Lstat(systemRuntime)
+		if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+			t.Fatal("systemd runtime directory is not private", err)
+		}
+		owner, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || owner.Uid != uint32(os.Getuid()) {
+			t.Fatal("systemd runtime directory owner mismatch")
+		}
 	}
 	powerPhase := os.Getenv("PODDER_ASSURANCE_POWER_PHASE")
 	if powerPhase != "" && (os.Getenv("PODDER_ASSURANCE_DISPOSABLE_VM") != "1" || !strings.HasPrefix(t.Name(), "TestAssurancePowerLossJournal")) {
@@ -112,19 +142,30 @@ func assuranceStore(t *testing.T) (*PodmanService, *round2Runner, string) {
 		t.Fatal("campaign receipt mismatch")
 	}
 	for k, d := range map[string]string{"HOME": "home", "XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data", "XDG_RUNTIME_DIR": "runtime", "XDG_CACHE_HOME": "cache"} {
-		t.Setenv(k, filepath.Join(base, d))
+		value := filepath.Join(base, d)
+		if k == "XDG_RUNTIME_DIR" && systemRuntime != "" {
+			value = systemRuntime
+		}
+		t.Setenv(k, value)
 	}
 	// Ignore ambient remote selectors and user engine configuration.
 	t.Setenv("CONTAINER_HOST", "")
 	t.Setenv("CONTAINER_CONNECTION", "")
 	t.Setenv("CONTAINERS_CONF", filepath.Join(base, "containers.conf"))
 	if !child {
-		if err := os.WriteFile(filepath.Join(base, "containers.conf"), []byte("[engine]\ncgroup_manager=\"cgroupfs\"\nevents_logger=\"file\"\n"), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(base, "runtime-profile"), []byte(driver+"\n"+manager+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(base, "containers.conf"), []byte("[engine]\ncgroup_manager=\""+manager+"\"\nevents_logger=\"file\"\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
+	profile, err := os.ReadFile(filepath.Join(base, "runtime-profile"))
+	if err != nil || string(profile) != driver+"\n"+manager+"\n" {
+		t.Fatal("isolated runtime profile receipt mismatch", err)
+	}
 	t.Setenv("PODDER_R2_EVIDENCE", filepath.Join(base, "out"))
-	r := &round2Runner{base: base}
+	r := &round2Runner{base: base, storageDriver: driver, cgroupManager: manager}
 	p := &PodmanService{runner: r}
 	out, stderr, err := r.Run("podman", "info", "--format", "json")
 	if err != nil {
@@ -133,13 +174,17 @@ func assuranceStore(t *testing.T) (*PodmanService, *round2Runner, string) {
 	var info struct {
 		Host struct {
 			ServiceIsRemote bool
+			CgroupManager   string
 			Security        struct{ Rootless bool }
 		}
-		Store   struct{ GraphRoot, RunRoot string }
+		Store   struct{ GraphRoot, RunRoot, GraphDriverName string }
 		Version struct{ Version string }
 	}
 	if err = json.Unmarshal([]byte(out), &info); err != nil || !info.Host.Security.Rootless || info.Host.ServiceIsRemote || info.Store.GraphRoot != base+"/root" || info.Store.RunRoot != base+"/runroot" {
 		t.Fatal("rootless store identity mismatch", err)
+	}
+	if info.Store.GraphDriverName != driver || info.Host.CgroupManager != manager {
+		t.Fatalf("engine did not use requested isolated profile: driver=%q cgroups=%q", info.Store.GraphDriverName, info.Host.CgroupManager)
 	}
 	if !child {
 		cs, err := p.ListContainers(true)

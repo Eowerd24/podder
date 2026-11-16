@@ -2,6 +2,14 @@
 
 Notable product changes are listed by version. Historical entries describe the scope of that version; see the README for current behavior and limitations.
 
+## [1.5.6] - 2026-11-16 — Public distribution and release provenance
+
+- Prepare a clean public source distribution, excluding internal audit reports, investigation evidence, local configuration, and build artifacts while retaining application source and regression coverage.
+- Sign release provenance through Sigstore's public Fulcio and Rekor services and verify the portable bundle before publishing complete release assets.
+- Bind provenance verification to the intended repository's numeric identity, trusted owner, exact signed source tag and commit, workflow, artifact digest, and signing run.
+- Retain signed-tag, dependency vulnerability, build, test, race, and immutable-release gates; remove the one-time private-repository recovery workflow.
+- Advance application and platform packaging metadata to 1.5.6. This release changes distribution and release verification; it adds no runtime features.
+
 ## [1.5.5] - 2026-11-16 — Dependency and native bridge security
 
 - Upgrade to Go 1.26.11, Wails 3.0.0 with the matching frontend runtime, and Vite 6.4.6 with patched transitive dependencies.

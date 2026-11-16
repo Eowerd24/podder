@@ -10,7 +10,7 @@
   <Identity 
     Name="io.github.eowerd24.podder"
     Publisher="CN=Podder Contributors"
-    Version="1.5.5.0"
+    Version="1.5.6.0"
     ProcessorArchitecture="x64" />
 
   <Properties>

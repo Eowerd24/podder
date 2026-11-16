@@ -11,11 +11,11 @@
         <key>CFBundleIdentifier</key>
             <string>io.github.eowerd24.podder</string>
         <key>CFBundleVersion</key>
-            <string>1.5.5</string>
+            <string>1.5.6</string>
         <key>CFBundleGetInfoString</key>
             <string>Podman GUI Control Panel and CLI Compose Helper</string>
         <key>CFBundleShortVersionString</key>
-            <string>1.5.5</string>
+            <string>1.5.6</string>
         <key>CFBundleIconFile</key>
             <string>icons</string>
         <key>CFBundleIconName</key>

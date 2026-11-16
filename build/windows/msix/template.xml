@@ -17,7 +17,7 @@
         PackageDisplayName="Podder"
         PublisherName="CN=Podder Contributors"
         PublisherDisplayName="Podder Contributors"
-        Version="1.5.5.0"
+        Version="1.5.6.0"
         PackageDescription="A lightweight desktop GUI and CLI for managing local Podman containers, images, and Compose/Quadlet workloads">
         <Capabilities>
             <Capability Name="runFullTrust" />

@@ -119,6 +119,52 @@ class CompatibilityBoundaries(unittest.TestCase):
         self.assertIn("poddercompat@127.0.0.1", args)
         self.assertNotIn("StrictHostKeyChecking=no", args)
 
+    def test_ssh_failure_classification_does_not_publish_raw_output(self):
+        secret = "PRIVATE-CREDENTIAL-do-not-publish"
+        for code, stderr, classification in [
+            (255, "connect: Connection refused " + secret, "ssh_connection_refused"),
+            (255, "Host key verification failed " + secret, "ssh_host_key_mismatch"),
+            (255, "Permission denied (publickey) " + secret, "ssh_authentication_failed"),
+            (255, secret, "ssh_transport_failed"),
+            (1, secret, "guest_not_ready"),
+        ]:
+            with self.subTest(classification=classification):
+                result = compat.ssh_status_summary(subprocess.CompletedProcess([], code, secret, stderr))
+                self.assertEqual(result, {"exit_code": code, "classification": classification})
+                self.assertNotIn(secret, json.dumps(result))
+
+    def test_cloud_init_diagnostics_retain_counts_without_messages_or_extra_fields(self):
+        secret = "PRIVATE-USER-DATA-do-not-publish"
+        response = {"status": "done", "stage": None, "extended_status": "degraded done",
+                    "errors": [secret], "recoverable_errors": {secret: [secret, secret]},
+                    "datasource": secret, "detail": secret}
+        result = compat.cloud_init_summary(json.dumps(response))
+        self.assertEqual(result, {"available": True, "status": "done", "stage": None, "degraded": True,
+                                  "errors_count": 1, "recoverable_errors_count": 2})
+        self.assertNotIn(secret, json.dumps(result))
+
+    def test_malformed_cloud_status_cannot_mask_original_boot_failure(self):
+        for response in ["", "not JSON", "[]", "[" * 2000 + "]" * 2000]:
+            with self.subTest(response=response[:20]):
+                self.assertFalse(compat.cloud_init_summary(response)["available"])
+        result = compat.cloud_init_summary(json.dumps({"status": [], "stage": {}, "extended_status": ["secret"]}))
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["stage"], "unknown")
+        self.assertFalse(result["degraded"])
+
+    def test_failure_probe_is_bounded_noninteractive_and_redacts_cloud_errors(self):
+        secret = "PRIVATE-CLOUD-ERROR-do-not-publish"
+        response = subprocess.CompletedProcess([], 2, json.dumps({"status": "done", "errors": [secret]}), secret)
+        with mock.patch.object(compat, "ssh", return_value=response) as invoke:
+            result = compat.provisioning_probe(Path("/tmp/podder-compat-fixture"), 12345)
+        self.assertEqual(invoke.call_args.args[2], "sudo -n cloud-init status --format json")
+        self.assertEqual(invoke.call_args.kwargs["timeout"], 10)
+        self.assertEqual(result["cloud_init"]["errors_count"], 1)
+        self.assertNotIn(secret, json.dumps(result))
+        with mock.patch.object(compat, "ssh", side_effect=subprocess.TimeoutExpired("private command", 10)):
+            result = compat.provisioning_probe(Path("/tmp/podder-compat-fixture"), 12345)
+        self.assertEqual(result, {"ssh": {"exit_code": None, "classification": "ssh_probe_timeout"}})
+
     def test_cloud_subids_have_actual_newlines_and_no_password_login(self):
         config = json.loads(compat.cloud_config("debian13", "ssh-ed25519 fixture client", "PRIVATE\n",
                                                 "ssh-ed25519 fixture host", "a" * 32).split("\n", 1)[1])

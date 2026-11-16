@@ -190,6 +190,83 @@ def copy_to_guest(work, port, path):
     run(["scp", *options, path, "poddercompat@127.0.0.1:incoming/"], stdout=subprocess.DEVNULL)
 
 
+def ssh_status_summary(response):
+    """Classify transport failures without publishing stderr or credentials."""
+    stderr = response.stderr or ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    reason = "guest_not_ready" if response.returncode == 1 else "guest_command_failed"
+    if response.returncode == 0:
+        reason = "success"
+    for text, classification in [
+        ("Host key verification failed", "ssh_host_key_mismatch"),
+        ("REMOTE HOST IDENTIFICATION HAS CHANGED", "ssh_host_key_mismatch"),
+        ("Permission denied", "ssh_authentication_failed"),
+        ("Connection refused", "ssh_connection_refused"),
+        ("Connection timed out", "ssh_connection_timeout"),
+        ("No route to host", "ssh_no_route"),
+        ("Network is unreachable", "ssh_network_unreachable"),
+        ("Connection closed", "ssh_connection_closed"),
+        ("a password is required", "guest_sudo_unavailable"),
+    ]:
+        if text.lower() in stderr.lower():
+            reason = classification
+            break
+    else:
+        if response.returncode == 255:
+            reason = "ssh_transport_failed"
+    return {"exit_code": response.returncode, "classification": reason}
+
+
+def cloud_init_summary(stdout):
+    """Return status enums and problem counts, never raw cloud-init messages."""
+    try:
+        value = json.loads(stdout[:65536])
+    except (ValueError, TypeError, RecursionError):
+        return {"available": False, "reason": "invalid_status_json"}
+    if not isinstance(value, dict):
+        return {"available": False, "reason": "invalid_status_json"}
+
+    def count_messages(item):
+        pending, count = [item], 0
+        while pending:
+            child = pending.pop()
+            if isinstance(child, dict):
+                pending.extend(child.values())
+            elif isinstance(child, list):
+                pending.extend(child)
+            elif isinstance(child, str) and child:
+                count += 1
+        return count
+
+    status = value.get("status")
+    stage = value.get("stage")
+    return {
+        "available": True,
+        "status": status if isinstance(status, str) and status in {"not started", "running", "done", "disabled", "error"} else "unknown",
+        "stage": stage if stage is None or isinstance(stage, str) and stage in {"init-local", "init", "modules-config", "modules-final"} else "unknown",
+        "degraded": isinstance(value.get("extended_status"), str) and value["extended_status"].startswith("degraded "),
+        "errors_count": count_messages(value.get("errors")),
+        "recoverable_errors_count": count_messages(value.get("recoverable_errors")),
+    }
+
+
+def provisioning_probe(work, port):
+    # Non-waiting and non-interactive: a failed boot must still reach cleanup
+    # promptly. Only whitelisted status fields/counts survive into the artifact.
+    try:
+        response = ssh(work, port, "sudo -n cloud-init status --format json",
+                       capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return {"ssh": {"exit_code": None, "classification": "ssh_probe_timeout"}}
+    except OSError:
+        return {"ssh": {"exit_code": None, "classification": "ssh_probe_failed"}}
+    result = {"ssh": ssh_status_summary(response)}
+    if response.returncode != 255:
+        result["cloud_init"] = cloud_init_summary(response.stdout)
+    return result
+
+
 def build_upstream(work, port, commit, timeout):
     require(re.fullmatch("[0-9a-f]{40}", commit), "Invalid pinned upstream commit")
     # All source execution and package installation happen inside the dedicated
@@ -426,15 +503,22 @@ def run_vm(args):
                  "port": port, "target": args.target}
         require(state["identity"] is not None, "QEMU process disappeared")
         (work / "vm.json").write_text(json.dumps(state, indent=2) + "\n")
-        deadline = time.monotonic() + args.boot_timeout
+        boot_started = time.monotonic()
+        deadline = boot_started + args.boot_timeout
+        result["provisioning"] = {"attempts": 0, "ready": False}
         print("Waiting for rootless guest provisioning", flush=True)
         while time.monotonic() < deadline:
             require(process.poll() is None, "QEMU exited during provisioning")
+            result["provisioning"]["attempts"] += 1
             status = ssh(work, port, "test -f /var/lib/podder-compat-ready && sudo cloud-init status --wait --format json", capture_output=True, text=True, timeout=20)
+            result["provisioning"]["last_ssh"] = ssh_status_summary(status)
+            result["provisioning"]["elapsed_seconds"] = round(time.monotonic() - boot_started, 1)
             if status.returncode == 0:
+                result["provisioning"]["ready"] = True
                 break
             if status.returncode == 2 and status.stdout.strip():
-                raise RuntimeError("Guest cloud-init reported provisioning errors: " + status.stdout[-2000:])
+                result["provisioning"]["cloud_init"] = cloud_init_summary(status.stdout)
+                raise RuntimeError("Guest cloud-init reported provisioning errors; see compact provisioning diagnostics")
             time.sleep(5)
         else:
             raise RuntimeError("Guest provisioning timed out; inspect private serial.log with --keep-vm")
@@ -481,6 +565,12 @@ def run_vm(args):
             # Test output is from a disposable fixture only. Keep detailed logs
             # private by default; --keep-vm allows local diagnosis.
     except Exception as error:
+        provisioning = result.get("provisioning")
+        if provisioning is not None and not provisioning["ready"]:
+            provisioning["elapsed_seconds"] = round(time.monotonic() - boot_started, 1)
+            if isinstance(error, subprocess.TimeoutExpired):
+                provisioning["last_ssh"] = {"exit_code": None, "classification": "ssh_command_timeout"}
+            provisioning["final_probe"] = provisioning_probe(work, port)
         result["error"] = str(error)
         print("Compatibility run failed: " + str(error), file=sys.stderr, flush=True)
     finally:
